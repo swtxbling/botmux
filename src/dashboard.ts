@@ -219,7 +219,7 @@ import { aggregateRoleBatch, parseRoleBatchTargets } from './dashboard/roles-bat
 import { automateOpenPlatformSetup, vcListenerEventGateError } from './setup/open-platform-automation.js';
 import { VC_MEETING_FEATURE_SCOPES, VC_MEETING_REALTIME_VOICE_SCOPES } from './setup/verify-permissions.js';
 import { maybeInstallTraexPluginOnSettingsChange, TRAEX_RECOMMENDED_SOURCE, TRAEX_RECOMMENDED_REF } from './setup/ensure-herdr-integrations.js';
-import { deriveCreateGroupName, parseSessionLoadouts, selectCreateSessionTargets } from './core/session-create.js';
+import { buildSessionSpawnRequests, deriveCreateGroupName, parseSessionLoadouts, selectCreateSessionTargets } from './core/session-create.js';
 import { parseDashboardImageUploads } from './core/dashboard-images.js';
 import { checkLarkCliVersion, MIN_LARK_CLI_VERSION_FOR_VC_BOT } from './vc-agent/polling-source.js';
 import { larkHosts, normalizeBrand } from './im/lark/lark-hosts.js';
@@ -5570,6 +5570,17 @@ const server = createServer(async (req, res) => {
       // 同时取 on_（union_id，租户内跨 app 稳定）做兜底邀请：lead 模式强制 creator=lead，
       // 万一 lead 的 allowlist 没有 ou_ 条目，open_id 解析不到、操作者就进不了群——union_id
       // 不受 app 作用域影响，仍能把人拉进来（createGroupWithBots 走 ownerUnionIds 通道）。
+      // Validate the loadout map BEFORE creating the Lark group. Request
+      // validity must not depend on a side-effect having already happened:
+      // rejecting after /api/groups/create leaves an orphaned group behind, and
+      // a user retrying an invalid payload would mint one every attempt.
+      // Expected targets are known here — the Lead in lead mode, every selected
+      // bot in all mode — so the payload can be judged now and re-narrowed to
+      // the bots that actually joined afterwards.
+      const expectedTargets = selectCreateSessionTargets(mode, selectedIds, creatorLarkAppId);
+      const preflightLoadouts = parseSessionLoadouts(parsed.skillLoadouts, expectedTargets);
+      if (!preflightLoadouts.ok) return jsonRes(res, 400, { ok: false, error: preflightLoadouts.error });
+
       const creatorDesc = registry.getByAppId(creatorLarkAppId)!;
       const allowed = creatorDesc.resolvedAllowedUsers ?? [];
       const userOpenId = allowed.find(u => u.startsWith('ou_'));
@@ -5627,36 +5638,28 @@ const server = createServer(async (req, res) => {
         return jsonRes(res, 200, { ok: true, chatId, shareLink: groupResp.shareLink, spawned: [], failed: [], warning: 'no_spawn_target', feedGroupId, feedGroupError });
       }
 
-      // Per-bot Skill loadout, narrowed to bots that actually spawn. In Lead
-      // mode the subs are not targets, so a loadout for them is dropped here
-      // rather than becoming configuration the user believes is active. A
-      // malformed entry fails the request instead of being reinterpreted —
-      // silently turning it into `{ include: [] }` would strip that session's
-      // skills entirely.
-      const loadoutsParsed = parseSessionLoadouts(parsed.skillLoadouts, targets);
-      if (!loadoutsParsed.ok) return jsonRes(res, 400, { ok: false, error: loadoutsParsed.error });
-      const sessionLoadouts = loadoutsParsed.value;
+      // Re-narrow the already-validated map to the bots that actually joined.
+      // This can only ever DROP entries, so it cannot fail — the payload was
+      // judged valid before the group existed.
+      const sessionLoadouts = Object.fromEntries(
+        Object.entries(preflightLoadouts.value ?? {}).filter(([appId]) => targets.includes(appId)),
+      );
       const bots = liveBots();
       const nameOf = (id: string) => bots.find(b => b.larkAppId === id)?.botName ?? id;
       const spawned: string[] = [];
       const failed: Array<{ larkAppId: string; error: string }> = [];
-      await Promise.all(targets.map(async (appId) => {
-        const role = mode === 'lead' ? 'lead' : (targets.length > 1 ? 'collab' : 'solo');
-        // lead 的 coworker = 所有 sub（除自己）；collab 的 coworker = 其它并列 bot（除自己）。
-        const coworkerIds = (mode === 'lead' ? joinedIds : targets).filter(id => id !== appId);
-        const coworkers = coworkerIds.map(id => ({ name: nameOf(id) }));
+      // Built by the shared helper so this routing (role, coworkers, banner
+      // ownership, per-bot loadout) is the same code the tests exercise.
+      const spawnRequests = buildSessionSpawnRequests({
+        chatId, content, column, mode, targets, joinedIds, creatorLarkAppId, nameOf,
+        loadouts: sessionLoadouts,
+      });
+      await Promise.all(spawnRequests.map(async ({ larkAppId: appId, body: spawnBody }) => {
         try {
           const up = await proxyToDaemon(appId, '/api/sessions/spawn', {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({
-              chatId, content, column, role, coworkers,
-              images: parsedImages.images,
-              postBanner: appId === creatorLarkAppId,
-              // Only this bot's own entry — never the whole map. A bot with no
-              // entry gets undefined and inherits its own policy.
-              ...(sessionLoadouts?.[appId] ? { skillLoadout: sessionLoadouts[appId] } : {}),
-            }),
+            body: JSON.stringify({ ...spawnBody, images: parsedImages.images }),
           });
           const b = await up.json().catch(() => null);
           if (up.ok && b?.ok) spawned.push(appId);

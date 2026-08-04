@@ -101,8 +101,14 @@ function isValidSkillSelector(value: unknown): value is SkillSelector {
  *  at all"), and a mixed list applied only partially. Neither is recoverable by
  *  the caller, so both are now hard errors. */
 export function parseSessionLoadout(raw: unknown): ParseResult<BotSkillPolicy | undefined> {
-  if (raw === undefined || raw === null) return { ok: true, value: undefined };
-  if (typeof raw !== 'object' || Array.isArray(raw)) return { ok: false, error: 'bad_skill_loadout' };
+  // Only an ABSENT field means inherit. `null` is an explicit JSON value, not a
+  // missing key: accepting it as inherit would give callers a second, silent
+  // way to express something the contract says must be stated with a real
+  // policy object.
+  if (raw === undefined) return { ok: true, value: undefined };
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { ok: false, error: 'bad_skill_loadout' };
+  }
   const include = (raw as { include?: unknown }).include;
   if (!Array.isArray(include)) return { ok: false, error: 'bad_skill_loadout' };
   if (!include.every(isValidSkillSelector)) return { ok: false, error: 'bad_skill_loadout' };
@@ -126,8 +132,10 @@ export function parseSessionLoadouts(
   raw: unknown,
   targets: readonly string[],
 ): ParseResult<Record<string, BotSkillPolicy> | undefined> {
-  if (raw === undefined || raw === null) return { ok: true, value: undefined };
-  if (typeof raw !== 'object' || Array.isArray(raw)) return { ok: false, error: 'bad_skill_loadout' };
+  if (raw === undefined) return { ok: true, value: undefined };
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { ok: false, error: 'bad_skill_loadout' };
+  }
   const allowed = new Set(targets);
   const out: Record<string, BotSkillPolicy> = {};
   for (const [larkAppId, value] of Object.entries(raw as Record<string, unknown>)) {
@@ -137,6 +145,46 @@ export function parseSessionLoadouts(
     if (parsed.value) out[larkAppId] = parsed.value;
   }
   return { ok: true, value: Object.keys(out).length > 0 ? out : undefined };
+}
+
+/** The per-bot spawn payloads the create-session route proxies to each daemon.
+ *  Extracted so the route and its tests share ONE implementation: a test that
+ *  re-derives this mapping only proves the test's own arithmetic, which is
+ *  exactly how "group created, then 400" slipped through. */
+export function buildSessionSpawnRequests(args: {
+  chatId: string;
+  content: string;
+  column: CreateSessionColumn;
+  mode: CreateSessionMode;
+  targets: readonly string[];
+  /** Every bot in the group, used to derive each target's coworkers. */
+  joinedIds: readonly string[];
+  creatorLarkAppId: string;
+  nameOf: (larkAppId: string) => string;
+  loadouts?: Record<string, BotSkillPolicy>;
+}): Array<{ larkAppId: string; body: Record<string, unknown> }> {
+  return args.targets.map((appId) => {
+    const role: SpawnRole = args.mode === 'lead'
+      ? 'lead'
+      : (args.targets.length > 1 ? 'collab' : 'solo');
+    // lead's coworkers = every sub; collab's = the other parallel bots.
+    const coworkerIds = (args.mode === 'lead' ? args.joinedIds : args.targets).filter(id => id !== appId);
+    const loadout = args.loadouts?.[appId];
+    return {
+      larkAppId: appId,
+      body: {
+        chatId: args.chatId,
+        content: args.content,
+        column: args.column,
+        role,
+        coworkers: coworkerIds.map(id => ({ name: args.nameOf(id) })),
+        postBanner: appId === args.creatorLarkAppId,
+        // Only this bot's own entry, and the key is omitted entirely when the
+        // bot has none — an absent field is what makes the daemon inherit.
+        ...(loadout ? { skillLoadout: loadout } : {}),
+      },
+    };
+  });
 }
 
 function coworkerListBlock(coworkers: Coworker[]): string {
