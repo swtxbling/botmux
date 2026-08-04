@@ -1233,6 +1233,7 @@ ipcRoute('POST', '/api/sessions/spawn', async (req, res) => {
     postBanner,
     ownerOpenId: parsed.value.ownerOpenId,
     ownerUnionId: parsed.value.ownerUnionId,
+    skillLoadout: parsed.value.skillLoadout,
   });
   if (!r.ok) {
     cleanupMaterializedDashboardImages(cachedLarkAppId, attachments);

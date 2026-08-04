@@ -3,6 +3,7 @@
 // 单测。daemon 侧 /api/sessions/spawn 与 session-manager 的 spawn/activate 复用。
 import { t, type Locale } from '../i18n/index.js';
 import type { CliTurnPayload } from '../types.js';
+import type { BotSkillPolicy, SkillSelector } from './skills/types.js';
 import { parseDashboardImageUploads, type DashboardImageUpload } from './dashboard-images.js';
 
 /** 协作模式：
@@ -75,6 +76,47 @@ export function selectCreateSessionTargets(
 ): string[] {
   if (mode === 'lead') return leadLarkAppId && joinedIds.includes(leadLarkAppId) ? [leadLarkAppId] : [];
   return [...joinedIds];
+}
+
+/** Sanitize the per-bot Skill loadout map submitted with a create-session
+ *  request. Deliberately narrow, because a loadout REPLACES the bot's own
+ *  policy for the spawned session:
+ *
+ *   • only keys that are actually spawn targets survive — in Lead mode the
+ *     sub-bots never spawn, so a loadout for them would be configuration the
+ *     user believes is active while nothing applies it;
+ *   • a bot with no entry stays absent rather than becoming `{ include: [] }`,
+ *     since absent means "inherit the bot policy" and empty means "explicitly
+ *     no skills" — collapsing the two would silently strip skills;
+ *   • entries are rebuilt from validated `skill:` / `pack:` selectors only, so
+ *     a hand-crafted request cannot smuggle unknown selector kinds into a
+ *     session policy.
+ *
+ *  Returns undefined when nothing survives, so callers can pass it straight
+ *  through to an optional field. */
+export function sanitizeSessionLoadouts(
+  raw: unknown,
+  targets: readonly string[],
+): Record<string, BotSkillPolicy> | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const allowed = new Set(targets);
+  const out: Record<string, BotSkillPolicy> = {};
+  for (const [larkAppId, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!allowed.has(larkAppId)) continue;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+    const include = (value as { include?: unknown }).include;
+    if (!Array.isArray(include)) continue;
+    const selectors = include.filter(
+      (selector): selector is SkillSelector =>
+        typeof selector === 'string'
+        && (selector.startsWith('skill:') || selector.startsWith('pack:'))
+        && selector.length > selector.indexOf(':') + 1,
+    );
+    // An empty array is meaningful ("no skills"), so keep it — only a
+    // structurally invalid entry is dropped above.
+    out[larkAppId] = { include: [...new Set(selectors)] };
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 function coworkerListBlock(coworkers: Coworker[]): string {
@@ -180,6 +222,10 @@ export interface SpawnRequest {
   ownerUnionId?: string;
   title?: string;
   images: DashboardImageUpload[];
+  /** Per-session Skill loadout for THIS bot, already narrowed by the
+   *  aggregator to a bot that actually spawns. Absent = inherit the bot
+   *  policy; `{ include: [] }` = explicitly no skills. */
+  skillLoadout?: BotSkillPolicy;
 }
 
 export type ParseResult<T> = { ok: true; value: T } | { ok: false; error: string };
@@ -229,6 +275,12 @@ export function parseSpawnRequest(body: unknown): ParseResult<SpawnRequest> {
       ownerUnionId: typeof b.ownerUnionId === 'string' && b.ownerUnionId.trim() ? b.ownerUnionId.trim() : undefined,
       title,
       images: parsedImages.images,
+      // Reuse the same validation as the aggregator's map form: a single entry
+      // keyed by a placeholder, so selector filtering stays in one place.
+      ...(() => {
+        const one = sanitizeSessionLoadouts({ self: b.skillLoadout }, ['self']);
+        return one?.self ? { skillLoadout: one.self } : {};
+      })(),
     },
   };
 }
