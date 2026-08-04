@@ -276,6 +276,42 @@ describe('forkSession — frozen launch posture inheritance', () => {
     expect(child.agentFrozen).toBe(true);
   });
 
+  // ── Same class of per-session override as model/effort: forkWorker resolves
+  //    `session.skillLoadout ?? botCfg.skills`, so a child row that drops the
+  //    loadout silently re-equips from the CURRENT bot policy and the clone
+  //    enters with different skills than the session it forked from. ──
+  it('P2: per-session skillLoadout is inherited by the fork child', async () => {
+    const src = makeSourceDs({ skillLoadout: { include: ['skill:review', 'pack:ops'] } });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), src);
+
+    const r = await callFork(src);
+    expect(r.ok).toBe(true);
+    const child = vi.mocked(sessionStore.createSession).mock.results[0].value as Session;
+    expect(child.skillLoadout).toEqual({ include: ['skill:review', 'pack:ops'] });
+  });
+
+  it('P2: an explicitly EMPTY loadout travels too (explicit "no skills", not inherit)', async () => {
+    // `{ include: [] }` and `undefined` mean opposite things downstream, so the
+    // empty case must survive the fork rather than collapsing into inherit.
+    const src = makeSourceDs({ skillLoadout: { include: [] } });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), src);
+
+    const r = await callFork(src);
+    expect(r.ok).toBe(true);
+    const child = vi.mocked(sessionStore.createSession).mock.results[0].value as Session;
+    expect(child.skillLoadout).toEqual({ include: [] });
+  });
+
+  it('P2: a source with no loadout leaves the child inheriting the bot policy', async () => {
+    const src = makeSourceDs();
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), src);
+
+    const r = await callFork(src);
+    expect(r.ok).toBe(true);
+    const child = vi.mocked(sessionStore.createSession).mock.results[0].value as Session;
+    expect(child.skillLoadout).toBeUndefined();
+  });
+
   // ── The larkAppId gap codex caught: the persisted child row must carry the
   //    bot identity so a restart before the child's first spawn doesn't
   //    misattribute it to getAllBots()[0]. ──

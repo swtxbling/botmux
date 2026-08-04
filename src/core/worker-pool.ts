@@ -4810,6 +4810,12 @@ export async function forkSession(
   childSession.cliPathOverride = ds.session.cliPathOverride;
   childSession.wrapperCli = ds.session.wrapperCli;
   childSession.agentFrozen = ds.session.agentFrozen;
+  //   • skillLoadout: same class of per-session override as model/effort above.
+  //     forkWorker resolves `session.skillLoadout ?? botCfg.skills`, so a child
+  //     row without it silently re-equips from the CURRENT bot policy — the
+  //     clone would enter with different skills than the session it forked
+  //     from. Copying keeps the child's loadout == the source's.
+  childSession.skillLoadout = ds.session.skillLoadout;
   childSession.nativeSessionTitle = childTitle;
   childSession.nativeSessionTitleUserDefined = true;
   sessionStore.updateSession(childSession);
