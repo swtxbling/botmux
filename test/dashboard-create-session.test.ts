@@ -198,6 +198,40 @@ describe('spawnDashboardSession — backlog (待办池) parks without starting t
     expect(sendMessageMock).toHaveBeenCalledTimes(1);
   });
 
+  it('persists a per-session Skill loadout onto the Session row', async () => {
+    // The loadout must be on the persisted row BEFORE the worker starts:
+    // forkWorker resolves `session.skillLoadout ?? botCfg.skills`, and a
+    // daemon restart re-reads the row rather than re-deriving from the bot.
+    const active = new Map<string, DaemonSession>();
+    const r = await spawnDashboardSession(active, undefined, {
+      larkAppId: APP, chatId: CHAT, content: '带装备开工', column: 'backlog', role: 'solo',
+      skillLoadout: { include: ['skill:review', 'pack:ops'] },
+    });
+    expect(r.ok).toBe(true);
+    const ds = active.get(sessionKey(CHAT, APP))!;
+    expect(ds.session.skillLoadout).toEqual({ include: ['skill:review', 'pack:ops'] });
+  });
+
+  it('leaves skillLoadout undefined when none was chosen, so the bot policy is inherited', async () => {
+    const active = new Map<string, DaemonSession>();
+    await spawnDashboardSession(active, undefined, {
+      larkAppId: APP, chatId: CHAT, content: '默认开工', column: 'backlog', role: 'solo',
+    });
+    const ds = active.get(sessionKey(CHAT, APP))!;
+    expect(ds.session.skillLoadout).toBeUndefined();
+  });
+
+  it('persists an explicitly empty loadout as "no skills", not as inherit', async () => {
+    const active = new Map<string, DaemonSession>();
+    await spawnDashboardSession(active, undefined, {
+      larkAppId: APP, chatId: CHAT, content: '空手开工', column: 'backlog', role: 'solo',
+      skillLoadout: { include: [] },
+    });
+    const ds = active.get(sessionKey(CHAT, APP))!;
+    expect(ds.session.skillLoadout).toEqual({ include: [] });
+    expect(ds.session.skillLoadout).not.toBeUndefined();
+  });
+
   it('banner posts the FULL content (no 300-char truncation that dropped the tail in the group)', async () => {
     const active = new Map<string, DaemonSession>();
     // >300 chars so the tail sits past the old slice(0,300) cutoff

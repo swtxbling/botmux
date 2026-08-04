@@ -5,7 +5,8 @@ import {
   deriveSessionTitleFromContent,
   deriveCreateGroupName,
   selectCreateSessionTargets,
-  sanitizeSessionLoadouts,
+  parseSessionLoadout,
+  parseSessionLoadouts,
   parseSpawnRequest,
   composeSpawnCodexAppContext,
   composeSpawnUserContent,
@@ -65,93 +66,160 @@ describe('selectCreateSessionTargets', () => {
   });
 });
 
-describe('parseSpawnRequest skillLoadout', () => {
-  const base = { chatId: 'oc_abc', content: '做点事', column: 'in_progress', role: 'solo' };
-
-  it('accepts a loadout forwarded for this bot', () => {
-    const r = parseSpawnRequest({ ...base, skillLoadout: { include: ['skill:review', 'pack:ops'] } });
-    expect(r.ok).toBe(true);
-    expect(r.ok && r.value.skillLoadout).toEqual({ include: ['skill:review', 'pack:ops'] });
-  });
-
-  it('leaves it undefined when absent, so the bot policy is inherited', () => {
-    const r = parseSpawnRequest(base);
-    expect(r.ok && r.value.skillLoadout).toBeUndefined();
-  });
-
-  it('preserves an explicitly empty loadout', () => {
-    const r = parseSpawnRequest({ ...base, skillLoadout: { include: [] } });
-    expect(r.ok && r.value.skillLoadout).toEqual({ include: [] });
-  });
-
-  it('re-validates selectors rather than trusting the aggregator', () => {
-    // The daemon endpoint is reachable independently of the dashboard
-    // aggregator, so it must not assume the map was already sanitized.
-    const r = parseSpawnRequest({ ...base, skillLoadout: { include: ['skill:ok', 'workflow:evil', 'pack:'] } });
-    expect(r.ok && r.value.skillLoadout).toEqual({ include: ['skill:ok'] });
-  });
-
-  it('ignores a structurally invalid loadout instead of failing the spawn', () => {
-    for (const bad of ['nope', 42, [], { include: 'x' }]) {
-      const r = parseSpawnRequest({ ...base, skillLoadout: bad });
-      expect(r.ok).toBe(true);
-      expect(r.ok && r.value.skillLoadout).toBeUndefined();
-    }
-  });
-});
-
-describe('sanitizeSessionLoadouts', () => {
-  // A loadout REPLACES the bot's own policy for the spawned session, so this
-  // sanitizer is the boundary that keeps a create-session request from
-  // configuring bots that will never spawn, or smuggling unknown selectors.
-  const leadTargets = selectCreateSessionTargets('lead', ['lead', 'sub-a'], 'lead');
+describe('session Skill loadout validation (fail-closed)', () => {
+  // A loadout REPLACES the bot's own policy for the spawned session, so the
+  // three outcomes must stay distinguishable. Filtering unknown selectors used
+  // to turn `['workflow:evil']` into `{ include: [] }` — bad input silently
+  // became the single most destructive VALID meaning ("carry no skills at
+  // all"), and a mixed list applied only partially. Both are now errors.
   const allTargets = selectCreateSessionTargets('all', ['lead', 'sub-a'], 'lead');
+  const leadTargets = selectCreateSessionTargets('lead', ['lead', 'sub-a'], 'lead');
 
-  it('Lead mode keeps only the Lead: a sub-bot loadout would never take effect', () => {
-    const result = sanitizeSessionLoadouts({
-      lead: { include: ['skill:deploy'] },
-      'sub-a': { include: ['skill:review'] },
-    }, leadTargets);
-    expect(result).toEqual({ lead: { include: ['skill:deploy'] } });
-    expect(result?.['sub-a']).toBeUndefined();
-  });
+  describe('parseSessionLoadout: the three states', () => {
+    it('absent means inherit', () => {
+      for (const absent of [undefined, null]) {
+        const r = parseSessionLoadout(absent);
+        expect(r.ok && r.value).toBeUndefined();
+      }
+    });
 
-  it('all mode keeps one entry per target bot', () => {
-    expect(sanitizeSessionLoadouts({
-      lead: { include: ['skill:deploy'] },
-      'sub-a': { include: ['pack:ops'] },
-    }, allTargets)).toEqual({
-      lead: { include: ['skill:deploy'] },
-      'sub-a': { include: ['pack:ops'] },
+    it('valid is kept verbatim, including an explicit empty policy', () => {
+      expect(parseSessionLoadout({ include: ['skill:a', 'pack:ops'] }))
+        .toEqual({ ok: true, value: { include: ['skill:a', 'pack:ops'] } });
+      expect(parseSessionLoadout({ include: [] })).toEqual({ ok: true, value: { include: [] } });
+    });
+
+    it('rejects unknown selector kinds instead of filtering them away', () => {
+      expect(parseSessionLoadout({ include: ['workflow:evil'] })).toEqual({ ok: false, error: 'bad_skill_loadout' });
+    });
+
+    it('rejects a mixed list rather than applying it partially', () => {
+      expect(parseSessionLoadout({ include: ['skill:ok', 'workflow:evil'] }))
+        .toEqual({ ok: false, error: 'bad_skill_loadout' });
+    });
+
+    it('rejects malformed selectors and non-strings', () => {
+      for (const bad of [['skill:'], ['pack:'], [''], ['nocolon'], [42], [null]]) {
+        expect(parseSessionLoadout({ include: bad })).toEqual({ ok: false, error: 'bad_skill_loadout' });
+      }
+    });
+
+    it('rejects structurally invalid payloads instead of falling back to inherit', () => {
+      for (const bad of ['nope', 42, [], { include: 'x' }, {}]) {
+        expect(parseSessionLoadout(bad)).toEqual({ ok: false, error: 'bad_skill_loadout' });
+      }
+    });
+
+    it('dedupes, which is not filtering: duplicates carry no distinct intent', () => {
+      expect(parseSessionLoadout({ include: ['skill:a', 'skill:a'] }))
+        .toEqual({ ok: true, value: { include: ['skill:a'] } });
     });
   });
 
-  it('drops keys for bots that are not spawn targets at all', () => {
-    expect(sanitizeSessionLoadouts({ stranger: { include: ['skill:deploy'] } }, allTargets)).toBeUndefined();
+  describe('parseSessionLoadouts: per-bot map', () => {
+    it('Lead mode keeps only the Lead; a sub-bot entry would never take effect', () => {
+      const r = parseSessionLoadouts({
+        lead: { include: ['skill:deploy'] },
+        'sub-a': { include: ['skill:review'] },
+      }, leadTargets);
+      expect(r).toEqual({ ok: true, value: { lead: { include: ['skill:deploy'] } } });
+    });
+
+    it('all mode keeps one entry per target bot', () => {
+      const r = parseSessionLoadouts({
+        lead: { include: ['skill:deploy'] },
+        'sub-a': { include: ['pack:ops'] },
+      }, allTargets);
+      expect(r.ok && r.value).toEqual({
+        lead: { include: ['skill:deploy'] },
+        'sub-a': { include: ['pack:ops'] },
+      });
+    });
+
+    it('drops non-target keys without failing the request', () => {
+      // A bot that failed to join is not the submitter's mistake, and an
+      // ignored key cannot clear anyone's skills.
+      const r = parseSessionLoadouts({ stranger: { include: ['skill:a'] } }, allTargets);
+      expect(r).toEqual({ ok: true, value: undefined });
+    });
+
+    it('fails the whole request when a TARGET bot has a malformed entry', () => {
+      expect(parseSessionLoadouts({ lead: { include: ['workflow:evil'] } }, allTargets))
+        .toEqual({ ok: false, error: 'bad_skill_loadout' });
+    });
+
+    it('ignores a malformed entry belonging to a non-target bot', () => {
+      expect(parseSessionLoadouts({ stranger: 'garbage' }, allTargets)).toEqual({ ok: true, value: undefined });
+    });
+
+    it('omits bots with no entry so they inherit, rather than inventing an empty policy', () => {
+      const r = parseSessionLoadouts({ lead: { include: ['skill:deploy'] } }, allTargets);
+      expect(Object.keys((r.ok && r.value) || {})).toEqual(['lead']);
+    });
+
+    it('passes an explicitly empty loadout through untouched', () => {
+      expect(parseSessionLoadouts({ lead: { include: [] } }, allTargets).ok
+        && parseSessionLoadouts({ lead: { include: [] } }, allTargets).value)
+        .toEqual({ lead: { include: [] } });
+    });
+
+    it('absent map means no per-session loadouts at all', () => {
+      expect(parseSessionLoadouts(undefined, allTargets)).toEqual({ ok: true, value: undefined });
+    });
   });
 
-  it('omits bots with no entry so they inherit, rather than inventing an empty policy', () => {
-    // Absent = inherit; `{ include: [] }` = explicitly no skills. Collapsing the
-    // two here would silently strip a bot's skills on every session creation.
-    const result = sanitizeSessionLoadouts({ lead: { include: ['skill:deploy'] } }, allTargets);
-    expect(Object.keys(result ?? {})).toEqual(['lead']);
-    expect(result?.['sub-a']).toBeUndefined();
-  });
+  describe('end to end: aggregator narrowing → per-bot forwarding → spawn parsing', () => {
+    it('Lead mode forwards the loadout only to the Lead', () => {
+      const targets = selectCreateSessionTargets('lead', ['lead', 'sub-a'], 'lead');
+      const map = parseSessionLoadouts({
+        lead: { include: ['skill:review'] },
+        'sub-a': { include: ['skill:never-applies'] },
+      }, targets);
+      expect(map.ok).toBe(true);
 
-  it('preserves an explicitly empty loadout', () => {
-    expect(sanitizeSessionLoadouts({ lead: { include: [] } }, allTargets)).toEqual({ lead: { include: [] } });
-  });
+      const forwarded = targets.map(appId => ({
+        appId,
+        body: { chatId: 'oc_x', content: 'go', column: 'in_progress', role: 'lead',
+          ...((map.ok && map.value?.[appId]) ? { skillLoadout: map.value[appId] } : {}) },
+      }));
+      expect(forwarded).toHaveLength(1);
+      const spawn = parseSpawnRequest(forwarded[0].body);
+      expect(spawn.ok && spawn.value.skillLoadout).toEqual({ include: ['skill:review'] });
+    });
 
-  it('accepts only skill:/pack: selectors and dedupes them', () => {
-    expect(sanitizeSessionLoadouts({
-      lead: { include: ['skill:a', 'skill:a', 'pack:ops', 'workflow:evil', 'skill:', 'pack:', '', 42] },
-    }, allTargets)).toEqual({ lead: { include: ['skill:a', 'pack:ops'] } });
-  });
+    it('all mode gives each bot only its own entry, and an unconfigured bot omits the field', () => {
+      const targets = selectCreateSessionTargets('all', ['lead', 'sub-a'], 'lead');
+      const map = parseSessionLoadouts({ lead: { include: ['skill:review'] } }, targets);
+      const bodies = Object.fromEntries(targets.map(appId => [appId, {
+        chatId: 'oc_x', content: 'go', column: 'in_progress', role: 'collab',
+        ...((map.ok && map.value?.[appId]) ? { skillLoadout: map.value[appId] } : {}),
+      }]));
 
-  it('returns undefined for structurally invalid payloads instead of throwing', () => {
-    for (const bad of [undefined, null, 'nope', 42, [], { lead: null }, { lead: [] }, { lead: { include: 'x' } }]) {
-      expect(sanitizeSessionLoadouts(bad, allTargets)).toBeUndefined();
-    }
+      expect('skillLoadout' in bodies['sub-a']).toBe(false);
+      const leadSpawn = parseSpawnRequest(bodies.lead);
+      const subSpawn = parseSpawnRequest(bodies['sub-a']);
+      expect(leadSpawn.ok && leadSpawn.value.skillLoadout).toEqual({ include: ['skill:review'] });
+      expect(subSpawn.ok && subSpawn.value.skillLoadout).toBeUndefined();
+    });
+
+    it('an explicit empty loadout survives the whole chain', () => {
+      const targets = selectCreateSessionTargets('all', ['lead'], 'lead');
+      const map = parseSessionLoadouts({ lead: { include: [] } }, targets);
+      const spawn = parseSpawnRequest({
+        chatId: 'oc_x', content: 'go', column: 'in_progress', role: 'solo',
+        skillLoadout: (map.ok && map.value?.lead),
+      });
+      expect(spawn.ok && spawn.value.skillLoadout).toEqual({ include: [] });
+    });
+
+    it('the spawn endpoint re-validates rather than trusting the aggregator', () => {
+      // /api/sessions/spawn is reachable independently of the Dashboard.
+      const spawn = parseSpawnRequest({
+        chatId: 'oc_x', content: 'go', column: 'in_progress', role: 'solo',
+        skillLoadout: { include: ['skill:ok', 'workflow:evil'] },
+      });
+      expect(spawn).toEqual({ ok: false, error: 'bad_skill_loadout' });
+    });
   });
 });
 
