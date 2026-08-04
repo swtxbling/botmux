@@ -489,6 +489,19 @@ export interface Session {
   /** Optional codex reasoning effort frozen at creation (per-turn API override).
    *  Only meaningful for codex/codex-app; injected as model_reasoning_effort at spawn. */
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
+  /** Per-session Skill loadout, chosen when the session was created ("confirm
+   *  your loadout before entering the dungeon"). Frozen with the other
+   *  creation-time overrides above, so later edits to the bot's own policy do
+   *  not silently re-equip a running session, and a daemon restart resumes with
+   *  the same loadout.
+   *
+   *  `undefined` — the overwhelmingly common case, and what every automatic
+   *  spawn path (new Lark topic, schedule, trigger, webhook) leaves it as —
+   *  means "inherit the bot policy", i.e. byte-identical behaviour to before
+   *  this field existed. Replaces the bot policy wholesale when set; the
+   *  creation UI pre-fills it from the bot so "replace" and "extend" never
+   *  become an ambiguity the backend has to guess at. */
+  skillLoadout?: BotSkillPolicy | null;
   /**
    * True once `cliId`/`cliPathOverride`/`wrapperCli`/`model` have been frozen for
    * this session (see `sessionAgentConfig`). Gates the one-time freeze so it runs

@@ -87,7 +87,22 @@ export function resolveSkillPolicy(input: SkillPolicyInput): SkillPolicyResult {
   const packSelectors = include.filter((s) => s.startsWith('pack:'));
 
   for (const selector of directSelectors) {
+    const before = raw.length;
     appendMatches(raw, candidates, selector, 'bot:include');
+    // `skill:` is an exact-name match with no wildcard, so "matched nothing"
+    // always means "not installed". Name it, the way `pack:` already does:
+    // previously a direct reference to a missing skill vanished silently
+    // unless it happened to leave the whole set empty, which made a
+    // hand-picked session loadout look like it applied when it had not.
+    if (raw.length === before) {
+      const skillName = skillNameFromSelector(selector);
+      diagnostics.push({
+        level: 'warn',
+        code: 'skill_not_found',
+        message: `Skill not found: ${skillName}`,
+        skillName,
+      });
+    }
   }
   for (const selector of packSelectors) {
     const packId = selector.slice('pack:'.length);

@@ -6483,7 +6483,11 @@ export function forkWorker(
     ...(initAtMostOnce ? { atMostOnce: true } : {}),
     vcMeetingImTurnOrigin: initVcMeetingImTurnOrigin,
     pluginBindings: botCfg.plugins,
-    skillPolicy: botCfg.skills,
+    // A session-scoped loadout replaces the bot policy for this session only.
+    // Resolved here rather than in the worker so restore/resume re-sends the
+    // same frozen loadout, and so every downstream stage (policy resolution,
+    // pack expansion, delivery, prompt catalog) stays on one code path.
+    skillPolicy: ds.session.skillLoadout ?? botCfg.skills,
     ...(runtimeIdentity.status === 'known'
       ? { runnerBuildId: runtimeIdentity.id }
       : {}),
