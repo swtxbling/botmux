@@ -5,6 +5,7 @@ import {
   deriveSessionTitleFromContent,
   deriveCreateGroupName,
   selectCreateSessionTargets,
+  buildSessionSpawnRequests,
   parseSessionLoadout,
   parseSessionLoadouts,
   parseSpawnRequest,
@@ -76,11 +77,16 @@ describe('session Skill loadout validation (fail-closed)', () => {
   const leadTargets = selectCreateSessionTargets('lead', ['lead', 'sub-a'], 'lead');
 
   describe('parseSessionLoadout: the three states', () => {
-    it('absent means inherit', () => {
-      for (const absent of [undefined, null]) {
-        const r = parseSessionLoadout(absent);
-        expect(r.ok && r.value).toBeUndefined();
-      }
+    it('only an ABSENT field means inherit', () => {
+      expect(parseSessionLoadout(undefined)).toEqual({ ok: true, value: undefined });
+    });
+
+    it('explicit null is rejected, not treated as inherit', () => {
+      // null is a value the caller chose to send, not a missing key. Accepting
+      // it as inherit would give a second, silent way to say something the
+      // contract requires stating with a real policy object.
+      expect(parseSessionLoadout(null)).toEqual({ ok: false, error: 'bad_skill_loadout' });
+      expect(parseSessionLoadouts({ lead: null }, ['lead'])).toEqual({ ok: false, error: 'bad_skill_loadout' });
     });
 
     it('valid is kept verbatim, including an explicit empty policy', () => {
@@ -105,7 +111,7 @@ describe('session Skill loadout validation (fail-closed)', () => {
     });
 
     it('rejects structurally invalid payloads instead of falling back to inherit', () => {
-      for (const bad of ['nope', 42, [], { include: 'x' }, {}]) {
+      for (const bad of ['nope', 42, [], { include: 'x' }, {}, null]) {
         expect(parseSessionLoadout(bad)).toEqual({ ok: false, error: 'bad_skill_loadout' });
       }
     });
@@ -168,8 +174,48 @@ describe('session Skill loadout validation (fail-closed)', () => {
     });
   });
 
-  describe('end to end: aggregator narrowing → per-bot forwarding → spawn parsing', () => {
-    it('Lead mode forwards the loadout only to the Lead', () => {
+  describe('validation must not depend on side-effects having happened', () => {
+    // The route validates against EXPECTED targets (lead id / all selected ids)
+    // before /api/groups/create runs, then re-narrows to the bots that actually
+    // joined. Validating only after group creation meant an invalid payload
+    // returned 400 with an orphaned Lark group already created — and a user
+    // retrying would mint one on every attempt.
+    it('expected targets are computable from the request alone, before any group exists', () => {
+      expect(selectCreateSessionTargets('lead', ['lead', 'sub-a'], 'lead')).toEqual(['lead']);
+      expect(selectCreateSessionTargets('all', ['lead', 'sub-a'], 'lead')).toEqual(['lead', 'sub-a']);
+    });
+
+    it('an invalid payload is rejectable against expected targets', () => {
+      const expected = selectCreateSessionTargets('all', ['lead', 'sub-a'], 'lead');
+      expect(parseSessionLoadouts({ lead: { include: ['workflow:evil'] } }, expected))
+        .toEqual({ ok: false, error: 'bad_skill_loadout' });
+    });
+
+    it('re-narrowing a pre-validated map to actually-joined bots can only drop, never fail', () => {
+      const expected = selectCreateSessionTargets('all', ['lead', 'sub-a'], 'lead');
+      const preflight = parseSessionLoadouts({
+        lead: { include: ['skill:a'] },
+        'sub-a': { include: ['skill:b'] },
+      }, expected);
+      expect(preflight.ok).toBe(true);
+
+      // sub-a failed to join, so the real targets are narrower.
+      const joinedTargets = ['lead'];
+      const narrowed = Object.fromEntries(
+        Object.entries((preflight.ok && preflight.value) || {}).filter(([id]) => joinedTargets.includes(id)),
+      );
+      expect(Object.keys(narrowed)).toEqual(['lead']);
+      expect(narrowed.lead).toEqual({ include: ['skill:a'] });
+    });
+  });
+
+  describe('end to end via the production request builder', () => {
+    // buildSessionSpawnRequests is the SAME function /api/sessions/create uses.
+    // Re-deriving this mapping inside the test would only prove the test's own
+    // arithmetic — which is how "group created, then 400" went unnoticed.
+    const nameOf = (id: string) => `name-${id}`;
+
+    it('Lead mode sends a spawn request only to the Lead, carrying its loadout', () => {
       const targets = selectCreateSessionTargets('lead', ['lead', 'sub-a'], 'lead');
       const map = parseSessionLoadouts({
         lead: { include: ['skill:review'] },
@@ -177,48 +223,75 @@ describe('session Skill loadout validation (fail-closed)', () => {
       }, targets);
       expect(map.ok).toBe(true);
 
-      const forwarded = targets.map(appId => ({
-        appId,
-        body: { chatId: 'oc_x', content: 'go', column: 'in_progress', role: 'lead',
-          ...((map.ok && map.value?.[appId]) ? { skillLoadout: map.value[appId] } : {}) },
-      }));
-      expect(forwarded).toHaveLength(1);
-      const spawn = parseSpawnRequest(forwarded[0].body);
+      const requests = buildSessionSpawnRequests({
+        chatId: 'oc_x', content: 'go', column: 'in_progress', mode: 'lead',
+        targets, joinedIds: ['lead', 'sub-a'], creatorLarkAppId: 'lead', nameOf,
+        loadouts: map.ok ? map.value : undefined,
+      });
+
+      expect(requests.map(r => r.larkAppId)).toEqual(['lead']);
+      expect(requests[0].body.skillLoadout).toEqual({ include: ['skill:review'] });
+      expect(requests[0].body.role).toBe('lead');
+      expect(requests[0].body.postBanner).toBe(true);
+      // The spawn endpoint accepts what the route actually sends.
+      const spawn = parseSpawnRequest(requests[0].body);
       expect(spawn.ok && spawn.value.skillLoadout).toEqual({ include: ['skill:review'] });
     });
 
-    it('all mode gives each bot only its own entry, and an unconfigured bot omits the field', () => {
+    it('all mode gives each bot only its own entry and OMITS the key when unconfigured', () => {
       const targets = selectCreateSessionTargets('all', ['lead', 'sub-a'], 'lead');
       const map = parseSessionLoadouts({ lead: { include: ['skill:review'] } }, targets);
-      const bodies = Object.fromEntries(targets.map(appId => [appId, {
-        chatId: 'oc_x', content: 'go', column: 'in_progress', role: 'collab',
-        ...((map.ok && map.value?.[appId]) ? { skillLoadout: map.value[appId] } : {}),
-      }]));
+      const requests = buildSessionSpawnRequests({
+        chatId: 'oc_x', content: 'go', column: 'in_progress', mode: 'all',
+        targets, joinedIds: targets, creatorLarkAppId: 'lead', nameOf,
+        loadouts: map.ok ? map.value : undefined,
+      });
 
-      expect('skillLoadout' in bodies['sub-a']).toBe(false);
-      const leadSpawn = parseSpawnRequest(bodies.lead);
-      const subSpawn = parseSpawnRequest(bodies['sub-a']);
-      expect(leadSpawn.ok && leadSpawn.value.skillLoadout).toEqual({ include: ['skill:review'] });
-      expect(subSpawn.ok && subSpawn.value.skillLoadout).toBeUndefined();
+      const byBot = Object.fromEntries(requests.map(r => [r.larkAppId, r.body]));
+      expect(byBot.lead.skillLoadout).toEqual({ include: ['skill:review'] });
+      // Absent key, not `undefined` value: JSON.stringify must not emit it.
+      expect('skillLoadout' in byBot['sub-a']).toBe(false);
+      expect(JSON.stringify(byBot['sub-a'])).not.toContain('skillLoadout');
+      expect(parseSpawnRequest(byBot['sub-a']).ok
+        && parseSpawnRequest(byBot['sub-a']).value.skillLoadout).toBeUndefined();
     });
 
-    it('an explicit empty loadout survives the whole chain', () => {
+    it('passes an explicitly empty loadout through the real builder untouched', () => {
       const targets = selectCreateSessionTargets('all', ['lead'], 'lead');
       const map = parseSessionLoadouts({ lead: { include: [] } }, targets);
-      const spawn = parseSpawnRequest({
-        chatId: 'oc_x', content: 'go', column: 'in_progress', role: 'solo',
-        skillLoadout: (map.ok && map.value?.lead),
+      const requests = buildSessionSpawnRequests({
+        chatId: 'oc_x', content: 'go', column: 'in_progress', mode: 'all',
+        targets, joinedIds: targets, creatorLarkAppId: 'lead', nameOf,
+        loadouts: map.ok ? map.value : undefined,
       });
+      expect(requests[0].body.skillLoadout).toEqual({ include: [] });
+      const spawn = parseSpawnRequest(requests[0].body);
       expect(spawn.ok && spawn.value.skillLoadout).toEqual({ include: [] });
     });
 
+    it('never leaks another bot\'s loadout into a request', () => {
+      const targets = selectCreateSessionTargets('all', ['a', 'b'], 'a');
+      const map = parseSessionLoadouts({
+        a: { include: ['skill:for-a'] },
+        b: { include: ['skill:for-b'] },
+      }, targets);
+      const requests = buildSessionSpawnRequests({
+        chatId: 'oc_x', content: 'go', column: 'in_progress', mode: 'all',
+        targets, joinedIds: targets, creatorLarkAppId: 'a', nameOf,
+        loadouts: map.ok ? map.value : undefined,
+      });
+      for (const request of requests) {
+        const serialized = JSON.stringify(request.body);
+        const otherSkill = request.larkAppId === 'a' ? 'skill:for-b' : 'skill:for-a';
+        expect(serialized).not.toContain(otherSkill);
+      }
+    });
+
     it('the spawn endpoint re-validates rather than trusting the aggregator', () => {
-      // /api/sessions/spawn is reachable independently of the Dashboard.
-      const spawn = parseSpawnRequest({
+      expect(parseSpawnRequest({
         chatId: 'oc_x', content: 'go', column: 'in_progress', role: 'solo',
         skillLoadout: { include: ['skill:ok', 'workflow:evil'] },
-      });
-      expect(spawn).toEqual({ ok: false, error: 'bad_skill_loadout' });
+      })).toEqual({ ok: false, error: 'bad_skill_loadout' });
     });
   });
 });
