@@ -200,7 +200,7 @@ import { aggregateRoleBatch, parseRoleBatchTargets } from './dashboard/roles-bat
 import { automateOpenPlatformSetup, vcListenerEventGateError } from './setup/open-platform-automation.js';
 import { VC_MEETING_FEATURE_SCOPES, VC_MEETING_REALTIME_VOICE_SCOPES } from './setup/verify-permissions.js';
 import { maybeInstallTraexPluginOnSettingsChange, TRAEX_RECOMMENDED_SOURCE, TRAEX_RECOMMENDED_REF } from './setup/ensure-herdr-integrations.js';
-import { deriveCreateGroupName, sanitizeSessionLoadouts, selectCreateSessionTargets } from './core/session-create.js';
+import { deriveCreateGroupName, parseSessionLoadouts, selectCreateSessionTargets } from './core/session-create.js';
 import { parseDashboardImageUploads } from './core/dashboard-images.js';
 import { checkLarkCliVersion, MIN_LARK_CLI_VERSION_FOR_VC_BOT } from './vc-agent/polling-source.js';
 import { larkHosts } from './im/lark/lark-hosts.js';
@@ -5335,8 +5335,13 @@ const server = createServer(async (req, res) => {
 
       // Per-bot Skill loadout, narrowed to bots that actually spawn. In Lead
       // mode the subs are not targets, so a loadout for them is dropped here
-      // rather than becoming configuration the user believes is active.
-      const sessionLoadouts = sanitizeSessionLoadouts(parsed.skillLoadouts, targets);
+      // rather than becoming configuration the user believes is active. A
+      // malformed entry fails the request instead of being reinterpreted —
+      // silently turning it into `{ include: [] }` would strip that session's
+      // skills entirely.
+      const loadoutsParsed = parseSessionLoadouts(parsed.skillLoadouts, targets);
+      if (!loadoutsParsed.ok) return jsonRes(res, 400, { ok: false, error: loadoutsParsed.error });
+      const sessionLoadouts = loadoutsParsed.value;
       const bots = liveBots();
       const nameOf = (id: string) => bots.find(b => b.larkAppId === id)?.botName ?? id;
       const spawned: string[] = [];

@@ -78,45 +78,65 @@ export function selectCreateSessionTargets(
   return [...joinedIds];
 }
 
-/** Sanitize the per-bot Skill loadout map submitted with a create-session
- *  request. Deliberately narrow, because a loadout REPLACES the bot's own
- *  policy for the spawned session:
+function isValidSkillSelector(value: unknown): value is SkillSelector {
+  if (typeof value !== 'string') return false;
+  const separator = value.indexOf(':');
+  if (separator < 0 || separator === value.length - 1) return false;
+  const kind = value.slice(0, separator);
+  return kind === 'skill' || kind === 'pack';
+}
+
+/** Validate ONE bot's Skill loadout. Fail-closed on purpose: a loadout
+ *  REPLACES the bot's own policy for the spawned session, so the three
+ *  outcomes must stay distinguishable and an unparseable one must never be
+ *  quietly reinterpreted.
  *
- *   • only keys that are actually spawn targets survive — in Lead mode the
- *     sub-bots never spawn, so a loadout for them would be configuration the
- *     user believes is active while nothing applies it;
- *   • a bot with no entry stays absent rather than becoming `{ include: [] }`,
- *     since absent means "inherit the bot policy" and empty means "explicitly
- *     no skills" — collapsing the two would silently strip skills;
- *   • entries are rebuilt from validated `skill:` / `pack:` selectors only, so
- *     a hand-crafted request cannot smuggle unknown selector kinds into a
- *     session policy.
+ *   • absent            → `undefined`, inherit the bot policy;
+ *   • valid             → kept verbatim, INCLUDING an explicit `{ include: [] }`;
+ *   • anything else     → `bad_skill_loadout`.
  *
- *  Returns undefined when nothing survives, so callers can pass it straight
- *  through to an optional field. */
-export function sanitizeSessionLoadouts(
+ *  Note what this does NOT do: it does not filter unknown selectors. Filtering
+ *  turned `['workflow:evil']` into `{ include: [] }`, i.e. bad input silently
+ *  became the most destructive valid meaning ("this session carries no skills
+ *  at all"), and a mixed list applied only partially. Neither is recoverable by
+ *  the caller, so both are now hard errors. */
+export function parseSessionLoadout(raw: unknown): ParseResult<BotSkillPolicy | undefined> {
+  if (raw === undefined || raw === null) return { ok: true, value: undefined };
+  if (typeof raw !== 'object' || Array.isArray(raw)) return { ok: false, error: 'bad_skill_loadout' };
+  const include = (raw as { include?: unknown }).include;
+  if (!Array.isArray(include)) return { ok: false, error: 'bad_skill_loadout' };
+  if (!include.every(isValidSkillSelector)) return { ok: false, error: 'bad_skill_loadout' };
+  // Deduplication is not filtering: duplicates carry no meaning a caller could
+  // have intended, and the resolver dedupes downstream anyway.
+  return { ok: true, value: { include: [...new Set(include)] } };
+}
+
+/** Validate the per-bot loadout map submitted with a create-session request.
+ *
+ *  Keys that are not spawn targets are DROPPED rather than rejected, and that
+ *  asymmetry is deliberate: in Lead mode the subs never spawn, and a bot may
+ *  simply have failed to join the new group — neither is the submitter's
+ *  mistake, and neither can clear anyone's skills. An entry whose *value* is
+ *  malformed is a different matter and fails the whole request.
+ *
+ *  A bot with no entry stays absent rather than becoming `{ include: [] }`:
+ *  absent means "inherit", empty means "explicitly no skills", and collapsing
+ *  the two would strip that bot's skills on every session creation. */
+export function parseSessionLoadouts(
   raw: unknown,
   targets: readonly string[],
-): Record<string, BotSkillPolicy> | undefined {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+): ParseResult<Record<string, BotSkillPolicy> | undefined> {
+  if (raw === undefined || raw === null) return { ok: true, value: undefined };
+  if (typeof raw !== 'object' || Array.isArray(raw)) return { ok: false, error: 'bad_skill_loadout' };
   const allowed = new Set(targets);
   const out: Record<string, BotSkillPolicy> = {};
   for (const [larkAppId, value] of Object.entries(raw as Record<string, unknown>)) {
     if (!allowed.has(larkAppId)) continue;
-    if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
-    const include = (value as { include?: unknown }).include;
-    if (!Array.isArray(include)) continue;
-    const selectors = include.filter(
-      (selector): selector is SkillSelector =>
-        typeof selector === 'string'
-        && (selector.startsWith('skill:') || selector.startsWith('pack:'))
-        && selector.length > selector.indexOf(':') + 1,
-    );
-    // An empty array is meaningful ("no skills"), so keep it — only a
-    // structurally invalid entry is dropped above.
-    out[larkAppId] = { include: [...new Set(selectors)] };
+    const parsed = parseSessionLoadout(value);
+    if (!parsed.ok) return parsed;
+    if (parsed.value) out[larkAppId] = parsed.value;
   }
-  return Object.keys(out).length > 0 ? out : undefined;
+  return { ok: true, value: Object.keys(out).length > 0 ? out : undefined };
 }
 
 function coworkerListBlock(coworkers: Coworker[]): string {
@@ -263,6 +283,11 @@ export function parseSpawnRequest(body: unknown): ParseResult<SpawnRequest> {
   const title = typeof b.title === 'string' && b.title.trim() ? b.title.trim().slice(0, 200) : undefined;
   const parsedImages = parseDashboardImageUploads(b.images);
   if (!parsedImages.ok) return { ok: false, error: parsedImages.error };
+  // The daemon endpoint is reachable independently of the Dashboard
+  // aggregator, so it re-validates rather than trusting the caller — and it
+  // rejects instead of filtering, for the same reason.
+  const loadout = parseSessionLoadout(b.skillLoadout);
+  if (!loadout.ok) return { ok: false, error: loadout.error };
   return {
     ok: true,
     value: {
@@ -275,12 +300,7 @@ export function parseSpawnRequest(body: unknown): ParseResult<SpawnRequest> {
       ownerUnionId: typeof b.ownerUnionId === 'string' && b.ownerUnionId.trim() ? b.ownerUnionId.trim() : undefined,
       title,
       images: parsedImages.images,
-      // Reuse the same validation as the aggregator's map form: a single entry
-      // keyed by a placeholder, so selector filtering stays in one place.
-      ...(() => {
-        const one = sanitizeSessionLoadouts({ self: b.skillLoadout }, ['self']);
-        return one?.self ? { skillLoadout: one.self } : {};
-      })(),
+      ...(loadout.value ? { skillLoadout: loadout.value } : {}),
     },
   };
 }
