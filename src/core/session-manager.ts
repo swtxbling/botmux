@@ -4,6 +4,7 @@
  * session restoration, and scheduled task execution.
  */
 import { existsSync, statSync } from 'node:fs';
+import type { BotSkillPolicy } from './skills/types.js';
 import { randomUUID } from 'node:crypto';
 import { basename, join, resolve } from 'node:path';
 import { expandHome } from './working-dir.js';
@@ -3192,6 +3193,9 @@ export interface SpawnDashboardSessionArgs {
   attachments?: LarkAttachment[];
   /** 会话标题，缺省取内容首行。 */
   title?: string;
+  /** 本次会话的 Skill loadout（仅本 bot）。缺省=继承 bot 策略；
+   *  `{ include: [] }`=显式不带任何 Skill。 */
+  skillLoadout?: BotSkillPolicy;
   /** 是否在群里发一条可见的任务横幅（只由 creator/lead 那一次 spawn 发，避免 N 个 bot 重复刷屏）。 */
   postBanner?: boolean;
   /** 会话归属人 open_id（本 bot 作用域）；缺省回退本 bot 首个 allowedUser。 */
@@ -3287,6 +3291,10 @@ export async function spawnDashboardSession(
     if (args.ownerUnionId) session.ownerUnionId = args.ownerUnionId;
     session.lastMessageAt = new Date(now).toISOString();
     if (args.attachments?.length) session.dashboardAttachments = args.attachments;
+    // Frozen at creation like cliId/model: forkWorker resolves
+    // `session.skillLoadout ?? botCfg.skills`, so leaving it undefined keeps the
+    // pre-loadout behaviour byte-for-byte.
+    if (args.skillLoadout) session.skillLoadout = args.skillLoadout;
     if (column === 'backlog') {
       session.queued = true;
       session.queuedPrompt = userContent;

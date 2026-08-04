@@ -219,7 +219,7 @@ import { aggregateRoleBatch, parseRoleBatchTargets } from './dashboard/roles-bat
 import { automateOpenPlatformSetup, vcListenerEventGateError } from './setup/open-platform-automation.js';
 import { VC_MEETING_FEATURE_SCOPES, VC_MEETING_REALTIME_VOICE_SCOPES } from './setup/verify-permissions.js';
 import { maybeInstallTraexPluginOnSettingsChange, TRAEX_RECOMMENDED_SOURCE, TRAEX_RECOMMENDED_REF } from './setup/ensure-herdr-integrations.js';
-import { deriveCreateGroupName, selectCreateSessionTargets } from './core/session-create.js';
+import { deriveCreateGroupName, sanitizeSessionLoadouts, selectCreateSessionTargets } from './core/session-create.js';
 import { parseDashboardImageUploads } from './core/dashboard-images.js';
 import { checkLarkCliVersion, MIN_LARK_CLI_VERSION_FOR_VC_BOT } from './vc-agent/polling-source.js';
 import { larkHosts, normalizeBrand } from './im/lark/lark-hosts.js';
@@ -5523,6 +5523,7 @@ const server = createServer(async (req, res) => {
         content?: unknown; larkAppIds?: unknown; mode?: unknown; column?: unknown;
         leadLarkAppId?: unknown; name?: unknown; bindWorkingDir?: unknown; images?: unknown;
         feedGroupId?: unknown; newFeedGroupName?: unknown; feedGroupAppId?: unknown;
+        skillLoadouts?: unknown;
       };
       try {
         const chunks: Buffer[] = [];
@@ -5626,6 +5627,10 @@ const server = createServer(async (req, res) => {
         return jsonRes(res, 200, { ok: true, chatId, shareLink: groupResp.shareLink, spawned: [], failed: [], warning: 'no_spawn_target', feedGroupId, feedGroupError });
       }
 
+      // Per-bot Skill loadout, narrowed to bots that actually spawn. In Lead
+      // mode the subs are not targets, so a loadout for them is dropped here
+      // rather than becoming configuration the user believes is active.
+      const sessionLoadouts = sanitizeSessionLoadouts(parsed.skillLoadouts, targets);
       const bots = liveBots();
       const nameOf = (id: string) => bots.find(b => b.larkAppId === id)?.botName ?? id;
       const spawned: string[] = [];
@@ -5643,6 +5648,9 @@ const server = createServer(async (req, res) => {
               chatId, content, column, role, coworkers,
               images: parsedImages.images,
               postBanner: appId === creatorLarkAppId,
+              // Only this bot's own entry — never the whole map. A bot with no
+              // entry gets undefined and inherits its own policy.
+              ...(sessionLoadouts?.[appId] ? { skillLoadout: sessionLoadouts[appId] } : {}),
             }),
           });
           const b = await up.json().catch(() => null);
