@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState, type DragEvent } from 'react';
 import { useT } from '../react-hooks.js';
 import { SectionHeader } from '../dashboard-components.js';
 import { buildSkillGraph, packIds, priorityNames, type BotGraphInfo } from './shared.js';
+import { SkillLoadoutPicker } from './skill-loadout-picker.js';
 import type { BotRow, SkillRow, StatusMessage } from './types.js';
 
 interface BotAssignmentsTabProps {
@@ -501,19 +502,6 @@ function BotAssignmentEditor(props: {
     setPackDraft(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
   };
 
-  const resolvedPreview = useMemo(() => {
-    const seen = new Map<string, string>(); // name -> source
-    for (const name of skillDraft) seen.set(name, 'direct');
-    for (const id of packDraft) {
-      const pack = props.packs.find(p => p.id === id);
-      if (pack) for (const inc of pack.include) {
-        const n = inc.replace('skill:', '');
-        if (!seen.has(n)) seen.set(n, `pack:${pack.name}`);
-      }
-    }
-    return [...seen.entries()].map(([name, source]) => ({ name, source }));
-  }, [skillDraft, packDraft, props.packs]);
-
   const save = async () => {
     setBusy(true);
     try {
@@ -533,43 +521,17 @@ function BotAssignmentEditor(props: {
         <h3>{tr('skills.botEdit')}: {props.bot.botName ?? props.bot.larkAppId}</h3>
         {props.status && <p className={`hint-${props.status.ok ? 'ok' : 'warn'}`}>{props.status.text}</p>}
 
-        <div className="skills-control-block">
-          <label>{tr('skills.packChips')}</label>
-          <div className="skills-pack-skill-list">
-            {props.packs.map(pack => (
-              <label key={pack.id} className="skills-pack-skill-item">
-                <input type="checkbox" checked={packDraft.has(pack.id)} onChange={() => togglePack(pack.id)} />
-                <span>{pack.name}</span>
-                <small>{tr('skills.skillCount', { count: pack.include.length })}</small>
-              </label>
-            ))}
-            {props.packs.length === 0 && <small className="muted">{tr('skills.packsEmpty')}</small>}
-          </div>
-        </div>
-
-        <div className="skills-control-block">
-          <label>{tr('skills.individualSkills')} ({tr('skills.advanced')})</label>
-          <div className="skills-pack-skill-list">
-            {props.skills.map(skill => (
-              <label key={skill.name} className="skills-pack-skill-item">
-                <input type="checkbox" checked={skillDraft.has(skill.name)} onChange={() => toggleSkill(skill.name)} />
-                <span>{skill.name}</span>
-              </label>
-            ))}
-          </div>
-        </div>
-
-        <div className="skills-control-block">
-          <label>{tr('skills.resolvedPreview')} ({resolvedPreview.length})</label>
-          <div className="skills-resolved-preview">
-            {resolvedPreview.map(({ name, source }) => (
-              <div key={name} className="skills-resolved-item">
-                <span>{name}</span>
-                <small className="muted">{source}</small>
-              </div>
-            ))}
-          </div>
-        </div>
+        {/* Shared with the per-session loadout picker so both places offer the
+            same pick affordance instead of two lookalike-but-different lists. */}
+        <SkillLoadoutPicker
+          skills={props.skills}
+          packs={props.packs}
+          selectedSkills={skillDraft}
+          selectedPacks={packDraft}
+          onToggleSkill={toggleSkill}
+          onTogglePack={togglePack}
+          idPrefix="bot-assignment"
+        />
 
         <div className="skills-dialog-actions">
           <button type="button" className="bd-button" onClick={props.onClose}>{tr('skills.cancel')}</button>
