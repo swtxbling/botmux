@@ -14,6 +14,7 @@
 | `/restart` | 重启 CLI 进程（保留 session 上下文） |
 | `/close` | 关闭会话并发送可恢复卡片（含 CLI 自身 resume 命令） |
 | `/rename <标题>` | 重命名当前 Botmux 会话，并同步运行中的 Codex/Claude 原生会话名 |
+| `/fork --create <新群名>` | 把当前空闲会话分身到一个新建群，源会话原样保留继续（仅 Claude 系 / Codex 终端模式；需在源会话所在话题内发起） |
 | `/card` | 手动召唤当前会话的流式卡片（关流式时也能召唤并恢复实时刷新；私密卡片模式下改发仅授权人可见的静态快照） |
 | `/term` | 获取当前会话的「可操作终端」（带写权限）链接，私密发给 owner（群内仅你可见，话题/单聊回退私信，不在群里暴露） |
 | `/dashboard [模块]` | 在飞书里打开 Dashboard 控制卡片（sessions/schedules/groups/settings/help 等） |
