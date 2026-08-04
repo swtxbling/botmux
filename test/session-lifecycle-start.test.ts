@@ -739,6 +739,55 @@ describe('session.start lifecycle integration', () => {
     }));
   });
 
+  // ── Per-session loadout: worker-pool resolves `session.skillLoadout ??
+  //    botCfg.skills` when composing the init message. These assertions hit
+  //    that exact line rather than re-implementing the `??` in a helper. ──
+  it('a session skillLoadout REPLACES the bot policy in the worker init message', () => {
+    const base = makeDs();
+    forkWorker({
+      ...base,
+      session: { ...base.session, skillLoadout: { include: ['skill:review', 'pack:ops'] } },
+    } as typeof base, 'hello', false);
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'init',
+      skillPolicy: { include: ['skill:review', 'pack:ops'] },
+    }));
+  });
+
+  it('an EMPTY loadout is an explicit "no skills", not a fallback to the bot policy', () => {
+    const base = makeDs();
+    forkWorker({
+      ...base,
+      session: { ...base.session, skillLoadout: { include: [] } },
+    } as typeof base, 'hello', false);
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'init',
+      skillPolicy: { include: [] },
+    }));
+  });
+
+  it('null/undefined loadout inherits the bot policy byte-for-byte', () => {
+    // The safety floor for every automatic spawn path (new topic, schedule,
+    // trigger, webhook), none of which ever writes skillLoadout.
+    for (const loadout of [undefined, null]) {
+      const base = makeDs();
+      forkWorker({
+        ...base,
+        session: { ...base.session, skillLoadout: loadout },
+      } as typeof base, 'hello', false);
+
+      const worker = forkMock.mock.results.at(-1)!.value;
+      expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'init',
+        skillPolicy: { include: ['skill:deploy'] },
+      }));
+    }
+  });
+
   it('passes the persisted Lark topic title to a fresh Codex worker before its first prompt', () => {
     const ds = makeDs({
       session: {

@@ -26963,3 +26963,15 @@ button.skills-issue-badge:hover {
   opacity: 0.55;
   cursor: not-allowed;
 }
+
+/* Loadout picker: entries whose skill/pack no longer exists stay selectable so
+   a stale saved loadout can actually be cleaned up. */
+.skills-loadout-orphan {
+  opacity: 0.85;
+}
+.skills-loadout-orphan-tag {
+  color: var(--danger);
+}
+.skills-resolved-missing small {
+  color: var(--danger);
+}
