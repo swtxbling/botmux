@@ -42,11 +42,20 @@ export function SessionLoadoutAccordion(props: {
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const mountedRef = useRef(true);
+  /** Mirrors `catalog` / in-flight state for the guards below. A retry runs in
+   *  the same tick as the click that requested it, long before React re-renders
+   *  with the cleared state, so guards read from closure state would still see
+   *  the stale values and silently no-op — which is exactly how the retry
+   *  button ended up clearing the error card without issuing a single request. */
+  const catalogRef = useRef<LoadoutCatalog | null>(null);
+  const inFlightRef = useRef(false);
 
   useEffect(() => () => { mountedRef.current = false; }, []);
 
-  const loadCatalog = useCallback(async () => {
-    if (catalog || loading) return;
+  const loadCatalog = useCallback(async (opts?: { force?: boolean }) => {
+    if (inFlightRef.current) return;
+    if (catalogRef.current && !opts?.force) return;
+    inFlightRef.current = true;
     setLoading(true);
     setLoadError(null);
     try {
@@ -84,17 +93,23 @@ export function SessionLoadoutAccordion(props: {
       if (!Array.isArray(botsBody.bots)) throw new Error('bots_malformed_response');
       const botRows: BotRow[] = botsBody.bots;
       if (!mountedRef.current) return;
-      setCatalog({
+      const next: LoadoutCatalog = {
         skills: Array.isArray(skillsBody.skills) ? skillsBody.skills : [],
         packs,
         bots: botRows,
-      });
+      };
+      catalogRef.current = next;
+      setCatalog(next);
     } catch (err: any) {
+      // A failed RETRY deliberately keeps the previous catalog: dropping it
+      // would blank out rows that are perfectly healthy just because the
+      // refresh happened to fail. The error card is shown either way.
       if (mountedRef.current) setLoadError(err?.message ?? String(err));
     } finally {
+      inFlightRef.current = false;
       if (mountedRef.current) setLoading(false);
     }
-  }, [catalog, loading]);
+  }, []);
 
   const installedNames = useMemo(
     () => new Set((catalog?.skills ?? []).map(skill => skill.name)),
@@ -115,14 +130,9 @@ export function SessionLoadoutAccordion(props: {
     return { ok: true, row };
   }, [catalog]);
 
-  const reloadCatalog = useCallback(async () => {
-    setCatalog(null);
-    setLoadError(null);
-    // loadCatalog short-circuits on a cached catalog, so clear it first; the
-    // state update lands before the next call in the same handler tick.
-    await Promise.resolve();
-    setLoading(false);
-  }, []);
+  /** Actually refetches. `force` is what makes it bypass the cached-catalog
+   *  short-circuit — the whole point of the button. */
+  const reloadCatalog = useCallback(() => { void loadCatalog({ force: true }); }, [loadCatalog]);
 
   // The bot policy arrives as plain JSON from /api/bots, so it is read through
   // the loose shape and its selectors are filtered where they are used.
@@ -171,6 +181,21 @@ export function SessionLoadoutAccordion(props: {
     delete next[larkAppId];
     props.onChange(next);
   };
+
+  /** Both failure modes — the catalog never loaded, and this particular bot is
+   *  unusable — are dead ends the user can only leave by retrying, so both get
+   *  the same card. An error with no way out reads like a permanent verdict. */
+  const errorCard = (message: string, marker: Record<string, string>) => (
+    <div className="session-loadout-blocked" {...marker}>
+      <p className="hint-warn">{message}</p>
+      <button
+        type="button"
+        data-action="retry-loadout-catalog"
+        disabled={props.disabled || loading}
+        onClick={reloadCatalog}
+      >{tr('skills.refresh')}</button>
+    </div>
+  );
 
   if (props.targets.length === 0) return null;
 
@@ -244,17 +269,11 @@ export function SessionLoadoutAccordion(props: {
               <div className="session-loadout-panel-inner">
                 {everOpened.has(target.larkAppId) && (
                   loading ? <small className="muted">{tr('common.loading')}</small>
-                    : loadError ? <p className="hint-warn">{loadError}</p>
+                    : loadError ? errorCard(loadError, { 'data-loadout-load-error': target.larkAppId })
                       : !catalog ? null
-                      : !status.ok ? (
-                        <div className="session-loadout-blocked" data-loadout-blocked={target.larkAppId}>
-                          <p className="hint-warn">{tr('sessions.create.loadoutBotUnavailable', { reason: status.reason })}</p>
-                          <button
-                            type="button"
-                            data-action="retry-loadout-catalog"
-                            onClick={() => { void reloadCatalog(); }}
-                          >{tr('skills.refresh')}</button>
-                        </div>
+                      : !status.ok ? errorCard(
+                        tr('sessions.create.loadoutBotUnavailable', { reason: status.reason }),
+                        { 'data-loadout-blocked': target.larkAppId },
                       ) : (
                         <>
                           {globalInjection && (
