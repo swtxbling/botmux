@@ -95,12 +95,19 @@ async function openAdvanced(renderer: TestRenderer.ReactTestRenderer) {
   await flush();
 }
 
-async function expandLoadout(renderer: TestRenderer.ReactTestRenderer, larkAppId: string) {
+/** In the team builder, "selecting" a bot means clicking its lineup card. */
+async function selectLineupBot(renderer: TestRenderer.ReactTestRenderer, larkAppId: string) {
   await openAdvanced(renderer);
-  const toggle = renderer.root
-    .findByProps({ 'data-loadout-row': larkAppId })
-    .findByProps({ 'data-action': 'toggle-loadout' });
-  await act(async () => { await toggle.props.onClick(); });
+  await flush();
+  const card = renderer.root.findByProps({ 'data-loadout-bot': larkAppId });
+  await act(async () => { await card.props.onClick(); });
+  await flush();
+}
+
+/** Open the custom fine-tune drawer so individual skills are reachable. */
+async function openCustomDrawer(renderer: TestRenderer.ReactTestRenderer) {
+  const btn = renderer.root.findByProps({ 'aria-expanded': false });
+  await act(async () => { await btn.props.onClick(); });
   await flush();
 }
 
@@ -108,9 +115,6 @@ describe('create-session dialog ↔ skillLoadouts wiring', () => {
   afterEach(() => { vi.unstubAllGlobals(); });
 
   it('omits skillLoadouts entirely when the user never opens a loadout', async () => {
-    // Absence is what makes the daemon inherit each bot's own policy. An
-    // explicit null would be rejected as bad_skill_loadout, and an empty object
-    // would be a real (wrong) override — so the key must simply not be there.
     const { bodies } = mockApis();
     const renderer = renderDialog();
     await checkBot(renderer, 'bot-1', true);
@@ -126,9 +130,11 @@ describe('create-session dialog ↔ skillLoadouts wiring', () => {
     const renderer = renderDialog();
     await checkBot(renderer, 'bot-1', true);
     await setContent(renderer, 'go');
-    await expandLoadout(renderer, 'bot-1');
+    await selectLineupBot(renderer, 'bot-1');
 
-    // bot-1's own policy is skill:a; adding skill:b makes it a real override.
+    // bot-1's own policy is skill:a; applying the Ops pack (skill:a) is a no-op,
+    // so toggle skill:b in the custom drawer to make a real override.
+    await openCustomDrawer(renderer);
     await act(async () => { renderer.root.findByProps({ 'data-loadout-skill': 'b' }).props.onClick(); });
     await submit(renderer);
 
@@ -137,8 +143,6 @@ describe('create-session dialog ↔ skillLoadouts wiring', () => {
   });
 
   it('drops the loadout of a bot the user unchecked before submitting', async () => {
-    // All mode gives every checked bot a row; unchecking one must not leave a
-    // stale entry for a bot that will never spawn.
     const { bodies } = mockApis();
     const renderer = renderDialog();
     await checkBot(renderer, 'bot-1', true);
@@ -146,8 +150,9 @@ describe('create-session dialog ↔ skillLoadouts wiring', () => {
     await act(async () => { renderer.root.findAllByProps({ name: 'mode', value: 'all' })[0]!.props.onChange(); });
     await setContent(renderer, 'go');
 
-    await expandLoadout(renderer, 'bot-2');
-    await act(async () => { renderer.root.findByProps({ 'data-loadout-row': 'bot-2' }).findByProps({ 'data-loadout-skill': 'b' }).props.onClick(); });
+    await selectLineupBot(renderer, 'bot-2');
+    await openCustomDrawer(renderer);
+    await act(async () => { renderer.root.findByProps({ 'data-loadout-skill': 'b' }).props.onClick(); });
     await checkBot(renderer, 'bot-2', false);
     await submit(renderer);
 
@@ -155,21 +160,18 @@ describe('create-session dialog ↔ skillLoadouts wiring', () => {
     expect('skillLoadouts' in bodies[0]).toBe(false);
   });
 
-  it('shows a row for the fallback Lead the request will actually carry', async () => {
-    // The Lead <select> is untouched, so `lead` is still empty while submit
-    // falls back to the first checked bot. Reading the raw state would render
-    // no rows at all for the bot that is about to spawn.
+  it('shows a lineup card for the fallback Lead the request will actually carry', async () => {
     mockApis();
     const renderer = renderDialog();
     await checkBot(renderer, 'bot-2', true);
     await openAdvanced(renderer);
     await flush();
 
-    expect(renderer.root.findAllByProps({ 'data-loadout-row': 'bot-2' })).toHaveLength(1);
-    expect(renderer.root.findAllByProps({ 'data-loadout-row': 'bot-1' })).toHaveLength(0);
+    expect(renderer.root.findAllByProps({ 'data-loadout-bot': 'bot-2' })).toHaveLength(1);
+    expect(renderer.root.findAllByProps({ 'data-loadout-bot': 'bot-1' })).toHaveLength(0);
   });
 
-  it('offers no loadout rows until a bot is selected', async () => {
+  it('offers no loadout until advanced settings is opened', async () => {
     mockApis();
     const renderer = renderDialog();
     await openAdvanced(renderer);

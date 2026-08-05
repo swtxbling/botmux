@@ -54,7 +54,7 @@ import {
   loadoutTargetBots,
   type LoadoutDrafts,
 } from './create-session-loadout.js';
-import { SessionLoadoutAccordion } from './skills/session-loadout-accordion.js';
+import { SessionLoadoutTeamBuilder } from './skills/session-loadout-team-builder.js';
 import {
   BOARD_COLUMNS,
   CLI_FILTER_OPTIONS,
@@ -2621,7 +2621,7 @@ export function CreateSessionDialog(props: {
                 stays inside Advanced Settings so the normal create flow is
                 quiet; mounting it here is also the deliberate lazy-load gate
                 for the bots/skills/packs catalog used by its default summary. */}
-            <SessionLoadoutAccordion
+            <SessionLoadoutTeamBuilder
               targets={loadoutTargets}
               drafts={loadoutDrafts}
               onChange={setLoadoutDrafts}
