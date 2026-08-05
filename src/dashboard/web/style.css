@@ -28347,13 +28347,15 @@ button.skills-issue-badge:hover {
 /* ── Fullscreen workshop (inside the same dialog) ── */
 .is-loadout-workspace {
   width: 100vw !important; max-width: 100vw !important; height: 100vh !important;
+  max-height: 100vh !important;
   margin: 0 !important; padding: 0 !important; border: none !important; border-radius: 0 !important;
 }
 .is-loadout-workspace .cs-card {
-  width: 100%; height: 100%; max-width: none; margin: 0; border-radius: 0;
+  width: 100%; height: 100%; max-width: none; max-height: 100vh !important;
+  margin: 0; border-radius: 0;
   display: flex; flex-direction: column;
 }
-.is-loadout-workspace .cs-header { flex-shrink: 0; }
+/* cs-header is not rendered in workshop mode (moved to non-workshop branch) */
 .loadout-workshop {
   display: flex; flex-direction: column; flex: 1; min-height: 0;
   background: var(--bg);
@@ -28370,15 +28372,33 @@ button.skills-issue-badge:hover {
 .loadout-workshop-body {
   flex: 1; min-height: 0; overflow: auto; padding: 16px;
 }
-/* Desktop: 3-column layout inside the workshop body */
+/* Desktop: explicit 3-column grid — head spans full width, lineup=left,
+   builds+custom=middle, preview=right (sticky). */
 .loadout-workshop-body .session-loadout-team {
   display: grid; grid-template-columns: 280px 1fr 300px; gap: 16px; align-items: start;
 }
-.loadout-workshop-body .loadout-lineup,
-.loadout-workshop-body .loadout-builds,
-.loadout-workshop-body .loadout-preview { min-width: 0; }
+.loadout-workshop-body .session-loadout-head { grid-column: 1 / -1; }
+.loadout-workshop-body .loadout-lineup { grid-column: 1; min-width: 0; }
+.loadout-workshop-body .loadout-builds { grid-column: 2; min-width: 0; }
+.loadout-workshop-body .loadout-custom { grid-column: 2; min-width: 0; }
+.loadout-workshop-body .loadout-preview {
+  grid-column: 3; min-width: 0; position: sticky; top: 0;
+}
 .loadout-workshop-body .loadout-lineup-grid { grid-template-columns: 1fr; }
 .loadout-workshop-body .loadout-build-grid { grid-template-columns: 1fr; }
+
+/* Mobile segmented control — only visible on narrow screens */
+.loadout-mobile-tabs {
+  display: none;
+}
+.loadout-mobile-tab {
+  flex: 1; padding: 8px 4px; border: 1px solid var(--border);
+  background: var(--surface); color: var(--fg); font: inherit; font-size: 12px;
+  cursor: pointer; text-align: center;
+}
+.loadout-mobile-tab.is-active {
+  background: var(--accent); border-color: var(--accent); color: var(--on-accent);
+}
 
 @media (max-width: 640px) {
   .loadout-lineup-grid { grid-template-columns: 1fr; }
@@ -28386,8 +28406,18 @@ button.skills-issue-badge:hover {
   .loadout-lineup-head, .loadout-builds-head { flex-direction: column; align-items: stretch; }
   .loadout-lineup-actions { justify-content: flex-start; }
   .loadout-bot-meta { padding-left: 0; }
-  /* Mobile: workshop body reverts to single-column flow */
-  .loadout-workshop-body .session-loadout-team {
-    display: flex; flex-direction: column;
-  }
+}
+
+/* Workshop: switch to segmented tabs below 900px so the middle column
+   never shrinks below ~240px (280+300 side columns leave too little room). */
+@media (max-width: 900px) {
+  .loadout-mobile-tabs { display: flex; gap: 0; margin-bottom: 12px; }
+  .loadout-workshop-body .session-loadout-team { display: block; }
+  .loadout-workshop-body .session-loadout-head { display: none; }
+  .loadout-workshop-body .loadout-lineup,
+  .loadout-workshop-body .loadout-builds,
+  .loadout-workshop-body .loadout-preview { display: none; }
+  .loadout-workshop-body .loadout-lineup[data-tab-active="true"],
+  .loadout-workshop-body .loadout-builds[data-tab-active="true"],
+  .loadout-workshop-body .loadout-preview[data-tab-active="true"] { display: block; }
 }

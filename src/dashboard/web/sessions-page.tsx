@@ -2517,8 +2517,9 @@ export function CreateSessionDialog(props: {
 
   return (
     <article className="cs-card">
-      <header className="cs-header"><h3>{t('sessions.create.title')}</h3></header>
       {!workshopOpen && (
+      <>
+      <header className="cs-header"><h3>{t('sessions.create.title')}</h3></header>
       <form id="cs-form" onSubmit={submit}>
         <fieldset className="cs-content">
           <legend>{t('sessions.create.content')}</legend>
@@ -2786,6 +2787,7 @@ export function CreateSessionDialog(props: {
           <button type="submit" className="cs-submit" disabled={submitting || bots.length === 0}>{submitting ? t('sessions.create.submitting') : t('sessions.create.submit')}</button>
         </div>
       </form>
+      </>
       )}
 
       {/* Fullscreen loadout workshop — same dialog, same React tree.
