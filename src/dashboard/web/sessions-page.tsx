@@ -2088,19 +2088,25 @@ export function CreateSessionDialog(props: {
       dialog.close();
     }
   }, [props.dialog, state]);
+
+  /** Fullscreen workshop state: open flag + isolated draft clone.
+   *  Declared before the dialog-class effect that reads workshopOpen.
+   *  The workshop lives in the same React tree so the dialog's other state
+   *  (prompt, images, bots, mode, lead, name) is never unmounted. */
+  const [workshopOpen, setWorkshopOpen] = useState(false);
+  const [workspaceDrafts, setWorkspaceDrafts] = useState<LoadoutDrafts>({});
+  const workshopEntryRef = useRef<HTMLButtonElement>(null);
+  const workshopTitleRef = useRef<HTMLHeadingElement>(null);
+
+  // Toggle the fullscreen workshop class on the native dialog element.
+  // We render inside the same dialog (not a portal) so the top-layer stacking
+  // context is preserved and Esc/focus stay simple.
   useEffect(() => {
     const dialog = props.dialog;
-    const handleClose = () => props.onClose();
-    const handleClick = (event: MouseEvent | globalThis.MouseEvent) => {
-      if (event.target === dialog) props.onClose();
-    };
-    dialog.addEventListener('close', handleClose);
-    dialog.addEventListener('click', handleClick);
-    return () => {
-      dialog.removeEventListener('close', handleClose);
-      dialog.removeEventListener('click', handleClick);
-    };
-  }, [props]);
+    if (workshopOpen) dialog.classList.add('is-loadout-workspace');
+    else dialog.classList.remove('is-loadout-workspace');
+    return () => dialog.classList.remove('is-loadout-workspace');
+  }, [workshopOpen, props.dialog]);
 
   const [content, setContent] = useState('');
   const [images, setImages] = useState<CreateSessionImage[]>([]);
@@ -2155,6 +2161,8 @@ export function CreateSessionDialog(props: {
     setMentionTrigger(null);
     setMentionIndex(0);
     setLoadoutDrafts({});
+    setWorkshopOpen(false);
+    setWorkspaceDrafts({});
     nextImageOrdinalRef.current = 1;
   }, [state]);
 
@@ -2232,6 +2240,64 @@ export function CreateSessionDialog(props: {
     }
   };
 
+  // ── Loadout workshop (fullscreen, same React tree) ──
+  // All hooks live here, BEFORE any conditional return, so hook order is
+  // stable across loading/ready/success state transitions.
+  const openWorkshop = useCallback(() => {
+    setWorkspaceDrafts(JSON.parse(JSON.stringify(loadoutDrafts)));
+    setWorkshopOpen(true);
+  }, [loadoutDrafts]);
+  const closeWorkshop = useCallback(() => setWorkshopOpen(false), []);
+  const commitWorkshop = useCallback(() => {
+    setLoadoutDrafts(workspaceDrafts);
+    setWorkshopOpen(false);
+  }, [workspaceDrafts]);
+
+  // Native dialog cancel (Esc in showModal): when the workshop is open, Esc
+  // must only discard the workshop, never close the whole create-session dialog.
+  useEffect(() => {
+    if (!workshopOpen) return;
+    const onCancel = (e: Event) => { e.preventDefault(); closeWorkshop(); };
+    props.dialog.addEventListener('cancel', onCancel);
+    return () => props.dialog.removeEventListener('cancel', onCancel);
+  }, [workshopOpen, closeWorkshop, props.dialog]);
+
+  // Focus: title on open (false→true); entry button on close (true→false).
+  // The effect runs after commit, so refs are already mounted — focus directly.
+  // Use a ref so the first mount (workshopOpen=false) does NOT steal focus
+  // from the prompt textarea.
+  const prevWorkshopOpenRef = useRef(false);
+  useEffect(() => {
+    const prev = prevWorkshopOpenRef.current;
+    prevWorkshopOpenRef.current = workshopOpen;
+    if (workshopOpen && !prev) {
+      workshopTitleRef.current?.focus();
+    } else if (!workshopOpen && prev) {
+      workshopEntryRef.current?.focus();
+    }
+  }, [workshopOpen]);
+
+  // Dialog close/backdrop: when the workshop is open, Esc/backdrop must only
+  // close the workshop (discard), never the whole create-session dialog.
+  useEffect(() => {
+    const dialog = props.dialog;
+    const handleClose = () => {
+      if (workshopOpen) { closeWorkshop(); return; }
+      props.onClose();
+    };
+    const handleClick = (event: MouseEvent | globalThis.MouseEvent) => {
+      if (event.target !== dialog) return;
+      if (workshopOpen) { closeWorkshop(); return; }
+      props.onClose();
+    };
+    dialog.addEventListener('close', handleClose);
+    dialog.addEventListener('click', handleClick);
+    return () => {
+      dialog.removeEventListener('close', handleClose);
+      dialog.removeEventListener('click', handleClick);
+    };
+  }, [props, workshopOpen, closeWorkshop]);
+
   if (!state) return null;
   if (state.success) {
     const body = state.success;
@@ -2274,6 +2340,21 @@ export function CreateSessionDialog(props: {
   const effectiveLead = effectiveLeadLarkAppId(lead, checkedIds);
   const loadoutTargets = loadoutTargetBots(mode, checkedIds, effectiveLead)
     .map(larkAppId => ({ larkAppId, botName: nameOf(larkAppId) }));
+
+  // Summary for the advanced-area card (no catalog fetch — only counts drafts).
+  // We count override selectors, NOT final resolved skills — without the
+  // catalog we can't know what a pack expands to, so we never claim a skill
+  // count here. Final capability is computed inside the workshop.
+  const customisedCount = Object.keys(loadoutDrafts).filter(id =>
+    loadoutTargets.some(t => t.larkAppId === id),
+  ).length;
+  const overrideCount = loadoutTargets.reduce((sum, t) => {
+    const draft = loadoutDrafts[t.larkAppId];
+    if (!draft) return sum;
+    return sum + (draft.include?.length ?? 0);
+  }, 0);
+  const allInherit = customisedCount === 0;
+
   const botQueryNorm = botQuery.trim().toLowerCase();
   const visibleBots = botQueryNorm
     ? bots.filter(bot =>
@@ -2437,6 +2518,7 @@ export function CreateSessionDialog(props: {
   return (
     <article className="cs-card">
       <header className="cs-header"><h3>{t('sessions.create.title')}</h3></header>
+      {!workshopOpen && (
       <form id="cs-form" onSubmit={submit}>
         <fieldset className="cs-content">
           <legend>{t('sessions.create.content')}</legend>
@@ -2617,16 +2699,29 @@ export function CreateSessionDialog(props: {
           </legend>
           {advancedOpen ? (
           <div id="cs-advanced-fields" className="cs-advanced-fields">
-            {/* Mode/Lead above decide which bots actually spawn. The loadout
-                stays inside Advanced Settings so the normal create flow is
-                quiet; mounting it here is also the deliberate lazy-load gate
-                for the bots/skills/packs catalog used by its default summary. */}
-            <SessionLoadoutTeamBuilder
-              targets={loadoutTargets}
-              drafts={loadoutDrafts}
-              onChange={setLoadoutDrafts}
-              disabled={submitting}
-            />
+            {/* Summary card + entry to the fullscreen workshop. The TeamBuilder
+                is only mounted inside the workshop, so no catalog fetch happens
+                until the user explicitly opens it. */}
+            <div className="loadout-summary-card" data-loadout-summary>
+              <div className="loadout-summary-copy">
+                <strong>{t('sessions.create.loadoutTitle')}</strong>
+                <small data-loadout-summary-state={allInherit ? 'inherit' : 'custom'}>
+                  {allInherit
+                    ? t('sessions.create.loadoutSummaryAllInherit')
+                    : t('sessions.create.loadoutSummaryCustom', { count: customisedCount, total: loadoutTargets.length, overrides: overrideCount })}
+                </small>
+              </div>
+              <button
+                type="button"
+                ref={workshopEntryRef}
+                className="bd-button small"
+                data-action="open-loadout-workshop"
+                disabled={submitting || loadoutTargets.length === 0}
+                onClick={openWorkshop}
+              >
+                {t('sessions.create.loadoutOpenWorkshop')}
+              </button>
+            </div>
             <label className="cs-advanced-field">
               <span>{t('sessions.create.groupName')}</span>
               <input className="cs-pill-input" type="text" name="name" maxLength={60} placeholder={t('sessions.create.groupNamePlaceholder')} value={name} onChange={event => setName(event.currentTarget.value)} />
@@ -2691,6 +2786,35 @@ export function CreateSessionDialog(props: {
           <button type="submit" className="cs-submit" disabled={submitting || bots.length === 0}>{submitting ? t('sessions.create.submitting') : t('sessions.create.submit')}</button>
         </div>
       </form>
+      )}
+
+      {/* Fullscreen loadout workshop — same dialog, same React tree.
+          Only mounted when open, so no catalog fetch until the user enters. */}
+      {workshopOpen && (
+        <div className="loadout-workshop" data-loadout-workshop>
+          <header className="loadout-workshop-head">
+            <h3 ref={workshopTitleRef} tabIndex={-1} className="loadout-workshop-title">
+              {t('sessions.create.loadoutWorkshopTitle')}
+            </h3>
+            <div className="loadout-workshop-actions">
+              <button type="button" className="bd-button small" data-action="workshop-cancel" onClick={closeWorkshop}>
+                {t('sessions.create.loadoutWorkshopCancel')}
+              </button>
+              <button type="button" className="bd-button primary small" data-action="workshop-commit" onClick={commitWorkshop}>
+                {t('sessions.create.loadoutWorkshopDone')}
+              </button>
+            </div>
+          </header>
+          <div className="loadout-workshop-body">
+            <SessionLoadoutTeamBuilder
+              targets={loadoutTargets}
+              drafts={workspaceDrafts}
+              onChange={setWorkspaceDrafts}
+              disabled={submitting}
+            />
+          </div>
+        </div>
+      )}
     </article>
   );
 }

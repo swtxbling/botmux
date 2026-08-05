@@ -19,10 +19,17 @@ async function flush() {
 
 /** The dialog only ever touches these members of the <dialog> element. */
 function stubDialog(): HTMLDialogElement {
+  const classList = new Set<string>();
   return {
     open: false,
     showModal() { (this as any).open = true; },
     close() { (this as any).open = false; },
+    classList: {
+      add: (c: string) => classList.add(c),
+      remove: (c: string) => classList.delete(c),
+      contains: (c: string) => classList.has(c),
+      toggle: (c: string) => { if (classList.has(c)) classList.delete(c); else classList.add(c); },
+    } as any,
     addEventListener() {},
     removeEventListener() {},
   } as unknown as HTMLDialogElement;
@@ -95,10 +102,18 @@ async function openAdvanced(renderer: TestRenderer.ReactTestRenderer) {
   await flush();
 }
 
-/** In the team builder, "selecting" a bot means clicking its lineup card. */
-async function selectLineupBot(renderer: TestRenderer.ReactTestRenderer, larkAppId: string) {
+/** Open the fullscreen loadout workshop from the advanced-area summary card. */
+async function openWorkshop(renderer: TestRenderer.ReactTestRenderer) {
   await openAdvanced(renderer);
   await flush();
+  const btn = renderer.root.findByProps({ 'data-action': 'open-loadout-workshop' });
+  await act(async () => { await btn.props.onClick(); });
+  await flush();
+}
+
+/** In the team builder, "selecting" a bot means clicking its lineup card. */
+async function selectLineupBot(renderer: TestRenderer.ReactTestRenderer, larkAppId: string) {
+  await openWorkshop(renderer);
   const card = renderer.root.findByProps({ 'data-loadout-bot': larkAppId });
   await act(async () => { await card.props.onClick(); });
   await flush();
@@ -107,6 +122,13 @@ async function selectLineupBot(renderer: TestRenderer.ReactTestRenderer, larkApp
 /** Open the custom fine-tune drawer so individual skills are reachable. */
 async function openCustomDrawer(renderer: TestRenderer.ReactTestRenderer) {
   const btn = renderer.root.findByProps({ 'aria-expanded': false });
+  await act(async () => { await btn.props.onClick(); });
+  await flush();
+}
+
+/** Commit the workshop (click "完成") so drafts are written back to the parent form. */
+async function commitWorkshop(renderer: TestRenderer.ReactTestRenderer) {
+  const btn = renderer.root.findByProps({ 'data-action': 'workshop-commit' });
   await act(async () => { await btn.props.onClick(); });
   await flush();
 }
@@ -136,6 +158,8 @@ describe('create-session dialog ↔ skillLoadouts wiring', () => {
     // so toggle skill:b in the custom drawer to make a real override.
     await openCustomDrawer(renderer);
     await act(async () => { renderer.root.findByProps({ 'data-loadout-perk': 'b' }).props.onClick(); });
+    // Commit the workshop so drafts are staged back to the parent form.
+    await commitWorkshop(renderer);
     await submit(renderer);
 
     expect(bodies).toHaveLength(1);
@@ -153,7 +177,26 @@ describe('create-session dialog ↔ skillLoadouts wiring', () => {
     await selectLineupBot(renderer, 'bot-2');
     await openCustomDrawer(renderer);
     await act(async () => { renderer.root.findByProps({ 'data-loadout-perk': 'b' }).props.onClick(); });
+    // Commit the workshop so drafts are staged, then uncheck bot-2.
+    await commitWorkshop(renderer);
     await checkBot(renderer, 'bot-2', false);
+    await submit(renderer);
+
+    expect(bodies).toHaveLength(1);
+    expect('skillLoadouts' in bodies[0]).toBe(false);
+  });
+
+  it('discards workshop edits when cancelled (staged Save/Cancel contract)', async () => {
+    const { bodies } = mockApis();
+    const renderer = renderDialog();
+    await checkBot(renderer, 'bot-1', true);
+    await setContent(renderer, 'go');
+    await selectLineupBot(renderer, 'bot-1');
+    await openCustomDrawer(renderer);
+    await act(async () => { renderer.root.findByProps({ 'data-loadout-perk': 'b' }).props.onClick(); });
+    // Cancel the workshop — drafts must NOT be staged back to the parent.
+    await act(async () => { renderer.root.findByProps({ 'data-action': 'workshop-cancel' }).props.onClick(); });
+    await flush();
     await submit(renderer);
 
     expect(bodies).toHaveLength(1);
@@ -164,22 +207,23 @@ describe('create-session dialog ↔ skillLoadouts wiring', () => {
     mockApis();
     const renderer = renderDialog();
     await checkBot(renderer, 'bot-2', true);
-    await openAdvanced(renderer);
-    await flush();
+    await openWorkshop(renderer);
 
     expect(renderer.root.findAllByProps({ 'data-loadout-bot': 'bot-2' })).toHaveLength(1);
     expect(renderer.root.findAllByProps({ 'data-loadout-bot': 'bot-1' })).toHaveLength(0);
   });
 
-  it('offers no loadout until advanced settings is opened', async () => {
+  it('offers no loadout workshop until the entry button is clicked', async () => {
     mockApis();
     const renderer = renderDialog();
     await openAdvanced(renderer);
     await flush();
+    // Summary card is in advanced area, but the TeamBuilder (workshop) is not mounted yet
+    expect(renderer.root.findAllByProps({ 'data-loadout-summary': true })).toHaveLength(1);
     expect(renderer.root.findAllByProps({ 'data-session-loadout': true })).toHaveLength(0);
   });
 
-  it('keeps loadout inside Advanced Settings and pays no catalog cost by default', async () => {
+  it('keeps loadout inside Advanced Settings and pays no catalog cost until workshop opens', async () => {
     const { calls } = mockApis();
     const renderer = renderDialog();
     await checkBot(renderer, 'bot-1', true);
@@ -191,7 +235,15 @@ describe('create-session dialog ↔ skillLoadouts wiring', () => {
       || url.startsWith('/api/skill-packs')
       || url.startsWith('/api/bots'))).toHaveLength(0);
 
+    // Opening advanced shows the summary card but does NOT fetch the catalog
     await openAdvanced(renderer);
+    expect(renderer.root.findAllByProps({ 'data-loadout-summary': true })).toHaveLength(1);
+    expect(calls.filter(url => url.startsWith('/api/skills')
+      || url.startsWith('/api/skill-packs')
+      || url.startsWith('/api/bots'))).toHaveLength(0);
+
+    // Opening the workshop mounts the TeamBuilder and fetches the catalog
+    await openWorkshop(renderer);
     expect(renderer.root.findAllByProps({ 'data-session-loadout': true })).toHaveLength(1);
     expect(calls.filter(url => url.startsWith('/api/skills')
       || url.startsWith('/api/skill-packs')
