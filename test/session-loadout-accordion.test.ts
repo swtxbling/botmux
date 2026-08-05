@@ -239,6 +239,100 @@ describe('per-session loadout accordion', () => {
     });
   });
 
+  describe('retry actually retries', () => {
+    // An error card whose button does nothing is worse than no button: it reads
+    // as a permanent verdict on a failure that may well be transient.
+
+    /** Serves a different payload per attempt, so a retry can be observed to
+     *  both issue new requests AND pick up the newer state. */
+    function mockAttempts(attempts: Array<{ botsStatus?: number; botsBody?: unknown }>): { calls: string[] } {
+      const calls: string[] = [];
+      let attempt = -1;
+      vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+        const u = String(url);
+        calls.push(u);
+        // /api/skills leads each round, so it marks the attempt boundary.
+        if (u.startsWith('/api/skills')) attempt += 1;
+        const current = attempts[Math.min(attempt, attempts.length - 1)] ?? {};
+        if (u.startsWith('/api/skill-packs')) return jsonRes(200, { packs: [] });
+        if (u.startsWith('/api/skills')) return jsonRes(200, { skills: [{ name: 'a', tags: [] }] });
+        if (u.startsWith('/api/bots')) {
+          if (current.botsStatus && current.botsStatus !== 200) return jsonRes(current.botsStatus, { error: 'bots_failed' });
+          return jsonRes(200, current.botsBody ?? { bots: [
+            { larkAppId: 'bot-1', botName: 'Bot 1', skills: { include: ['skill:a'] }, skillInjectionSupport: 'dynamic', skillInjection: 'prompt' },
+          ] });
+        }
+        return jsonRes(404, {});
+      }));
+      return { calls };
+    }
+
+    async function clickRetry(renderer: TestRenderer.ReactTestRenderer, larkAppId: string) {
+      const button = renderer.root
+        .findByProps({ 'data-loadout-row': larkAppId })
+        .findByProps({ 'data-action': 'retry-loadout-catalog' });
+      await act(async () => { button.props.onClick(); });
+      await flush();
+    }
+
+    it('a failed initial load offers a retry, and the retry succeeds', async () => {
+      const { calls } = mockAttempts([{ botsStatus: 500 }, {}]);
+      const renderer = render({});
+      await expand(renderer, 'bot-1');
+      expect(renderer.root.findAllByProps({ 'data-loadout-skill': 'a' })).toHaveLength(0);
+      const firstRound = calls.length;
+
+      await clickRetry(renderer, 'bot-1');
+
+      // Requests were actually reissued — the original bug cleared the card
+      // without touching the network.
+      expect(calls.length).toBe(firstRound + 3);
+      expect(renderer.root.findAllByProps({ 'data-loadout-load-error': 'bot-1' })).toHaveLength(0);
+      expect(renderer.root.findAllByProps({ 'data-loadout-skill': 'a' })).toHaveLength(1);
+    });
+
+    it('a blocked bot row recovers once the roster reports it healthy', async () => {
+      // The catalog itself loaded fine, so the retry has to bypass the cached
+      // -catalog short-circuit rather than rely on it being absent.
+      const { calls } = mockAttempts([
+        { botsBody: { bots: [{ larkAppId: 'bot-1', error: 'daemon offline' }] } },
+        {},
+      ]);
+      const renderer = render({});
+      await expand(renderer, 'bot-1');
+      expect(renderer.root.findAllByProps({ 'data-loadout-blocked': 'bot-1' })).toHaveLength(1);
+      const firstRound = calls.length;
+
+      await clickRetry(renderer, 'bot-1');
+
+      expect(calls.length).toBe(firstRound + 3);
+      expect(renderer.root.findAllByProps({ 'data-loadout-blocked': 'bot-1' })).toHaveLength(0);
+      expect(renderer.root.findAllByProps({ 'data-loadout-skill': 'a' })).toHaveLength(1);
+    });
+
+    it('a retry that also fails can be retried again rather than wedging', async () => {
+      // Attempt 1 blocks the row, attempt 2 fails outright, attempt 3 recovers.
+      // The failure path must keep offering a way out — otherwise one unlucky
+      // click turns a transient outage into a dead dialog.
+      const { calls } = mockAttempts([
+        { botsBody: { bots: [{ larkAppId: 'bot-1', error: 'daemon offline' }] } },
+        { botsStatus: 500 },
+        {},
+      ]);
+      const renderer = render({});
+      await expand(renderer, 'bot-1');
+      expect(renderer.root.findAllByProps({ 'data-loadout-blocked': 'bot-1' })).toHaveLength(1);
+
+      await clickRetry(renderer, 'bot-1');
+      expect(renderer.root.findAllByProps({ 'data-loadout-load-error': 'bot-1' })).toHaveLength(1);
+      const beforeLast = calls.length;
+
+      await clickRetry(renderer, 'bot-1');
+      expect(calls.length).toBe(beforeLast + 3);
+      expect(renderer.root.findAllByProps({ 'data-loadout-skill': 'a' })).toHaveLength(1);
+    });
+  });
+
   it('removes a collapsed panel from the tab order and the a11y tree', async () => {
     // The DOM is kept mounted so collapsing can animate, but 0fr +
     // overflow:hidden only hides it visually — its checkboxes would still be
