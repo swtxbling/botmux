@@ -76,18 +76,31 @@ export function SessionLoadoutAccordion(props: {
       } else if (!packsRes) {
         throw new Error('packs_network_error');
       }
+      // A 200 does not mean the policy is usable. The aggregator returns a
+      // per-bot row, and an unreachable daemon yields `{ larkAppId, error }`
+      // with no `skills` — indistinguishable from "this bot has no policy"
+      // unless checked. Every target must be present AND healthy, otherwise
+      // the first checkbox ticked would submit a loadout that silently
+      // replaces a default we never actually read.
+      if (!Array.isArray(botsBody.bots)) throw new Error('bots_malformed_response');
+      const botRows: BotRow[] = botsBody.bots;
+      for (const target of props.targets) {
+        const row = botRows.find(bot => bot.larkAppId === target.larkAppId);
+        if (!row) throw new Error(`bot_missing:${target.larkAppId}`);
+        if (row.error) throw new Error(`bot_unavailable:${target.larkAppId}:${row.error}`);
+      }
       if (!mountedRef.current) return;
       setCatalog({
         skills: Array.isArray(skillsBody.skills) ? skillsBody.skills : [],
         packs,
-        bots: Array.isArray(botsBody.bots) ? botsBody.bots : [],
+        bots: botRows,
       });
     } catch (err: any) {
       if (mountedRef.current) setLoadError(err?.message ?? String(err));
     } finally {
       if (mountedRef.current) setLoading(false);
     }
-  }, [catalog, loading]);
+  }, [catalog, loading, props.targets]);
 
   const installedNames = useMemo(
     () => new Set((catalog?.skills ?? []).map(skill => skill.name)),
@@ -152,6 +165,7 @@ export function SessionLoadoutAccordion(props: {
         const botPolicy = botPolicyOf(target.larkAppId);
         const customised = isLoadoutCustomised(draft, botPolicy);
         const isOpen = expanded === target.larkAppId;
+        const panelId = `session-loadout-panel-${target.larkAppId}`;
         // Draft wins; otherwise show what the bot would use anyway. Both are
         // read through the loose shape, since only the draft is our own type.
         const effective: { include?: readonly string[] } | undefined = draft ?? botPolicy;
@@ -162,7 +176,10 @@ export function SessionLoadoutAccordion(props: {
         // falling back to the machine default). Warning on capability alone
         // would cry wolf for every bot on such a CLI running in prompt mode.
         const effectiveInjection = bot?.skillInjection ?? bot?.skillInjectionDefault;
-        const globalInjection = effectiveInjection === 'global';
+        // Both must hold: the CLI has to actually share a global skills dir,
+        // AND the resolved mode has to be `global`. Checking the mode alone
+        // would false-positive on a dynamic CLI carrying a stale/legacy value.
+        const globalInjection = bot?.skillInjectionSupport === 'global' && effectiveInjection === 'global';
 
         return (
           <div
@@ -175,6 +192,7 @@ export function SessionLoadoutAccordion(props: {
               className="session-loadout-summary"
               data-action="toggle-loadout"
               aria-expanded={isOpen}
+              aria-controls={panelId}
               disabled={props.disabled}
               onClick={() => { void toggleRow(target.larkAppId); }}
             >
@@ -187,8 +205,20 @@ export function SessionLoadoutAccordion(props: {
               <span className="session-loadout-chevron" aria-hidden="true">›</span>
             </button>
 
-            {/* grid-template-rows 0fr→1fr expands without measuring height. */}
-            <div className="session-loadout-panel" data-loadout-panel={isOpen ? 'open' : 'closed'}>
+            {/* grid-template-rows 0fr→1fr expands without measuring height.
+                The DOM stays mounted so collapsing can animate, so a closed
+                panel must be removed from the a11y tree and the tab order
+                explicitly — 0fr + overflow:hidden only hides it visually, and
+                its checkboxes would still be reachable with Tab. */}
+            <div
+              className="session-loadout-panel"
+              id={panelId}
+              role="region"
+              aria-label={target.botName}
+              data-loadout-panel={isOpen ? 'open' : 'closed'}
+              aria-hidden={!isOpen || undefined}
+              inert={!isOpen || undefined}
+            >
               <div className="session-loadout-panel-inner">
                 {everOpened.has(target.larkAppId) && (
                   loading ? <small className="muted">{tr('common.loading')}</small>

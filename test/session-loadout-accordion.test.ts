@@ -21,6 +21,8 @@ interface CatalogOptions {
   packsNetworkFail?: boolean;
   /** Resolved injection mode for bot-2, which is on a global-capable CLI. */
   bot2Injection?: 'global' | 'prompt' | 'off';
+  /** Replaces the whole /api/bots payload, for malformed / failed-entry cases. */
+  botsPayload?: unknown;
 }
 
 function mockCatalog(options: CatalogOptions = {}): { calls: string[] } {
@@ -41,6 +43,7 @@ function mockCatalog(options: CatalogOptions = {}): { calls: string[] } {
         : jsonRes(skills, { error: 'skills_failed' });
     }
     if (u.startsWith('/api/bots')) {
+      if (options.botsPayload !== undefined) return jsonRes(200, options.botsPayload);
       return bots === 200
         ? jsonRes(200, { bots: [
           { larkAppId: 'bot-1', botName: 'Bot 1', skills: { include: ['skill:a'] }, skillInjectionSupport: 'dynamic', skillInjection: 'prompt' },
@@ -129,6 +132,18 @@ describe('per-session loadout accordion', () => {
     expect(renderer.root.findAllByProps({ 'data-loadout-degraded': true })).toHaveLength(0);
   });
 
+  it('stays silent for a dynamic CLI even if its resolved mode reads global', async () => {
+    // Capability AND mode must both hold; a stale or legacy value on a
+    // per-session-capable CLI must not raise a warning that does not apply.
+    mockCatalog({ botsPayload: { bots: [
+      { larkAppId: 'bot-1', botName: 'Bot 1', skills: { include: ['skill:a'] }, skillInjectionSupport: 'dynamic', skillInjection: 'global' },
+      { larkAppId: 'bot-2', botName: 'Bot 2', skills: { include: [] }, skillInjectionSupport: 'dynamic', skillInjection: 'global' },
+    ] } });
+    const renderer = render({});
+    await expand(renderer, 'bot-1');
+    expect(renderer.root.findAllByProps({ 'data-loadout-degraded': true })).toHaveLength(0);
+  });
+
   describe('a failed catalog blocks editing instead of looking like empty data', () => {
     // Reading a failure as "empty" is the dangerous interpretation: an errored
     // /api/bots looks like "this bot has no policy", so the first checkbox the
@@ -154,6 +169,47 @@ describe('per-session loadout accordion', () => {
       expect(renderer.root.findAllByProps({ 'data-loadout-skill': 'a' })).toHaveLength(1);
       expect(renderer.root.findAllByProps({ 'data-loadout-pack': 'ops' })).toHaveLength(0);
     });
+  });
+
+  describe('a 200 from /api/bots is not proof the policy is usable', () => {
+    // The aggregator returns one row per bot, and an unreachable daemon yields
+    // `{ larkAppId, error }` with no `skills`. Left unchecked that is
+    // indistinguishable from "this bot has no policy", so the first checkbox
+    // ticked would submit a loadout replacing a default we never read.
+    it.each([
+      ['a malformed bots payload', { bots: 'garbage' }, 'bots_malformed_response'],
+      ['a target missing from the roster', { bots: [{ larkAppId: 'other', botName: 'Other' }] }, 'bot_missing:bot-1'],
+      ['a target returned as a failed entry', { bots: [{ larkAppId: 'bot-1', error: 'daemon offline' }] }, 'bot_unavailable:bot-1'],
+    ])('%s blocks editing', async (_label, botsPayload, marker) => {
+      mockCatalog({ botsPayload });
+      const renderer = render({});
+      await expand(renderer, 'bot-1');
+      expect(renderer.root.findAllByProps({ 'data-loadout-skill': 'a' })).toHaveLength(0);
+      expect(JSON.stringify(renderer.toJSON())).toContain(marker as string);
+    });
+  });
+
+  it('removes a collapsed panel from the tab order and the a11y tree', async () => {
+    // The DOM is kept mounted so collapsing can animate, but 0fr +
+    // overflow:hidden only hides it visually — its checkboxes would still be
+    // reachable with Tab without inert/aria-hidden.
+    mockCatalog();
+    const renderer = render({});
+    await expand(renderer, 'bot-1');
+
+    const open = renderer.root.findByProps({ 'data-loadout-panel': 'open' });
+    expect(open.props.inert).toBeUndefined();
+    expect(open.props['aria-hidden']).toBeUndefined();
+
+    const summary = renderer.root
+      .findByProps({ 'data-loadout-row': 'bot-1' })
+      .findByProps({ 'data-action': 'toggle-loadout' });
+    expect(summary.props['aria-controls']).toBe(open.props.id);
+
+    await expand(renderer, 'bot-1');
+    const closed = renderer.root.findByProps({ 'data-loadout-panel': 'closed' });
+    expect(closed.props.inert).toBe(true);
+    expect(closed.props['aria-hidden']).toBe(true);
   });
 
   it('editing back to the bot default drops the draft instead of submitting an override', async () => {
