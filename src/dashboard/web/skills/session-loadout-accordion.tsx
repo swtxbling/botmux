@@ -35,6 +35,9 @@ export function SessionLoadoutAccordion(props: {
 }) {
   const tr = useT();
   const [expanded, setExpanded] = useState<string | null>(null);
+  /** Rows that have been opened at least once stay mounted, so collapsing can
+   *  animate instead of the content vanishing on the first frame. */
+  const [everOpened, setEverOpened] = useState<Set<string>>(() => new Set());
   const [catalog, setCatalog] = useState<LoadoutCatalog | null>(null);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -55,14 +58,28 @@ export function SessionLoadoutAccordion(props: {
       const skillsBody = await skillsRes.json().catch(() => ({}));
       const packsBody = packsRes ? await packsRes.json().catch(() => ({})) : {};
       const botsBody = await botsRes.json().catch(() => ({}));
-      if (!skillsRes.ok) throw new Error(skillsBody?.error ?? `HTTP ${skillsRes.status}`);
+      // Both of these must SUCCEED. Treating a failure as "empty" is the
+      // dangerous reading: an errored /api/bots would look like "this bot has
+      // no policy", and the first checkbox the user ticks would then submit a
+      // loadout that silently replaces the real default.
+      if (!skillsRes.ok) throw new Error(skillsBody?.error ?? `skills HTTP ${skillsRes.status}`);
+      if (!botsRes.ok) throw new Error(botsBody?.error ?? `bots HTTP ${botsRes.status}`);
+      // Packs are optional ONLY on an explicit 404 (older daemon without the
+      // pack API). A 5xx or a network error is a real failure: rendering an
+      // empty pack list would invite the user to "fix" a loadout whose packs
+      // merely failed to load.
+      let packs: LoadoutPackOption[] = [];
+      if (packsRes?.ok && Array.isArray(packsBody.packs)) {
+        packs = packsBody.packs.map((pack: any) => ({ id: pack.id, name: pack.name, include: pack.include ?? [] }));
+      } else if (packsRes && packsRes.status !== 404) {
+        throw new Error(packsBody?.error ?? `packs HTTP ${packsRes.status}`);
+      } else if (!packsRes) {
+        throw new Error('packs_network_error');
+      }
       if (!mountedRef.current) return;
       setCatalog({
         skills: Array.isArray(skillsBody.skills) ? skillsBody.skills : [],
-        // Older daemons have no pack API; an absent pack list is not an error.
-        packs: packsRes?.ok && Array.isArray(packsBody.packs)
-          ? packsBody.packs.map((pack: any) => ({ id: pack.id, name: pack.name, include: pack.include ?? [] }))
-          : [],
+        packs,
         bots: Array.isArray(botsBody.bots) ? botsBody.bots : [],
       });
     } catch (err: any) {
@@ -95,11 +112,22 @@ export function SessionLoadoutAccordion(props: {
   const toggleRow = async (larkAppId: string) => {
     const next = expanded === larkAppId ? null : larkAppId;
     setExpanded(next);
-    if (next) await loadCatalog();
+    if (next) {
+      setEverOpened(prev => prev.has(next) ? prev : new Set(prev).add(next));
+      await loadCatalog();
+    }
   };
 
   const setDraft = (larkAppId: string, policy: BotSkillPolicy) => {
-    props.onChange({ ...props.drafts, [larkAppId]: policy });
+    const next = { ...props.drafts };
+    // Editing back to exactly the bot's own policy is the same intent as
+    // pressing "restore default": drop the key so the request omits the field
+    // and the daemon inherits. Keeping an equivalent draft would submit a
+    // session override while the summary reads "inherit default" — the UI and
+    // the wire would disagree.
+    if (isLoadoutCustomised(policy, botPolicyOf(larkAppId))) next[larkAppId] = policy;
+    else delete next[larkAppId];
+    props.onChange(next);
   };
 
   const restoreDefault = (larkAppId: string) => {
@@ -129,7 +157,12 @@ export function SessionLoadoutAccordion(props: {
         const effective: { include?: readonly string[] } | undefined = draft ?? botPolicy;
         const selection = selectionFromPolicy(effective);
         const bot = catalog?.bots.find(row => row.larkAppId === target.larkAppId);
-        const globalInjection = bot?.skillInjectionSupport === 'global';
+        // `skillInjectionSupport` only says the CLI *can* share a global skills
+        // dir; whether it actually does is the resolved mode (per-bot override
+        // falling back to the machine default). Warning on capability alone
+        // would cry wolf for every bot on such a CLI running in prompt mode.
+        const effectiveInjection = bot?.skillInjection ?? bot?.skillInjectionDefault;
+        const globalInjection = effectiveInjection === 'global';
 
         return (
           <div
@@ -157,7 +190,7 @@ export function SessionLoadoutAccordion(props: {
             {/* grid-template-rows 0fr→1fr expands without measuring height. */}
             <div className="session-loadout-panel" data-loadout-panel={isOpen ? 'open' : 'closed'}>
               <div className="session-loadout-panel-inner">
-                {isOpen && (
+                {everOpened.has(target.larkAppId) && (
                   loading ? <small className="muted">{tr('common.loading')}</small>
                     : loadError ? <p className="hint-warn">{loadError}</p>
                       : catalog ? (
