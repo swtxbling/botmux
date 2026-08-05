@@ -28196,6 +28196,13 @@ button.skills-issue-badge:hover {
 .loadout-preview-head {
   display: flex; align-items: center; justify-content: space-between; gap: 12px;
   margin-bottom: 10px;
+  min-width: 0;
+}
+.loadout-lineup-head > span:first-child,
+.loadout-builds-head > span:first-child,
+.loadout-custom-head > span:first-child,
+.loadout-preview-head > span:first-child {
+  display: flex; flex-direction: column; min-width: 0; gap: 2px;
 }
 .loadout-lineup-head strong,
 .loadout-builds-head strong,
@@ -28204,20 +28211,28 @@ button.skills-issue-badge:hover {
 .loadout-lineup-head small,
 .loadout-builds-head small,
 .loadout-custom-head small,
-.loadout-preview-head small { color: var(--muted); font-size: 11px; }
-.loadout-lineup-actions { display: flex; align-items: center; gap: 8px; }
+.loadout-preview-head small { color: var(--muted); font-size: 11px; min-width: 0; word-break: break-word; }
+.loadout-lineup-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
 .loadout-selected-count {
   font-size: 11.5px; color: var(--accent); font-weight: 600;
   padding: 2px 8px; border-radius: var(--radius-full); background: var(--accent-soft);
+  white-space: nowrap; flex-shrink: 0;
 }
 .loadout-lineup-grid {
-  display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 8px;
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 8px;
 }
 .loadout-bot-card {
-  display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 10px;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  grid-template-rows: auto auto;
+  grid-template-areas:
+    "check name"
+    "meta  meta";
+  align-items: start; gap: 4px 10px;
   padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius);
   background: var(--surface); cursor: pointer; text-align: left; font-family: inherit;
   transition: border-color .15s, background .15s;
+  min-width: 0;
 }
 .loadout-bot-card:hover:not(:disabled) { border-color: var(--accent); }
 .loadout-bot-card.is-selected { border-color: var(--accent); background: var(--accent-soft); }
@@ -28225,14 +28240,26 @@ button.skills-issue-badge:hover {
 .loadout-bot-card.is-unavailable { opacity: 0.5; }
 .loadout-bot-card:disabled { cursor: not-allowed; }
 .loadout-bot-check {
+  grid-area: check;
   width: 18px; height: 18px; border: 1.5px solid var(--border); border-radius: 4px;
   display: flex; align-items: center; justify-content: center; font-size: 12px; color: var(--bg);
+  margin-top: 1px;
 }
 .loadout-bot-card.is-selected .loadout-bot-check { background: var(--accent); border-color: var(--accent); }
-.loadout-bot-name { display: flex; flex-direction: column; min-width: 0; }
-.loadout-bot-name strong { font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.loadout-bot-name small { font-size: 10.5px; color: var(--muted); }
-.loadout-bot-count { font-size: 11px; color: var(--muted); white-space: nowrap; }
+.loadout-bot-name {
+  grid-area: name;
+  display: flex; flex-direction: column; min-width: 0;
+}
+.loadout-bot-name strong {
+  font-size: 12.5px; min-width: 0; word-break: break-word; overflow-wrap: anywhere;
+}
+.loadout-bot-name small { font-size: 10.5px; color: var(--muted); min-width: 0; word-break: break-word; }
+.loadout-bot-meta {
+  grid-area: meta;
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0;
+  padding-left: 28px;
+}
+.loadout-bot-count { font-size: 11px; color: var(--muted); white-space: nowrap; flex-shrink: 0; }
 
 .loadout-build-grid {
   display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px;
@@ -28310,5 +28337,7 @@ button.skills-issue-badge:hover {
 @media (max-width: 640px) {
   .loadout-lineup-grid { grid-template-columns: 1fr; }
   .loadout-build-grid { grid-template-columns: 1fr; }
-  .loadout-lineup-head, .loadout-builds-head { flex-direction: column; align-items: flex-start; }
+  .loadout-lineup-head, .loadout-builds-head { flex-direction: column; align-items: stretch; }
+  .loadout-lineup-actions { justify-content: flex-start; }
+  .loadout-bot-meta { padding-left: 0; }
 }

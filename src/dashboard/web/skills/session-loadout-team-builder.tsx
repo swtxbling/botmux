@@ -393,6 +393,8 @@ export function SessionLoadoutTeamBuilder(props: {
                     <span className="loadout-bot-check" aria-hidden="true">{selected ? '✓' : ''}</span>
                     <span className="loadout-bot-name">
                       <strong>{target.botName}</strong>
+                    </span>
+                    <span className="loadout-bot-meta">
                       <small data-loadout-state={customised ? 'custom' : isEmptyDefault ? 'empty' : 'inherit'}>
                         {customised
                           ? tr('sessions.create.loadoutCustomLabel')
@@ -400,9 +402,9 @@ export function SessionLoadoutTeamBuilder(props: {
                             ? tr('sessions.create.loadoutDefaultEmpty')
                             : tr('sessions.create.loadoutDefaultLabel')}
                       </small>
-                    </span>
-                    <span className="loadout-bot-count" data-loadout-final-count={finalCount}>
-                      {tr('sessions.create.loadoutFinalCount', { count: finalCount })}
+                      <span className="loadout-bot-count" data-loadout-final-count={finalCount}>
+                        {tr('sessions.create.loadoutFinalCount', { count: finalCount })}
+                      </span>
                     </span>
                   </button>
                 );
