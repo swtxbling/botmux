@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { DragEvent } from 'react';
 import { useT } from '../react-hooks.js';
 import {
   resolveLoadoutPreview,
-  SkillLoadoutPicker,
   type LoadoutPackOption,
 } from './skill-loadout-picker.js';
 import {
@@ -20,12 +20,15 @@ interface LoadoutCatalog {
   bots: BotRow[];
 }
 
+/** Tri-state of a skill across the currently selected (writable) bots. */
+type SkillTriState = 'all' | 'none' | 'mixed';
+
 /** Game-style "team → loadout → fine-tune" builder.
  *
  *  Replaces the per-bot dual-column workbench with three layers:
  *    1. Lineup  — multi-select Bot cards (the "team")
  *    2. Loadout — Pack/Build cards applied to all selected Bots at once
- *    3. Fine-tune — individual Skills, only in the custom drawer
+ *    3. Fine-tune — individual Skills (Perks), only in the custom drawer
  *
  *  Backend contract is unchanged: `LoadoutDrafts` is still a per-bot map,
  *  absent = inherit, `{ include: [] }` = explicit clear. */
@@ -90,6 +93,21 @@ export function SessionLoadoutTeamBuilder(props: {
     if (props.targets.length > 0) void loadCatalog();
   }, [loadCatalog, props.targets.length]);
 
+  // Prune selection when targets shrink so we never hold a stale id for a bot
+  // that will not spawn — otherwise the count reads "2 / 1" and batch writes
+  // target a hidden bot.
+  useEffect(() => {
+    setSelectedBots(prev => {
+      const ids = new Set(props.targets.map(t => t.larkAppId));
+      let changed = false;
+      const next = new Set<string>();
+      for (const id of prev) {
+        if (ids.has(id)) next.add(id); else changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [props.targets]);
+
   const installedNames = useMemo(
     () => new Set((catalog?.skills ?? []).map(s => s.name)),
     [catalog],
@@ -111,6 +129,15 @@ export function SessionLoadoutTeamBuilder(props: {
 
   const reloadCatalog = useCallback(() => { void loadCatalog({ force: true }); }, [loadCatalog]);
 
+  /** Only bots that are both selected AND editable — the real batch target. */
+  const writableSelected = useMemo(
+    () => props.targets
+      .filter(t => selectedBots.has(t.larkAppId))
+      .filter(t => botStatusOf(t.larkAppId).ok)
+      .map(t => t.larkAppId),
+    [props.targets, selectedBots, botStatusOf],
+  );
+
   // ── Lineup selection ──────────────────────────────────────────────
   const toggleBot = useCallback((larkAppId: string) => {
     setSelectedBots(prev => {
@@ -121,53 +148,67 @@ export function SessionLoadoutTeamBuilder(props: {
   }, []);
 
   const selectAll = useCallback(() => {
-    setSelectedBots(new Set(props.targets.map(t => t.larkAppId)));
-  }, [props.targets]);
+    // Only select editable bots; non-editable cards are disabled and cannot
+    // be picked, so the count always matches the real writable target set.
+    const editable = props.targets.filter(t => botStatusOf(t.larkAppId).ok).map(t => t.larkAppId);
+    setSelectedBots(new Set(editable));
+  }, [props.targets, botStatusOf]);
 
   const clearSelection = useCallback(() => setSelectedBots(new Set()), []);
 
   // ── Batch operations ──────────────────────────────────────────────
-  /** Apply a pack's include to all selected bots that are editable. */
+  /** Apply a pack's include to all writable selected bots. */
   const applyPackToSelected = useCallback((packId: string) => {
     if (!catalog) return;
     const pack = catalog.packs.find(p => p.id === packId);
     if (!pack) return;
     const next = { ...props.drafts };
-    for (const larkAppId of selectedBots) {
-      const status = botStatusOf(larkAppId);
-      if (!status.ok) continue;
+    for (const larkAppId of writableSelected) {
       const policy = policyFromSelection([], [packId]);
       if (isLoadoutCustomised(policy, botPolicyOf(larkAppId))) next[larkAppId] = policy;
       else delete next[larkAppId];
     }
     props.onChange(next);
-  }, [catalog, selectedBots, props.drafts, props.onChange, botStatusOf, botPolicyOf]);
+  }, [catalog, writableSelected, props.drafts, props.onChange, botPolicyOf]);
 
-  /** Restore each selected bot to its own default (delete the draft key). */
+  /** Restore each writable selected bot to its own default (delete the draft key). */
   const restoreSelectedDefaults = useCallback(() => {
     const next = { ...props.drafts };
-    for (const larkAppId of selectedBots) delete next[larkAppId];
+    for (const larkAppId of writableSelected) delete next[larkAppId];
     props.onChange(next);
-  }, [selectedBots, props.drafts, props.onChange]);
+  }, [writableSelected, props.drafts, props.onChange]);
 
-  /** Toggle a single skill across all selected bots. */
-  const toggleSkillForSelected = useCallback((skillName: string) => {
+  /** Set a skill to a uniform state across all writable selected bots.
+   *  `enabled: true` forces the skill on for everyone; `false` forces it off.
+   *  This replaces the old per-bot toggle that "swapped" mixed states. */
+  const setSkillForSelected = useCallback((skillName: string, enabled: boolean) => {
     if (!catalog) return;
     const next = { ...props.drafts };
-    for (const larkAppId of selectedBots) {
-      const status = botStatusOf(larkAppId);
-      if (!status.ok) continue;
+    for (const larkAppId of writableSelected) {
       const draft = next[larkAppId];
       const base = draft ?? botPolicyOf(larkAppId);
       const { skills, packs } = selectionFromPolicy(base);
       const nextSkills = new Set(skills);
-      if (nextSkills.has(skillName)) nextSkills.delete(skillName); else nextSkills.add(skillName);
+      if (enabled) nextSkills.add(skillName); else nextSkills.delete(skillName);
       const policy = policyFromSelection(nextSkills, packs);
       if (isLoadoutCustomised(policy, botPolicyOf(larkAppId))) next[larkAppId] = policy;
       else delete next[larkAppId];
     }
     props.onChange(next);
-  }, [catalog, selectedBots, props.drafts, props.onChange, botStatusOf, botPolicyOf]);
+  }, [catalog, writableSelected, props.drafts, props.onChange, botPolicyOf]);
+
+  /** Tri-state of a skill across writable selected bots, for the perk UI. */
+  const skillTriState = useCallback((skillName: string): SkillTriState => {
+    if (writableSelected.length === 0) return 'none';
+    let onCount = 0;
+    for (const larkAppId of writableSelected) {
+      const sel = selectionFromPolicy(props.drafts[larkAppId] ?? botPolicyOf(larkAppId));
+      if (sel.skills.has(skillName)) onCount++;
+    }
+    if (onCount === 0) return 'none';
+    if (onCount === writableSelected.length) return 'all';
+    return 'mixed';
+  }, [writableSelected, props.drafts, botPolicyOf]);
 
   // ── Diff preview ──────────────────────────────────────────────────
   const preview = useMemo<null | {
@@ -225,6 +266,13 @@ export function SessionLoadoutTeamBuilder(props: {
   // ── Drag-and-drop: drop a pack on the lineup to apply to all selected ──
   const [dragPackId, setDragPackId] = useState<string | null>(null);
 
+  const startPackDrag = useCallback((event: DragEvent<HTMLElement>, packId: string) => {
+    setDragPackId(packId);
+    event.dataTransfer.effectAllowed = 'copy';
+    // Firefox refuses to begin native DnD unless at least one payload is set.
+    event.dataTransfer.setData('text/plain', `pack:${packId}`);
+  }, []);
+
   if (props.targets.length === 0) return null;
 
   const errorCard = (message: string) => (
@@ -262,8 +310,8 @@ export function SessionLoadoutTeamBuilder(props: {
                 <button type="button" className="btn btn-sm" onClick={clearSelection} disabled={props.disabled || selectedBots.size === 0}>
                   {tr('sessions.create.loadoutClear')}
                 </button>
-                <span className="loadout-selected-count" data-selected-count={selectedBots.size}>
-                  {tr('sessions.create.loadoutSelectedCount', { count: selectedBots.size, total: props.targets.length })}
+                <span className="loadout-selected-count" data-selected-count={writableSelected.length}>
+                  {tr('sessions.create.loadoutSelectedCount', { count: writableSelected.length, total: props.targets.length })}
                 </span>
               </span>
             </div>
@@ -282,14 +330,18 @@ export function SessionLoadoutTeamBuilder(props: {
                 const sel = selectionFromPolicy(draft ?? botPolicy);
                 const finalCount = resolveLoadoutPreview(sel.skills, sel.packs, catalog.packs).length;
                 const selected = selectedBots.has(target.larkAppId);
+                const disabled = props.disabled || !status.ok;
                 return (
                   <button
                     key={target.larkAppId}
                     type="button"
                     className={`loadout-bot-card${selected ? ' is-selected' : ''}${customised ? ' is-customised' : ''}${!status.ok ? ' is-unavailable' : ''}`}
                     data-loadout-bot={target.larkAppId}
+                    data-loadout-bot-editable={status.ok ? 'true' : 'false'}
                     aria-pressed={selected}
-                    disabled={props.disabled}
+                    aria-disabled={disabled || undefined}
+                    title={status.ok ? target.botName : tr('sessions.create.loadoutBotUnavailable', { reason: status.reason })}
+                    disabled={disabled}
                     onClick={() => toggleBot(target.larkAppId)}
                   >
                     <span className="loadout-bot-check" aria-hidden="true">{selected ? '✓' : ''}</span>
@@ -313,20 +365,20 @@ export function SessionLoadoutTeamBuilder(props: {
             <div className="loadout-builds-head">
               <span>
                 <strong>{tr('sessions.create.loadoutBuilds')}</strong>
-                <small>{tr('sessions.create.loadoutBuildsHint', { count: selectedBots.size })}</small>
+                <small>{tr('sessions.create.loadoutBuildsHint', { count: writableSelected.length })}</small>
               </span>
               <button
                 type="button"
                 className="btn btn-sm"
                 onClick={() => setShowCustom(v => !v)}
-                disabled={props.disabled || selectedBots.size === 0}
+                disabled={props.disabled || writableSelected.length === 0}
                 aria-expanded={showCustom}
               >
                 {showCustom ? tr('sessions.create.loadoutHideCustom') : tr('sessions.create.loadoutCustomFine')}
               </button>
             </div>
 
-            {selectedBots.size === 0 && (
+            {writableSelected.length === 0 && (
               <p className="loadout-empty-hint">{tr('sessions.create.loadoutSelectBotsFirst')}</p>
             )}
 
@@ -341,8 +393,8 @@ export function SessionLoadoutTeamBuilder(props: {
                     key={pack.id}
                     className="loadout-build-card"
                     data-loadout-pack={pack.id}
-                    draggable={!props.disabled && selectedBots.size > 0}
-                    onDragStart={() => setDragPackId(pack.id)}
+                    draggable={!props.disabled && writableSelected.length > 0}
+                    onDragStart={e => startPackDrag(e, pack.id)}
                     onDragEnd={() => setDragPackId(null)}
                   >
                     <div className="loadout-build-card-head">
@@ -360,10 +412,10 @@ export function SessionLoadoutTeamBuilder(props: {
                       className="btn btn-primary btn-sm loadout-build-apply"
                       data-action="apply-pack"
                       data-pack-id={pack.id}
-                      disabled={props.disabled || selectedBots.size === 0}
+                      disabled={props.disabled || writableSelected.length === 0}
                       onClick={() => applyPackToSelected(pack.id)}
                     >
-                      {tr('sessions.create.loadoutApplyBuild', { count: selectedBots.size })}
+                      {tr('sessions.create.loadoutApplyBuild', { count: writableSelected.length })}
                     </button>
                     {appliedCount > 0 && (
                       <span className="loadout-build-applied" data-pack-applied={appliedCount}>
@@ -379,41 +431,50 @@ export function SessionLoadoutTeamBuilder(props: {
             </div>
           </section>
 
-          {/* ── Layer 3: Custom fine-tune drawer ── */}
-          {showCustom && selectedBots.size > 0 && (
+          {/* ── Layer 3: Custom fine-tune (Perks — skills only, no packs) ── */}
+          {showCustom && writableSelected.length > 0 && (
             <section className="loadout-custom" aria-label={tr('sessions.create.loadoutCustomFine')}>
               <div className="loadout-custom-head">
                 <strong>{tr('sessions.create.loadoutCustomFine')}</strong>
-                <small>{tr('sessions.create.loadoutCustomHint', { count: selectedBots.size })}</small>
+                <small>{tr('sessions.create.loadoutCustomHint', { count: writableSelected.length })}</small>
               </div>
-              {selectedBots.size > 1 && (
+              {writableSelected.length > 1 && (
                 <p className="hint-warn loadout-custom-multi">
                   {tr('sessions.create.loadoutMultiWarning')}
                 </p>
               )}
-              {(() => {
-                // Use the first selected bot's effective selection as the shared
-                // starting point; toggles apply to all selected bots.
-                const firstId = [...selectedBots][0];
-                const firstPolicy = props.drafts[firstId] ?? botPolicyOf(firstId);
-                const sel = selectionFromPolicy(firstPolicy);
-                const unavailable = new Set(
-                  [...sel.skills].filter(n => !installedNames.has(n)),
-                );
-                return (
-                  <SkillLoadoutPicker
-                    skills={catalog.skills}
-                    packs={catalog.packs}
-                    selectedSkills={sel.skills}
-                    selectedPacks={sel.packs}
-                    unavailableSkills={unavailable}
-                    disabled={props.disabled}
-                    idPrefix="team-builder"
-                    onToggleSkill={toggleSkillForSelected}
-                    onTogglePack={applyPackToSelected}
-                  />
-                );
-              })()}
+              <div className="loadout-perk-list" data-loadout-perk-list>
+                {catalog.skills.map(skill => {
+                  const state = skillTriState(skill.name);
+                  const enabled = state === 'all';
+                  return (
+                    <button
+                      key={skill.name}
+                      type="button"
+                      className={`loadout-perk${enabled ? ' is-on' : ''}${state === 'mixed' ? ' is-mixed' : ''}`}
+                      data-loadout-perk={skill.name}
+                      data-perk-state={state}
+                      aria-pressed={enabled}
+                      disabled={props.disabled}
+                      onClick={() => setSkillForSelected(skill.name, !enabled)}
+                    >
+                      <span className="loadout-perk-check" aria-hidden="true">
+                        {state === 'all' ? '✓' : state === 'mixed' ? '−' : ''}
+                      </span>
+                      <span className="loadout-perk-name">
+                        <strong>{skill.name}</strong>
+                        {skill.description && <small>{skill.description}</small>}
+                      </span>
+                      <span className="loadout-perk-state">
+                        {state === 'all' ? tr('sessions.create.loadoutPerkAll') : state === 'mixed' ? tr('sessions.create.loadoutPerkMixed') : tr('sessions.create.loadoutPerkNone')}
+                      </span>
+                    </button>
+                  );
+                })}
+                {catalog.skills.length === 0 && (
+                  <small className="muted">{tr('skills.emptyTitle')}</small>
+                )}
+              </div>
             </section>
           )}
 
@@ -466,10 +527,10 @@ export function SessionLoadoutTeamBuilder(props: {
                   type="button"
                   className="btn btn-sm"
                   data-action="restore-selected-defaults"
-                  disabled={props.disabled || selectedBots.size === 0}
+                  disabled={props.disabled || writableSelected.length === 0}
                   onClick={restoreSelectedDefaults}
                 >
-                  {tr('sessions.create.loadoutRestoreSelected', { count: selectedBots.size })}
+                  {tr('sessions.create.loadoutRestoreSelected', { count: writableSelected.length })}
                 </button>
               </div>
             </section>
