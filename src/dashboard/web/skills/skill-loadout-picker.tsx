@@ -147,11 +147,13 @@ export function SkillLoadoutPicker(props: {
         aria-label={tr(selected ? 'skills.loadoutRemove' : 'skills.loadoutAdd', { item: label })}
         disabled={props.disabled}
         title={detail || label}
+        data-drag-item={`${item.type}:${item.id}`}
         {...marker}
         onClick={() => toggle(item)}
         onDragStart={event => startDrag(event, item)}
         onDragEnd={clearDrag}
       >
+        <span className="skills-loadout-grip" aria-hidden="true" />
         <span className={`skills-loadout-kind skills-loadout-kind-${item.type}`} aria-hidden="true">
           {item.type === 'pack' ? 'P' : 'S'}
         </span>
@@ -178,10 +180,12 @@ export function SkillLoadoutPicker(props: {
       draggable={!props.disabled}
       data-equipped-type={item.type}
       data-equipped-id={item.id}
+      data-drag-item={`${item.type}:${item.id}`}
       {...(orphan ? { 'data-loadout-orphan': orphan } : {})}
       onDragStart={event => startDrag(event, item)}
       onDragEnd={clearDrag}
     >
+      <span className="skills-loadout-grip" aria-hidden="true" />
       <span className={`skills-loadout-kind skills-loadout-kind-${item.type}`} aria-hidden="true">
         {item.type === 'pack' ? 'P' : 'S'}
       </span>

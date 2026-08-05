@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useT } from '../react-hooks.js';
-import { SkillLoadoutPicker, type LoadoutPackOption } from './skill-loadout-picker.js';
+import {
+  resolveLoadoutPreview,
+  SkillLoadoutPicker,
+  type LoadoutPackOption,
+} from './skill-loadout-picker.js';
 import {
   isLoadoutCustomised,
   policyFromSelection,
@@ -19,12 +23,12 @@ interface LoadoutCatalog {
 /** Per-session Skill loadout, one collapsed row per bot that will actually
  *  spawn. Deliberately lazy and deliberately quiet:
  *
- *   • the create-session dialog is a lightweight entry point, so the catalog is
- *     fetched on the FIRST expand rather than on dialog open — a user who never
- *     touches loadouts pays nothing;
- *   • rows stay collapsed and summarised ("inherit (3)"), because inheriting
- *     the bot's own policy is the overwhelmingly common case and must not look
- *     like a decision the user has to make.
+ *   • the parent mounts this component only after Advanced Settings opens, so
+ *     the normal create-session path pays nothing;
+ *   • once mounted, the catalog loads immediately so each still-collapsed row
+ *     can honestly show the bot's existing packs/skills instead of the vague
+ *     phrase "inherit default";
+ *   • the full workbench stays collapsed until that particular row is opened.
  */
 export function SessionLoadoutAccordion(props: {
   /** Bots that will actually spawn — already narrowed by loadoutTargetBots. */
@@ -110,6 +114,10 @@ export function SessionLoadoutAccordion(props: {
       if (mountedRef.current) setLoading(false);
     }
   }, []);
+
+  useEffect(() => {
+    if (props.targets.length > 0) void loadCatalog();
+  }, [loadCatalog, props.targets.length]);
 
   const installedNames = useMemo(
     () => new Set((catalog?.skills ?? []).map(skill => skill.name)),
@@ -218,6 +226,26 @@ export function SessionLoadoutAccordion(props: {
         const selection = selectionFromPolicy(effective);
         const status = botStatusOf(target.larkAppId);
         const bot = status.ok ? status.row : undefined;
+        const summaryItems = catalog ? [
+          ...[...selection.packs].map(id => {
+            const pack = catalog.packs.find(candidate => candidate.id === id);
+            return { type: 'pack' as const, id, label: pack?.name ?? id, missing: !pack };
+          }),
+          ...[...selection.skills].map(name => ({
+            type: 'skill' as const,
+            id: name,
+            label: name,
+            missing: !installedNames.has(name),
+          })),
+        ] : [];
+        const summaryMode = !catalog
+          ? (loadError ? 'unavailable' : 'loading')
+          : !status.ok
+            ? 'unavailable'
+            : summaryItems.length === 0 ? 'empty' : 'ready';
+        const finalSkillCount = catalog
+          ? resolveLoadoutPreview(selection.skills, selection.packs, catalog.packs).length
+          : 0;
         // `skillInjectionSupport` only says the CLI *can* share a global skills
         // dir; whether it actually does is the resolved mode (per-bot override
         // falling back to the machine default). Warning on capability alone
@@ -243,11 +271,43 @@ export function SessionLoadoutAccordion(props: {
               disabled={props.disabled}
               onClick={() => { void toggleRow(target.larkAppId); }}
             >
-              <span className="session-loadout-bot">{target.botName}</span>
-              <span className="session-loadout-state" data-loadout-state={customised ? 'custom' : 'inherit'}>
-                {customised
-                  ? tr('sessions.create.loadoutCustom', { count: selection.skills.size + selection.packs.size })
-                  : tr('sessions.create.loadoutInherit')}
+              <span className="session-loadout-bot">
+                <strong>{target.botName}</strong>
+                <small data-loadout-state={customised ? 'custom' : 'inherit'}>
+                  {customised
+                    ? tr('sessions.create.loadoutCustomLabel')
+                    : tr('sessions.create.loadoutDefaultLabel')}
+                </small>
+              </span>
+              <span className="session-loadout-default-summary" data-loadout-default={summaryMode}>
+                {summaryMode === 'loading' && <em>{tr('sessions.create.loadoutDefaultLoading')}</em>}
+                {summaryMode === 'unavailable' && <em>{tr('sessions.create.loadoutDefaultUnavailable')}</em>}
+                {summaryMode === 'empty' && <em>{tr('sessions.create.loadoutDefaultEmpty')}</em>}
+                {summaryMode === 'ready' && (
+                  <>
+                    <span className="session-loadout-default-items">
+                      {summaryItems.slice(0, 3).map(item => (
+                        <span
+                          key={`${item.type}:${item.id}`}
+                          className={`session-loadout-default-chip${item.missing ? ' is-missing' : ''}`}
+                          data-loadout-default-selector={`${item.type}:${item.id}`}
+                          title={item.label}
+                        >
+                          <b aria-hidden="true">{item.type === 'pack' ? 'P' : 'S'}</b>
+                          {item.label}
+                        </span>
+                      ))}
+                      {summaryItems.length > 3 && (
+                        <span className="session-loadout-default-more">
+                          {tr('sessions.create.loadoutMore', { count: summaryItems.length - 3 })}
+                        </span>
+                      )}
+                    </span>
+                    <span className="session-loadout-final-count" data-loadout-final-count={finalSkillCount}>
+                      {tr('sessions.create.loadoutFinalCount', { count: finalSkillCount })}
+                    </span>
+                  </>
+                )}
               </span>
               <span className="session-loadout-chevron" aria-hidden="true">›</span>
             </button>

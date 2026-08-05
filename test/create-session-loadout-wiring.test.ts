@@ -33,10 +33,12 @@ const bots = [
   { larkAppId: 'bot-2', botName: 'Bot 2' },
 ];
 
-function mockApis(): { bodies: any[] } {
+function mockApis(): { bodies: any[]; calls: string[] } {
   const bodies: any[] = [];
+  const calls: string[] = [];
   vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
     const u = String(url);
+    calls.push(u);
     if (u.startsWith('/api/skill-packs')) return jsonRes(200, { packs: [{ id: 'ops', name: 'Ops', include: ['skill:a'] }] });
     if (u.startsWith('/api/skills')) return jsonRes(200, { skills: [{ name: 'a', tags: [] }, { name: 'b', tags: [] }] });
     if (u.startsWith('/api/bots')) {
@@ -51,7 +53,7 @@ function mockApis(): { bodies: any[] } {
     }
     return jsonRes(404, {});
   }));
-  return { bodies };
+  return { bodies, calls };
 }
 
 function renderDialog() {
@@ -87,7 +89,14 @@ async function submit(renderer: TestRenderer.ReactTestRenderer) {
   await flush();
 }
 
+async function openAdvanced(renderer: TestRenderer.ReactTestRenderer) {
+  if (renderer.root.findAllByProps({ id: 'cs-advanced-fields' }).length > 0) return;
+  await act(async () => { renderer.root.findByProps({ id: 'cs-advanced-title' }).props.onClick(); });
+  await flush();
+}
+
 async function expandLoadout(renderer: TestRenderer.ReactTestRenderer, larkAppId: string) {
+  await openAdvanced(renderer);
   const toggle = renderer.root
     .findByProps({ 'data-loadout-row': larkAppId })
     .findByProps({ 'data-action': 'toggle-loadout' });
@@ -153,6 +162,7 @@ describe('create-session dialog ↔ skillLoadouts wiring', () => {
     mockApis();
     const renderer = renderDialog();
     await checkBot(renderer, 'bot-2', true);
+    await openAdvanced(renderer);
     await flush();
 
     expect(renderer.root.findAllByProps({ 'data-loadout-row': 'bot-2' })).toHaveLength(1);
@@ -162,7 +172,27 @@ describe('create-session dialog ↔ skillLoadouts wiring', () => {
   it('offers no loadout rows until a bot is selected', async () => {
     mockApis();
     const renderer = renderDialog();
+    await openAdvanced(renderer);
     await flush();
     expect(renderer.root.findAllByProps({ 'data-session-loadout': true })).toHaveLength(0);
+  });
+
+  it('keeps loadout inside Advanced Settings and pays no catalog cost by default', async () => {
+    const { calls } = mockApis();
+    const renderer = renderDialog();
+    await checkBot(renderer, 'bot-1', true);
+    await flush();
+
+    expect(renderer.root.findAllByProps({ id: 'cs-advanced-fields' })).toHaveLength(0);
+    expect(renderer.root.findAllByProps({ 'data-session-loadout': true })).toHaveLength(0);
+    expect(calls.filter(url => url.startsWith('/api/skills')
+      || url.startsWith('/api/skill-packs')
+      || url.startsWith('/api/bots'))).toHaveLength(0);
+
+    await openAdvanced(renderer);
+    expect(renderer.root.findAllByProps({ 'data-session-loadout': true })).toHaveLength(1);
+    expect(calls.filter(url => url.startsWith('/api/skills')
+      || url.startsWith('/api/skill-packs')
+      || url.startsWith('/api/bots'))).toHaveLength(3);
   });
 });
