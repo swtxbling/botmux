@@ -76,19 +76,13 @@ export function SessionLoadoutAccordion(props: {
       } else if (!packsRes) {
         throw new Error('packs_network_error');
       }
-      // A 200 does not mean the policy is usable. The aggregator returns a
-      // per-bot row, and an unreachable daemon yields `{ larkAppId, error }`
-      // with no `skills` — indistinguishable from "this bot has no policy"
-      // unless checked. Every target must be present AND healthy, otherwise
-      // the first checkbox ticked would submit a loadout that silently
-      // replaces a default we never actually read.
+      // Shape check only. Per-target health is derived at RENDER time instead
+      // (see botStatusOf): validating here would be bypassed the moment a new
+      // target is checked after the catalog is already cached, since
+      // loadCatalog() returns early — and that bot would get an editable
+      // picker built on a policy we never read.
       if (!Array.isArray(botsBody.bots)) throw new Error('bots_malformed_response');
       const botRows: BotRow[] = botsBody.bots;
-      for (const target of props.targets) {
-        const row = botRows.find(bot => bot.larkAppId === target.larkAppId);
-        if (!row) throw new Error(`bot_missing:${target.larkAppId}`);
-        if (row.error) throw new Error(`bot_unavailable:${target.larkAppId}:${row.error}`);
-      }
       if (!mountedRef.current) return;
       setCatalog({
         skills: Array.isArray(skillsBody.skills) ? skillsBody.skills : [],
@@ -100,12 +94,35 @@ export function SessionLoadoutAccordion(props: {
     } finally {
       if (mountedRef.current) setLoading(false);
     }
-  }, [catalog, loading, props.targets]);
+  }, [catalog, loading]);
 
   const installedNames = useMemo(
     () => new Set((catalog?.skills ?? []).map(skill => skill.name)),
     [catalog],
   );
+
+  /** Per-row health, derived from whatever catalog we currently hold. A 200
+   *  from /api/bots does not mean a given bot is usable: the aggregator returns
+   *  one row per bot, and an unreachable daemon yields `{ larkAppId, error }`
+   *  with no `skills` — indistinguishable from "this bot has no policy" unless
+   *  checked. Deriving it here (rather than at fetch time) means a target
+   *  checked AFTER the catalog was cached is validated too. */
+  const botStatusOf = useCallback((larkAppId: string): { ok: true; row: BotRow } | { ok: false; reason: string } => {
+    if (!catalog) return { ok: false, reason: 'catalog_unavailable' };
+    const row = catalog.bots.find(bot => bot.larkAppId === larkAppId);
+    if (!row) return { ok: false, reason: `bot_missing:${larkAppId}` };
+    if (row.error) return { ok: false, reason: `bot_unavailable:${larkAppId}:${row.error}` };
+    return { ok: true, row };
+  }, [catalog]);
+
+  const reloadCatalog = useCallback(async () => {
+    setCatalog(null);
+    setLoadError(null);
+    // loadCatalog short-circuits on a cached catalog, so clear it first; the
+    // state update lands before the next call in the same handler tick.
+    await Promise.resolve();
+    setLoading(false);
+  }, []);
 
   // The bot policy arrives as plain JSON from /api/bots, so it is read through
   // the loose shape and its selectors are filtered where they are used.
@@ -132,6 +149,10 @@ export function SessionLoadoutAccordion(props: {
   };
 
   const setDraft = (larkAppId: string, policy: BotSkillPolicy) => {
+    // Structural guard, independent of what the UI happens to render: without a
+    // readable default we cannot tell a real customisation from an accidental
+    // overwrite, so refuse to record one at all.
+    if (!botStatusOf(larkAppId).ok) return;
     const next = { ...props.drafts };
     // Editing back to exactly the bot's own policy is the same intent as
     // pressing "restore default": drop the key so the request omits the field
@@ -170,7 +191,8 @@ export function SessionLoadoutAccordion(props: {
         // read through the loose shape, since only the draft is our own type.
         const effective: { include?: readonly string[] } | undefined = draft ?? botPolicy;
         const selection = selectionFromPolicy(effective);
-        const bot = catalog?.bots.find(row => row.larkAppId === target.larkAppId);
+        const status = botStatusOf(target.larkAppId);
+        const bot = status.ok ? status.row : undefined;
         // `skillInjectionSupport` only says the CLI *can* share a global skills
         // dir; whether it actually does is the resolved mode (per-bot override
         // falling back to the machine default). Warning on capability alone
@@ -223,7 +245,17 @@ export function SessionLoadoutAccordion(props: {
                 {everOpened.has(target.larkAppId) && (
                   loading ? <small className="muted">{tr('common.loading')}</small>
                     : loadError ? <p className="hint-warn">{loadError}</p>
-                      : catalog ? (
+                      : !catalog ? null
+                      : !status.ok ? (
+                        <div className="session-loadout-blocked" data-loadout-blocked={target.larkAppId}>
+                          <p className="hint-warn">{tr('sessions.create.loadoutBotUnavailable', { reason: status.reason })}</p>
+                          <button
+                            type="button"
+                            data-action="retry-loadout-catalog"
+                            onClick={() => { void reloadCatalog(); }}
+                          >{tr('skills.refresh')}</button>
+                        </div>
+                      ) : (
                         <>
                           {globalInjection && (
                             <p className="hint-warn session-loadout-degraded" data-loadout-degraded>
@@ -258,7 +290,7 @@ export function SessionLoadoutAccordion(props: {
                             >{tr('sessions.create.loadoutRestore')}</button>
                           </div>
                         </>
-                      ) : null
+                      )
                 )}
               </div>
             </div>
