@@ -48,6 +48,13 @@ import {
 } from './preferences.js';
 import { OPEN_CREATE_SESSION_EVENT, consumePendingCreateSession } from './create-session-entry.js';
 import {
+  buildLoadoutSubmission,
+  effectiveLeadLarkAppId,
+  loadoutTargetBots,
+  type LoadoutDrafts,
+} from './create-session-loadout.js';
+import { SessionLoadoutAccordion } from './skills/session-loadout-accordion.js';
+import {
   BOARD_COLUMNS,
   CLI_FILTER_OPTIONS,
   ICON,
@@ -1970,6 +1977,10 @@ function CreateSessionDialog(props: {
   const [keptSuccess, setKeptSuccess] = useState<any>(null);
   const [mentionTrigger, setMentionTrigger] = useState<MentionTrigger | null>(null);
   const [mentionIndex, setMentionIndex] = useState(0);
+  /** Per-bot Skill overrides for THIS session. A bot appears here only once the
+   *  user actually edits its loadout; absent means "inherit the bot policy",
+   *  which is what makes the request omit the field entirely. */
+  const [loadoutDrafts, setLoadoutDrafts] = useState<LoadoutDrafts>({});
   const contentRef = useRef<HTMLTextAreaElement>(null);
   const nextImageOrdinalRef = useRef(1);
 
@@ -1989,6 +2000,7 @@ function CreateSessionDialog(props: {
     setKeptSuccess(null);
     setMentionTrigger(null);
     setMentionIndex(0);
+    setLoadoutDrafts({});
     nextImageOrdinalRef.current = 1;
   }, [state]);
 
@@ -2028,6 +2040,12 @@ function CreateSessionDialog(props: {
   const checkedIds = [...selectedBots];
   const leadOptions = checkedIds;
   const nameOf = (id: string) => bots.find(bot => bot.larkAppId === id)?.botName ?? id;
+  // The lead the request will actually carry, including the "first checked
+  // bot" fallback — the loadout rows must match the bots that really spawn,
+  // not the bots that happen to be ticked.
+  const effectiveLead = effectiveLeadLarkAppId(lead, checkedIds);
+  const loadoutTargets = loadoutTargetBots(mode, checkedIds, effectiveLead)
+    .map(larkAppId => ({ larkAppId, botName: nameOf(larkAppId) }));
   const botQueryNorm = botQuery.trim().toLowerCase();
   const visibleBots = botQueryNorm
     ? bots.filter(bot =>
@@ -2135,7 +2153,7 @@ function CreateSessionDialog(props: {
     const text = content.trim();
     if (!text) { alert(t('sessions.create.errContent')); return; }
     if (checkedIds.length === 0) { alert(t('sessions.create.errNoBot')); return; }
-    const leadLarkAppId = lead || checkedIds[0] || '';
+    const leadLarkAppId = effectiveLead;
     if (mode === 'lead' && (!leadLarkAppId || !checkedIds.includes(leadLarkAppId))) { alert(t('sessions.create.errLead')); return; }
     setSubmitting(true);
     setKeptSuccess(null);
@@ -2151,6 +2169,11 @@ function CreateSessionDialog(props: {
           leadLarkAppId: mode === 'lead' ? leadLarkAppId : undefined,
           name: name.trim() || undefined,
           bindWorkingDir: bindWorkingDir.trim() || undefined,
+          // Only bots that will actually spawn, and only the ones the user
+          // customised. `undefined` when nothing was touched, so the daemon
+          // sees no field at all and every bot inherits its own policy —
+          // opening this dialog must never be able to strip a bot's skills.
+          skillLoadouts: buildLoadoutSubmission(loadoutDrafts, loadoutTargets.map(target => target.larkAppId)),
           images: images.map(image => ({
             name: image.name,
             mimeType: image.mimeType,
@@ -2161,7 +2184,9 @@ function CreateSessionDialog(props: {
       const body = await r.json().catch(() => null);
       if (r.ok && body?.ok) {
         if (keepOpen) {
-          // 连续创建：不切成功页、不关弹窗，保留机器人勾选等配置，清空内容/群名继续下一条
+          // 连续创建：不切成功页、不关弹窗，保留机器人勾选等配置，清空内容/群名继续下一条。
+          // loadout 草稿同样保留——它跟机器人勾选是同一类「这一批怎么配」的设置，
+          // 清掉会让下一条静默退回继承，用户不会注意到自己刚配的装备没了。
           setKeptSuccess(body);
           setContent('');
           setImages([]);
@@ -2321,6 +2346,16 @@ function CreateSessionDialog(props: {
           </select>
           <small>{t('sessions.create.leadHelp')}</small>
         </fieldset>
+        {/* Sits after mode/lead because those decide which bots actually spawn,
+            and the rows must mirror that exactly. Renders nothing until at
+            least one bot is a real target, so the common "just send it" path
+            never sees it. */}
+        <SessionLoadoutAccordion
+          targets={loadoutTargets}
+          drafts={loadoutDrafts}
+          onChange={setLoadoutDrafts}
+          disabled={submitting}
+        />
         <fieldset className="cs-column">
           <legend>{t('sessions.create.column')}</legend>
           <label><input type="radio" name="column" value="in_progress" checked={column === 'in_progress'} onChange={() => setColumn('in_progress')} /> {t('sessions.create.columnInProgress')}</label>

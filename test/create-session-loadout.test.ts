@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   buildLoadoutSubmission,
+  effectiveLeadLarkAppId,
   isLoadoutCustomised,
   loadoutTargetBots,
   policyFromSelection,
@@ -31,6 +32,34 @@ describe('create-session loadout drafts', () => {
     });
   });
 
+  describe('the rows follow the Lead the request actually carries', () => {
+    // The Lead <select> stays empty until the user touches it, but submit falls
+    // back to the first checked bot. Reading the raw state would show no rows
+    // at all for the bot that is about to spawn.
+    it('falls back to the first checked bot, exactly as submit does', () => {
+      expect(effectiveLeadLarkAppId('', ['sub-a', 'lead'])).toBe('sub-a');
+      expect(effectiveLeadLarkAppId('lead', ['sub-a', 'lead'])).toBe('lead');
+      expect(effectiveLeadLarkAppId('', [])).toBe('');
+    });
+
+    it('yields a row for the fallback Lead, where the raw state would yield none', () => {
+      const checked = ['sub-a', 'lead'];
+      expect(loadoutTargetBots('lead', checked, '')).toEqual([]);
+      expect(loadoutTargetBots('lead', checked, effectiveLeadLarkAppId('', checked))).toEqual(['sub-a']);
+    });
+
+    it('the row set equals what the server derives from the same submitted Lead', () => {
+      // Whatever the dialog sends as leadLarkAppId is what the server plans
+      // targets from, so both sides must start from the same value.
+      const checked = ['sub-a', 'lead'];
+      for (const lead of ['', 'lead']) {
+        const submitted = effectiveLeadLarkAppId(lead, checked);
+        expect(loadoutTargetBots('lead', checked, submitted))
+          .toEqual(selectCreateSessionTargets('lead', checked, submitted));
+      }
+    });
+  });
+
   describe('buildLoadoutSubmission only submits what the user customised', () => {
     it('omits untouched bots so they inherit their own policy', () => {
       const drafts = { lead: { include: ['skill:review'] } };
@@ -39,6 +68,15 @@ describe('create-session loadout drafts', () => {
 
     it('returns undefined when nothing was customised', () => {
       expect(buildLoadoutSubmission({}, ['lead', 'sub-a'])).toBeUndefined();
+    });
+
+    it('disappears from the serialised body rather than becoming null', () => {
+      // The parser is fail-closed: an explicit null is `bad_skill_loadout`, not
+      // "inherit". Only true absence inherits, so opening the dialog and
+      // sending without touching loadouts must not add the key at all.
+      const body = JSON.stringify({ content: 'go', skillLoadouts: buildLoadoutSubmission({}, ['lead']) });
+      expect(body).not.toContain('skillLoadouts');
+      expect(JSON.parse(body)).toEqual({ content: 'go' });
     });
 
     it('drops a draft for a bot that is no longer a target', () => {
