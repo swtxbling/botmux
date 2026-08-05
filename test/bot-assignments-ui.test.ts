@@ -422,10 +422,11 @@ describe('bot assignments tab', () => {
     const root = renderer.root;
     const editBtn = root.findAllByType('button').find((button: any) => button.props.children === '选择');
     act(() => { editBtn!.props.onClick(); });
-    const checkboxes = root.findAllByType('input').filter((input: any) => input.props.type === 'checkbox');
+    const packP2 = root.findByProps({ 'data-loadout-pack': 'p2' });
+    const skillC = root.findByProps({ 'data-loadout-skill': 'c' });
     act(() => {
-      checkboxes[1].props.onChange(); // pack:p2
-      checkboxes[4].props.onChange(); // skill:c
+      packP2.props.onClick();
+      skillC.props.onClick();
     });
     const form = root.findByProps({ 'data-action': 'save-bot-assignment' });
     await act(async () => { await form.props.onSubmit({ preventDefault: () => {} }); });

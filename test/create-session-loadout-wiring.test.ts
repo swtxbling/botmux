@@ -120,7 +120,7 @@ describe('create-session dialog ↔ skillLoadouts wiring', () => {
     await expandLoadout(renderer, 'bot-1');
 
     // bot-1's own policy is skill:a; adding skill:b makes it a real override.
-    await act(async () => { renderer.root.findByProps({ 'data-loadout-skill': 'b' }).props.onChange(); });
+    await act(async () => { renderer.root.findByProps({ 'data-loadout-skill': 'b' }).props.onClick(); });
     await submit(renderer);
 
     expect(bodies).toHaveLength(1);
@@ -138,7 +138,7 @@ describe('create-session dialog ↔ skillLoadouts wiring', () => {
     await setContent(renderer, 'go');
 
     await expandLoadout(renderer, 'bot-2');
-    await act(async () => { renderer.root.findByProps({ 'data-loadout-row': 'bot-2' }).findByProps({ 'data-loadout-skill': 'b' }).props.onChange(); });
+    await act(async () => { renderer.root.findByProps({ 'data-loadout-row': 'bot-2' }).findByProps({ 'data-loadout-skill': 'b' }).props.onClick(); });
     await checkBot(renderer, 'bot-2', false);
     await submit(renderer);
 

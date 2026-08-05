@@ -366,12 +366,12 @@ describe('per-session loadout accordion', () => {
     let received: LoadoutDrafts = {};
     let renderer = render({}, drafts => { received = drafts; });
     await expand(renderer, 'bot-1');
-    await act(async () => { renderer.root.findByProps({ 'data-loadout-skill': 'b' }).props.onChange(); });
+    await act(async () => { renderer.root.findByProps({ 'data-loadout-skill': 'b' }).props.onClick(); });
     expect(received['bot-1']).toBeTruthy();
 
     renderer = render(received, drafts => { received = drafts; });
     await expand(renderer, 'bot-1');
-    await act(async () => { renderer.root.findByProps({ 'data-loadout-skill': 'b' }).props.onChange(); });
+    await act(async () => { renderer.root.findByProps({ 'data-loadout-skill': 'b' }).props.onClick(); });
     expect('bot-1' in received).toBe(false);
     expect(received).toEqual({});
   });
@@ -394,7 +394,7 @@ describe('per-session loadout accordion', () => {
     await expand(renderer, 'bot-1');
 
     const skillB = renderer.root.findByProps({ 'data-loadout-skill': 'b' });
-    await act(async () => { skillB.props.onChange(); });
+    await act(async () => { skillB.props.onClick(); });
 
     expect([...(received!['bot-1'].include ?? [])].sort()).toEqual(['skill:a', 'skill:b']);
   });
