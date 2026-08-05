@@ -146,6 +146,8 @@ describe('SkillLoadoutPicker', () => {
     const onToggleSkill = vi.fn();
     const renderer = render({ onToggleSkill });
     const source = renderer.root.findByProps({ 'data-loadout-skill': 'a' });
+    expect(source.props.draggable).toBe(true);
+    expect(source.props['data-drag-item']).toBe('skill:a');
     const dataTransfer = { effectAllowed: '', dropEffect: '', setData: vi.fn() };
     const dragStart = { dataTransfer } as any;
 
@@ -161,6 +163,27 @@ describe('SkillLoadoutPicker', () => {
     });
     expect(drop.preventDefault).toHaveBeenCalled();
     expect(onToggleSkill).toHaveBeenCalledWith('a');
+  });
+
+  it('drags one Pack as its own item without changing an adjacent Skill', () => {
+    const onToggleSkill = vi.fn();
+    const onTogglePack = vi.fn();
+    const renderer = render({ onToggleSkill, onTogglePack });
+    const source = renderer.root.findByProps({ 'data-loadout-pack': 'ops' });
+    expect(source.props.draggable).toBe(true);
+    expect(source.props['data-drag-item']).toBe('pack:ops');
+
+    const dataTransfer = { effectAllowed: '', dropEffect: '', setData: vi.fn() };
+    act(() => { source.props.onDragStart({ dataTransfer } as any); });
+    const tray = renderer.root.findByProps({ 'data-loadout-tray': true });
+    const drop = { preventDefault: vi.fn(), dataTransfer } as any;
+    act(() => {
+      tray.props.onDragOver(drop);
+      tray.props.onDrop(drop);
+    });
+
+    expect(onTogglePack).toHaveBeenCalledWith('ops');
+    expect(onToggleSkill).not.toHaveBeenCalled();
   });
 
   it('drags equipped items back to the catalog to remove them', () => {

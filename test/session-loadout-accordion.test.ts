@@ -80,25 +80,31 @@ async function expand(renderer: TestRenderer.ReactTestRenderer, larkAppId: strin
 describe('per-session loadout accordion', () => {
   afterEach(() => { vi.unstubAllGlobals(); });
 
-  it('costs nothing until a row is expanded', async () => {
-    // The create-session dialog is a lightweight entry point: a user who never
-    // touches loadouts must not pay for the catalog fetch.
+  it('loads the catalog on mount so collapsed rows can show the real default equipment', async () => {
+    // The parent only mounts this inside Advanced Settings. Once the user asks
+    // for that surface, the summary must be factual before any row is opened.
     const { calls } = mockCatalog();
     const renderer = render({});
     await flush();
-    expect(calls).toHaveLength(0);
+    expect(calls).toHaveLength(3);
     expect(renderer.root.findAllByProps({ 'data-loadout-state': 'inherit' })).toHaveLength(2);
+    expect(renderer.root.findByProps({ 'data-loadout-row': 'bot-1' })
+      .findAllByProps({ 'data-loadout-default-selector': 'skill:a' })).toHaveLength(1);
+    expect(renderer.root.findByProps({ 'data-loadout-row': 'bot-1' })
+      .findByProps({ 'data-loadout-final-count': 1 })).toBeTruthy();
+    expect(renderer.root.findByProps({ 'data-loadout-row': 'bot-2' })
+      .findAllByProps({ 'data-loadout-default': 'empty' })).toHaveLength(1);
   });
 
-  it('fetches the catalog on first expand and reuses it afterwards', async () => {
+  it('reuses the advanced-settings catalog when rows are expanded', async () => {
     const { calls } = mockCatalog();
     const renderer = render({});
+    await flush();
+    const afterMount = calls.length;
     await expand(renderer, 'bot-1');
-    expect(calls.some(url => url.startsWith('/api/skills'))).toBe(true);
-
-    const afterFirst = calls.length;
+    expect(calls).toHaveLength(afterMount);
     await expand(renderer, 'bot-2');
-    expect(calls).toHaveLength(afterFirst);
+    expect(calls).toHaveLength(afterMount);
   });
 
   it('keeps at most one row open', async () => {
@@ -146,7 +152,7 @@ describe('per-session loadout accordion', () => {
 
   describe('a failed catalog blocks editing instead of looking like empty data', () => {
     // Reading a failure as "empty" is the dangerous interpretation: an errored
-    // /api/bots looks like "this bot has no policy", so the first checkbox the
+    // /api/bots looks like "this bot has no policy", so the first item the
     // user ticks would submit a loadout that silently replaces the real default.
     it.each([
       ['skills 500', { skills: 500 }],
@@ -174,7 +180,7 @@ describe('per-session loadout accordion', () => {
   describe('a 200 from /api/bots is not proof the policy is usable', () => {
     // The aggregator returns one row per bot, and an unreachable daemon yields
     // `{ larkAppId, error }` with no `skills`. Left unchecked that is
-    // indistinguishable from "this bot has no policy", so the first checkbox
+    // indistinguishable from "this bot has no policy", so the first item
     // ticked would submit a loadout replacing a default we never read.
     it('a malformed bots payload blocks the whole catalog', async () => {
       mockCatalog({ botsPayload: { bots: 'garbage' } });
@@ -335,7 +341,7 @@ describe('per-session loadout accordion', () => {
 
   it('removes a collapsed panel from the tab order and the a11y tree', async () => {
     // The DOM is kept mounted so collapsing can animate, but 0fr +
-    // overflow:hidden only hides it visually — its checkboxes would still be
+    // overflow:hidden only hides it visually — its controls would still be
     // reachable with Tab without inert/aria-hidden.
     mockCatalog();
     const renderer = render({});
@@ -422,6 +428,10 @@ describe('per-session loadout accordion', () => {
       .findAllByProps({ 'data-loadout-state': 'custom' })).toHaveLength(1);
     expect(renderer.root.findByProps({ 'data-loadout-row': 'bot-2' })
       .findAllByProps({ 'data-loadout-state': 'inherit' })).toHaveLength(1);
+    expect(renderer.root.findByProps({ 'data-loadout-row': 'bot-1' })
+      .findAllByProps({ 'data-loadout-default-selector': 'skill:b' })).toHaveLength(1);
+    expect(renderer.root.findByProps({ 'data-loadout-row': 'bot-2' })
+      .findAllByProps({ 'data-loadout-default': 'empty' })).toHaveLength(1);
   });
 
   it('renders nothing when no bot will spawn (Lead mode without a Lead)', () => {

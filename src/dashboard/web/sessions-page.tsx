@@ -2349,16 +2349,6 @@ export function CreateSessionDialog(props: {
           </select>
           <small>{t('sessions.create.leadHelp')}</small>
         </fieldset>
-        {/* Sits after mode/lead because those decide which bots actually spawn,
-            and the rows must mirror that exactly. Renders nothing until at
-            least one bot is a real target, so the common "just send it" path
-            never sees it. */}
-        <SessionLoadoutAccordion
-          targets={loadoutTargets}
-          drafts={loadoutDrafts}
-          onChange={setLoadoutDrafts}
-          disabled={submitting}
-        />
         <fieldset className="cs-column">
           <legend>{t('sessions.create.column')}</legend>
           <label><input type="radio" name="column" value="in_progress" checked={column === 'in_progress'} onChange={() => setColumn('in_progress')} /> {t('sessions.create.columnInProgress')}</label>
@@ -2380,6 +2370,16 @@ export function CreateSessionDialog(props: {
           </legend>
           {advancedOpen ? (
           <div id="cs-advanced-fields" className="cs-advanced-fields">
+            {/* Mode/Lead above decide which bots actually spawn. The loadout
+                stays inside Advanced Settings so the normal create flow is
+                quiet; mounting it here is also the deliberate lazy-load gate
+                for the bots/skills/packs catalog used by its default summary. */}
+            <SessionLoadoutAccordion
+              targets={loadoutTargets}
+              drafts={loadoutDrafts}
+              onChange={setLoadoutDrafts}
+              disabled={submitting}
+            />
             <label className="cs-advanced-field">
               <span>{t('sessions.create.groupName')}</span>
               <input className="cs-pill-input" type="text" name="name" maxLength={60} placeholder={t('sessions.create.groupNamePlaceholder')} value={name} onChange={event => setName(event.currentTarget.value)} />
