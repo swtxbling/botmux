@@ -347,10 +347,10 @@ export function SessionLoadoutTeamBuilder(props: {
                 <small>{tr('sessions.create.loadoutLineupHint')}</small>
               </span>
               <span className="loadout-lineup-actions">
-                <button type="button" className="btn btn-sm" onClick={selectAll} disabled={props.disabled}>
+                <button type="button" className="bd-button small" onClick={selectAll} disabled={props.disabled}>
                   {tr('sessions.create.loadoutSelectAll')}
                 </button>
-                <button type="button" className="btn btn-sm" onClick={clearSelection} disabled={props.disabled || selectedBots.size === 0}>
+                <button type="button" className="bd-button small" onClick={clearSelection} disabled={props.disabled || selectedBots.size === 0}>
                   {tr('sessions.create.loadoutClear')}
                 </button>
                 <span className="loadout-selected-count" data-selected-count={writableSelected.length}>
@@ -421,7 +421,7 @@ export function SessionLoadoutTeamBuilder(props: {
               </span>
               <button
                 type="button"
-                className="btn btn-sm"
+                className="bd-button small"
                 onClick={() => setShowCustom(v => !v)}
                 disabled={props.disabled || writableSelected.length === 0}
                 aria-expanded={showCustom}
@@ -461,7 +461,7 @@ export function SessionLoadoutTeamBuilder(props: {
                     </div>
                     <button
                       type="button"
-                      className="btn btn-primary btn-sm loadout-build-apply"
+                      className="bd-button primary small loadout-build-apply"
                       data-action="apply-pack"
                       data-pack-id={pack.id}
                       disabled={props.disabled || writableSelected.length === 0}
@@ -577,7 +577,7 @@ export function SessionLoadoutTeamBuilder(props: {
               <div className="loadout-preview-actions">
                 <button
                   type="button"
-                  className="btn btn-sm"
+                  className="bd-button small"
                   data-action="restore-selected-defaults"
                   disabled={props.disabled || writableSelected.length === 0}
                   onClick={restoreSelectedDefaults}
