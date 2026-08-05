@@ -109,6 +109,79 @@ describe('SessionLoadoutTeamBuilder', () => {
     expect(drafts['bot-2']).toEqual({ include: ['skill:b'] });
   });
 
+  // ── P1-5: pack-provided skill tri-state ──
+  it('pack-provided skill shows "all" tri-state, not "none"', async () => {
+    // ops pack = [skill:a, skill:b]; bot-1 draft = pack:ops → a should be "all"
+    const { renderer } = await openAndLoad({ drafts: { 'bot-1': { include: ['pack:ops'] } } });
+    await selectBot(renderer, 'bot-1');
+    await openCustom(renderer);
+    const perkA = renderer.root.findByProps({ 'data-loadout-perk': 'a' });
+    expect(perkA.props['data-perk-state']).toBe('all');
+    expect(perkA.props['aria-pressed']).toBe(true);
+  });
+
+  it('enabling a pack-provided skill is a no-op (no duplicate direct selector)', async () => {
+    const { renderer, onChange } = await openAndLoad({ drafts: { 'bot-1': { include: ['pack:ops'] } } });
+    await selectBot(renderer, 'bot-1');
+    await openCustom(renderer);
+    const perkA = renderer.root.findByProps({ 'data-loadout-perk': 'a' });
+    expect(perkA.props['data-perk-state']).toBe('all');
+    // Clicking "all" should disable → but a is pack-provided, so it must
+    // materialize direct skills, drop the pack, then remove a.
+    await act(async () => { await perkA.props.onClick(); });
+    const drafts = onChange.mock.calls[0][0];
+    // Should NOT have pack:ops anymore; should have skill:b (materialized) but not skill:a
+    expect(drafts['bot-1'].include).not.toContain('pack:ops');
+    expect(drafts['bot-1'].include).toContain('skill:b');
+    expect(drafts['bot-1'].include).not.toContain('skill:a');
+  });
+
+  it('mixed perk has aria-pressed="mixed"', async () => {
+    // bot-1 has skill:a (direct), bot-2 has nothing → mixed for 'a'
+    const { renderer } = await openAndLoad({ drafts: { 'bot-1': { include: ['skill:a'] } } });
+    await selectBot(renderer, 'bot-1');
+    await selectBot(renderer, 'bot-2');
+    await openCustom(renderer);
+    const perkA = renderer.root.findByProps({ 'data-loadout-perk': 'a' });
+    expect(perkA.props['data-perk-state']).toBe('mixed');
+    expect(perkA.props['aria-pressed']).toBe('mixed');
+  });
+
+  it('onChange feedback loop: tri-state updates after re-render with new drafts', async () => {
+    const onChange = vi.fn();
+    mockApis();
+    let renderer = render({ onChange });
+    await flush();
+    await selectBot(renderer, 'bot-1');
+    await selectBot(renderer, 'bot-2');
+    await openCustom(renderer);
+
+    // Initially bot-1 default = [skill:a], bot-2 default = [] → 'a' is mixed
+    let perkA = renderer.root.findByProps({ 'data-loadout-perk': 'a' });
+    expect(perkA.props['data-perk-state']).toBe('mixed');
+
+    // Simulate onChange being called and props re-rendered with new drafts
+    const newDrafts = { 'bot-2': { include: ['skill:a'] } };
+    await act(async () => {
+      renderer.update(React.createElement(SessionLoadoutTeamBuilder, {
+        targets: bots, drafts: newDrafts, onChange,
+      }));
+    });
+    await flush();
+    // Now both bots have 'a' → should be 'all'
+    perkA = renderer.root.findByProps({ 'data-loadout-perk': 'a' });
+    expect(perkA.props['data-perk-state']).toBe('all');
+  });
+
+  // ── P1-6: zero-config bot empty state ──
+  it('zero-config bot shows "未配置默认装备" label', async () => {
+    // bot-2 default = [] (no skills) → should show empty label
+    const { renderer } = await openAndLoad();
+    const bot2Card = renderer.root.findByProps({ 'data-loadout-bot': 'bot-2' });
+    const stateSmall = bot2Card.findByProps({ 'data-loadout-state': 'empty' });
+    expect(stateSmall).toBeTruthy();
+  });
+
   // ── Batch pack ──
   it('applies a pack to two selected bots and writes per-bot drafts', async () => {
     const { renderer, onChange } = await openAndLoad();
