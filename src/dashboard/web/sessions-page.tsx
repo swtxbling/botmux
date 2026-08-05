@@ -1924,7 +1924,10 @@ function Drawer(props: {
   );
 }
 
-function CreateSessionDialog(props: {
+/** Exported for the wiring test: asserting on helpers alone would still pass if
+ *  someone dropped `skillLoadouts` from the request body, so the test drives a
+ *  real submit and inspects what actually goes over the wire. */
+export function CreateSessionDialog(props: {
   dialog: HTMLDialogElement;
   state: CreateSessionState | null;
   onClose: () => void;
