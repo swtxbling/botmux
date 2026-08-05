@@ -135,7 +135,7 @@ describe('create-session dialog ↔ skillLoadouts wiring', () => {
     // bot-1's own policy is skill:a; applying the Ops pack (skill:a) is a no-op,
     // so toggle skill:b in the custom drawer to make a real override.
     await openCustomDrawer(renderer);
-    await act(async () => { renderer.root.findByProps({ 'data-loadout-skill': 'b' }).props.onClick(); });
+    await act(async () => { renderer.root.findByProps({ 'data-loadout-perk': 'b' }).props.onClick(); });
     await submit(renderer);
 
     expect(bodies).toHaveLength(1);
@@ -152,7 +152,7 @@ describe('create-session dialog ↔ skillLoadouts wiring', () => {
 
     await selectLineupBot(renderer, 'bot-2');
     await openCustomDrawer(renderer);
-    await act(async () => { renderer.root.findByProps({ 'data-loadout-skill': 'b' }).props.onClick(); });
+    await act(async () => { renderer.root.findByProps({ 'data-loadout-perk': 'b' }).props.onClick(); });
     await checkBot(renderer, 'bot-2', false);
     await submit(renderer);
 
