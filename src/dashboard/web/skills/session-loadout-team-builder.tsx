@@ -180,35 +180,78 @@ export function SessionLoadoutTeamBuilder(props: {
 
   /** Set a skill to a uniform state across all writable selected bots.
    *  `enabled: true` forces the skill on for everyone; `false` forces it off.
-   *  This replaces the old per-bot toggle that "swapped" mixed states. */
+   *
+   *  Must account for pack-provided skills:
+   *  - Enabling a skill already provided by a pack is a no-op (no duplicate
+   *    direct selector; the effective set is unchanged).
+   *  - Disabling a pack-provided skill requires materializing the current
+   *    effective skill set as direct selectors, dropping the pack(s) that
+   *    provide the target skill, then removing the target — so the final
+   *    effective set actually shrinks. This is "from loadout to custom". */
   const setSkillForSelected = useCallback((skillName: string, enabled: boolean) => {
     if (!catalog) return;
     const next = { ...props.drafts };
     for (const larkAppId of writableSelected) {
       const draft = next[larkAppId];
       const base = draft ?? botPolicyOf(larkAppId);
-      const { skills, packs } = selectionFromPolicy(base);
-      const nextSkills = new Set(skills);
-      if (enabled) nextSkills.add(skillName); else nextSkills.delete(skillName);
-      const policy = policyFromSelection(nextSkills, packs);
-      if (isLoadoutCustomised(policy, botPolicyOf(larkAppId))) next[larkAppId] = policy;
-      else delete next[larkAppId];
+      const { skills: directSkills, packs } = selectionFromPolicy(base);
+      const effective = new Set(
+        resolveLoadoutPreview(directSkills, packs, catalog.packs).map(e => e.name),
+      );
+
+      if (enabled) {
+        // Already effective (direct or via pack) → no-op.
+        if (effective.has(skillName)) continue;
+        const nextSkills = new Set(directSkills);
+        nextSkills.add(skillName);
+        const policy = policyFromSelection(nextSkills, packs);
+        if (isLoadoutCustomised(policy, botPolicyOf(larkAppId))) next[larkAppId] = policy;
+        else delete next[larkAppId];
+      } else {
+        // Not effective → nothing to remove.
+        if (!effective.has(skillName)) continue;
+        // If a pack provides this skill, materialize all effective skills as
+        // direct selectors and drop the providing pack(s).
+        const packList = [...packs];
+        const providingPacks = packList.filter(packId => {
+          const pack = catalog.packs.find(p => p.id === packId);
+          return pack?.include.some(sel => sel === `skill:${skillName}`);
+        });
+        if (providingPacks.length > 0) {
+          const materialized = new Set(effective);
+          materialized.delete(skillName);
+          const remainingPacks = packList.filter(packId => !providingPacks.includes(packId));
+          const policy = policyFromSelection(materialized, remainingPacks);
+          if (isLoadoutCustomised(policy, botPolicyOf(larkAppId))) next[larkAppId] = policy;
+          else delete next[larkAppId];
+        } else {
+          // Purely direct selector → just remove it.
+          const nextSkills = new Set(directSkills);
+          nextSkills.delete(skillName);
+          const policy = policyFromSelection(nextSkills, packs);
+          if (isLoadoutCustomised(policy, botPolicyOf(larkAppId))) next[larkAppId] = policy;
+          else delete next[larkAppId];
+        }
+      }
     }
     props.onChange(next);
   }, [catalog, writableSelected, props.drafts, props.onChange, botPolicyOf]);
 
-  /** Tri-state of a skill across writable selected bots, for the perk UI. */
+  /** Tri-state of a skill across writable selected bots, for the perk UI.
+   *  Based on EFFECTIVE skills (direct + pack-expanded), not just direct
+   *  selectors — otherwise a skill provided only by a pack reads as "none". */
   const skillTriState = useCallback((skillName: string): SkillTriState => {
     if (writableSelected.length === 0) return 'none';
     let onCount = 0;
     for (const larkAppId of writableSelected) {
       const sel = selectionFromPolicy(props.drafts[larkAppId] ?? botPolicyOf(larkAppId));
-      if (sel.skills.has(skillName)) onCount++;
+      const effective = resolveLoadoutPreview(sel.skills, sel.packs, catalog?.packs ?? []);
+      if (effective.some(e => e.name === skillName)) onCount++;
     }
     if (onCount === 0) return 'none';
     if (onCount === writableSelected.length) return 'all';
     return 'mixed';
-  }, [writableSelected, props.drafts, botPolicyOf]);
+  }, [writableSelected, props.drafts, botPolicyOf, catalog]);
 
   // ── Diff preview ──────────────────────────────────────────────────
   const preview = useMemo<null | {
@@ -329,6 +372,9 @@ export function SessionLoadoutTeamBuilder(props: {
                 const customised = isLoadoutCustomised(draft, botPolicy);
                 const sel = selectionFromPolicy(draft ?? botPolicy);
                 const finalCount = resolveLoadoutPreview(sel.skills, sel.packs, catalog.packs).length;
+                const defaultSel = selectionFromPolicy(botPolicy);
+                const defaultCount = resolveLoadoutPreview(defaultSel.skills, defaultSel.packs, catalog.packs).length;
+                const isEmptyDefault = !customised && defaultCount === 0;
                 const selected = selectedBots.has(target.larkAppId);
                 const disabled = props.disabled || !status.ok;
                 return (
@@ -347,8 +393,12 @@ export function SessionLoadoutTeamBuilder(props: {
                     <span className="loadout-bot-check" aria-hidden="true">{selected ? '✓' : ''}</span>
                     <span className="loadout-bot-name">
                       <strong>{target.botName}</strong>
-                      <small data-loadout-state={customised ? 'custom' : 'inherit'}>
-                        {customised ? tr('sessions.create.loadoutCustomLabel') : tr('sessions.create.loadoutDefaultLabel')}
+                      <small data-loadout-state={customised ? 'custom' : isEmptyDefault ? 'empty' : 'inherit'}>
+                        {customised
+                          ? tr('sessions.create.loadoutCustomLabel')
+                          : isEmptyDefault
+                            ? tr('sessions.create.loadoutDefaultEmpty')
+                            : tr('sessions.create.loadoutDefaultLabel')}
                       </small>
                     </span>
                     <span className="loadout-bot-count" data-loadout-final-count={finalCount}>
@@ -454,7 +504,7 @@ export function SessionLoadoutTeamBuilder(props: {
                       className={`loadout-perk${enabled ? ' is-on' : ''}${state === 'mixed' ? ' is-mixed' : ''}`}
                       data-loadout-perk={skill.name}
                       data-perk-state={state}
-                      aria-pressed={enabled}
+                      aria-pressed={state === 'mixed' ? 'mixed' : enabled}
                       disabled={props.disabled}
                       onClick={() => setSkillForSelected(skill.name, !enabled)}
                     >
