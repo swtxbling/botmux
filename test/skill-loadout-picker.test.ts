@@ -61,24 +61,31 @@ describe('SkillLoadoutPicker', () => {
     return renderer;
   }
 
+  it('renders a library and equipment tray instead of another checkbox form', () => {
+    const renderer = render();
+    expect(renderer.root.findAllByProps({ 'data-loadout-library': true })).toHaveLength(1);
+    expect(renderer.root.findAllByProps({ 'data-loadout-tray': true })).toHaveLength(1);
+    expect(renderer.root.findAllByType('input')).toHaveLength(0);
+  });
+
   it('is fully controlled: toggling reports upward without mutating its own view', () => {
     const onToggleSkill = vi.fn();
     const renderer = render({ selectedSkills: new Set(['a']), onToggleSkill });
-    const box = renderer.root.findByProps({ 'data-loadout-skill': 'a' });
-    expect(box.props.checked).toBe(true);
+    const item = renderer.root.findByProps({ 'data-loadout-skill': 'a' });
+    expect(item.props['aria-pressed']).toBe(true);
 
-    act(() => { box.props.onChange(); });
+    act(() => { item.props.onClick(); });
     expect(onToggleSkill).toHaveBeenCalledWith('a');
-    // No internal draft state — the checkbox still reflects the prop, so the
+    // No internal draft state — the catalog card still reflects the prop, so the
     // caller stays the single owner of the selection it will submit.
-    expect(renderer.root.findByProps({ 'data-loadout-skill': 'a' }).props.checked).toBe(true);
+    expect(renderer.root.findByProps({ 'data-loadout-skill': 'a' }).props['aria-pressed']).toBe(true);
   });
 
   it('reflects pack selection and reports pack toggles', () => {
     const onTogglePack = vi.fn();
     const renderer = render({ selectedPacks: new Set(['ops']), onTogglePack });
-    expect(renderer.root.findByProps({ 'data-loadout-pack': 'ops' }).props.checked).toBe(true);
-    act(() => { renderer.root.findByProps({ 'data-loadout-pack': 'qa' }).props.onChange(); });
+    expect(renderer.root.findByProps({ 'data-loadout-pack': 'ops' }).props['aria-pressed']).toBe(true);
+    act(() => { renderer.root.findByProps({ 'data-loadout-pack': 'qa' }).props.onClick(); });
     expect(onTogglePack).toHaveBeenCalledWith('qa');
   });
 
@@ -102,7 +109,7 @@ describe('SkillLoadoutPicker', () => {
   });
 
   it('renders removable rows for selected-but-missing skills and packs', () => {
-    // A saved loadout can outlive the things it names. Without a checkbox the
+    // A saved loadout can outlive the things it names. Without a removable card the
     // stale entry is visible but un-removable, so the user can never clean it.
     const onToggleSkill = vi.fn();
     const onTogglePack = vi.fn();
@@ -114,13 +121,11 @@ describe('SkillLoadoutPicker', () => {
     });
 
     const orphanSkill = renderer.root.findByProps({ 'data-loadout-orphan': 'skill' });
-    expect(orphanSkill.props.checked).toBe(true);
-    act(() => { orphanSkill.props.onChange(); });
+    act(() => { orphanSkill.findByType('button').props.onClick(); });
     expect(onToggleSkill).toHaveBeenCalledWith('uninstalled');
 
     const orphanPack = renderer.root.findByProps({ 'data-loadout-orphan': 'pack' });
-    expect(orphanPack.props.checked).toBe(true);
-    act(() => { orphanPack.props.onChange(); });
+    act(() => { orphanPack.findByType('button').props.onClick(); });
     expect(onTogglePack).toHaveBeenCalledWith('deleted-pack');
   });
 
@@ -132,9 +137,47 @@ describe('SkillLoadoutPicker', () => {
 
   it('honours disabled without losing the current selection', () => {
     const renderer = render({ selectedSkills: new Set(['a']), disabled: true });
-    const box = renderer.root.findByProps({ 'data-loadout-skill': 'a' });
-    expect(box.props.disabled).toBe(true);
-    expect(box.props.checked).toBe(true);
+    const item = renderer.root.findByProps({ 'data-loadout-skill': 'a' });
+    expect(item.props.disabled).toBe(true);
+    expect(item.props['aria-pressed']).toBe(true);
+  });
+
+  it('uses a real library → tray drag contract while keeping click as fallback', () => {
+    const onToggleSkill = vi.fn();
+    const renderer = render({ onToggleSkill });
+    const source = renderer.root.findByProps({ 'data-loadout-skill': 'a' });
+    const dataTransfer = { effectAllowed: '', dropEffect: '', setData: vi.fn() };
+    const dragStart = { dataTransfer } as any;
+
+    act(() => { source.props.onDragStart(dragStart); });
+    expect(dataTransfer.effectAllowed).toBe('copy');
+    expect(dataTransfer.setData).toHaveBeenCalledWith('text/plain', 'skill:a');
+
+    const tray = renderer.root.findByProps({ 'data-loadout-tray': true });
+    const drop = { preventDefault: vi.fn(), dataTransfer } as any;
+    act(() => {
+      tray.props.onDragOver(drop);
+      tray.props.onDrop(drop);
+    });
+    expect(drop.preventDefault).toHaveBeenCalled();
+    expect(onToggleSkill).toHaveBeenCalledWith('a');
+  });
+
+  it('drags equipped items back to the catalog to remove them', () => {
+    const onToggleSkill = vi.fn();
+    const renderer = render({ selectedSkills: new Set(['a']), onToggleSkill });
+    const equipped = renderer.root.findByProps({ 'data-equipped-id': 'a' });
+    const dataTransfer = { effectAllowed: '', dropEffect: '', setData: vi.fn() };
+    act(() => { equipped.props.onDragStart({ dataTransfer } as any); });
+    expect(dataTransfer.effectAllowed).toBe('move');
+
+    const library = renderer.root.findByProps({ 'data-loadout-library': true });
+    const drop = { preventDefault: vi.fn(), dataTransfer } as any;
+    act(() => {
+      library.props.onDragOver(drop);
+      library.props.onDrop(drop);
+    });
+    expect(onToggleSkill).toHaveBeenCalledWith('a');
   });
 
   it('scopes itself with idPrefix so two pickers can coexist', () => {
