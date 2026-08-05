@@ -41,11 +41,13 @@ export function SessionLoadoutTeamBuilder(props: {
   const tr = useT();
   const [selectedBots, setSelectedBots] = useState<Set<string>>(() => new Set());
   const [showCustom, setShowCustom] = useState(false);
+  const [mobileTab, setMobileTab] = useState<'lineup' | 'builds' | 'preview'>('lineup');
   const [catalog, setCatalog] = useState<LoadoutCatalog | null>(null);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const mountedRef = useRef(true);
   const inFlightRef = useRef(false);
+  const tabRefs = useRef<Record<string, HTMLButtonElement | null>>({});
 
   useEffect(() => () => { mountedRef.current = false; }, []);
 
@@ -339,8 +341,50 @@ export function SessionLoadoutTeamBuilder(props: {
 
       {catalog && (
         <>
+          {/* Mobile segmented control — switches between lineup/builds/preview.
+              Hidden on desktop where the 3-column grid shows all sections. */}
+          <nav className="loadout-mobile-tabs" role="tablist" aria-label={tr('sessions.create.loadoutMobileTabs')}>
+            {(['lineup', 'builds', 'preview'] as const).map((tab, idx) => {
+              const tabs = ['lineup', 'builds', 'preview'] as const;
+              const active = mobileTab === tab;
+              return (
+                <button
+                  key={tab}
+                  type="button"
+                  role="tab"
+                  id={`loadout-tab-${tab}`}
+                  aria-selected={active}
+                  aria-controls={`loadout-panel-${tab}`}
+                  tabIndex={active ? 0 : -1}
+                  className={`loadout-mobile-tab${active ? ' is-active' : ''}`}
+                  data-mobile-tab={tab}
+                  ref={el => { tabRefs.current[tab] = el; }}
+                  onClick={() => setMobileTab(tab)}
+                  onKeyDown={e => {
+                    let next = -1;
+                    if (e.key === 'ArrowRight') next = (idx + 1) % tabs.length;
+                    else if (e.key === 'ArrowLeft') next = (idx - 1 + tabs.length) % tabs.length;
+                    else if (e.key === 'Home') next = 0;
+                    else if (e.key === 'End') next = tabs.length - 1;
+                    if (next >= 0) {
+                      e.preventDefault();
+                      setMobileTab(tabs[next]);
+                      // Move focus to the newly activated tab (roving tabindex).
+                      tabRefs.current[tabs[next]]?.focus();
+                    }
+                  }}
+                >
+                  {tab === 'lineup'
+                    ? tr('sessions.create.loadoutLineup')
+                    : tab === 'builds'
+                      ? tr('sessions.create.loadoutBuilds')
+                      : tr('sessions.create.loadoutPreview')}
+                </button>
+              );
+            })}
+          </nav>
           {/* ── Layer 1: Lineup ── */}
-          <section className="loadout-lineup" aria-label={tr('sessions.create.loadoutLineup')}>
+          <section className="loadout-lineup" data-tab="lineup" data-tab-active={mobileTab === 'lineup'} role="tabpanel" id="loadout-panel-lineup" aria-labelledby="loadout-tab-lineup" aria-label={tr('sessions.create.loadoutLineup')}>
             <div className="loadout-lineup-head">
               <span>
                 <strong>{tr('sessions.create.loadoutLineup')}</strong>
@@ -413,7 +457,7 @@ export function SessionLoadoutTeamBuilder(props: {
           </section>
 
           {/* ── Layer 2: Loadouts (Packs / Builds) ── */}
-          <section className="loadout-builds" aria-label={tr('sessions.create.loadoutBuilds')}>
+          <section className="loadout-builds" data-tab="builds" data-tab-active={mobileTab === 'builds'} role="tabpanel" id="loadout-panel-builds" aria-labelledby="loadout-tab-builds" aria-label={tr('sessions.create.loadoutBuilds')}>
             <div className="loadout-builds-head">
               <span>
                 <strong>{tr('sessions.create.loadoutBuilds')}</strong>
@@ -485,7 +529,7 @@ export function SessionLoadoutTeamBuilder(props: {
 
           {/* ── Layer 3: Custom fine-tune (Perks — skills only, no packs) ── */}
           {showCustom && writableSelected.length > 0 && (
-            <section className="loadout-custom" aria-label={tr('sessions.create.loadoutCustomFine')}>
+            <section className="loadout-custom" data-tab="builds" data-tab-active={mobileTab === 'builds'} role="tabpanel" aria-label={tr('sessions.create.loadoutCustomFine')}>
               <div className="loadout-custom-head">
                 <strong>{tr('sessions.create.loadoutCustomFine')}</strong>
                 <small>{tr('sessions.create.loadoutCustomHint', { count: writableSelected.length })}</small>
@@ -531,62 +575,68 @@ export function SessionLoadoutTeamBuilder(props: {
           )}
 
           {/* ── Diff preview ── */}
-          {preview && preview.rows.length > 0 && (
-            <section className="loadout-preview" aria-label={tr('sessions.create.loadoutPreview')}>
-              <div className="loadout-preview-head">
-                <strong>{tr('sessions.create.loadoutPreview')}</strong>
-                <small>{tr('sessions.create.loadoutPreviewHint')}</small>
-              </div>
-              {preview.commonSkills.size > 0 && (
-                <div className="loadout-preview-common">
-                  <span>{tr('sessions.create.loadoutCommonSkills')}</span>
-                  <div className="loadout-preview-chips">
-                    {[...preview.commonSkills].map(n => (
-                      <span key={n} className="loadout-preview-chip">{n}</span>
-                    ))}
-                  </div>
-                </div>
-              )}
-              <div className="loadout-preview-rows">
-                {preview.rows.map(r => (
-                  <div key={r.larkAppId} className="loadout-preview-row" data-preview-bot={r.larkAppId}>
-                    <div className="loadout-preview-bot">
-                      <strong>{r.botName}</strong>
-                      <small>
-                        {r.editable
-                          ? tr('sessions.create.loadoutPreviewCount', { from: r.defaultCount, to: r.finalCount })
-                          : tr('sessions.create.loadoutDefaultUnavailable')}
-                      </small>
+          <section className="loadout-preview" data-tab="preview" data-tab-active={mobileTab === 'preview'} role="tabpanel" id="loadout-panel-preview" aria-labelledby="loadout-tab-preview" aria-label={tr('sessions.create.loadoutPreview')}>
+            <div className="loadout-preview-head">
+              <strong>{tr('sessions.create.loadoutPreview')}</strong>
+              <small>{tr('sessions.create.loadoutPreviewHint')}</small>
+            </div>
+            {preview && preview.rows.length > 0 ? (
+              <>
+                {preview.commonSkills.size > 0 && (
+                  <div className="loadout-preview-common">
+                    <span>{tr('sessions.create.loadoutCommonSkills')}</span>
+                    <div className="loadout-preview-chips">
+                      {[...preview.commonSkills].map(n => (
+                        <span key={n} className="loadout-preview-chip">{n}</span>
+                      ))}
                     </div>
-                    {r.added.length > 0 && (
-                      <span className="loadout-preview-diff is-add">
-                        +{r.added.join(', ')}
-                      </span>
-                    )}
-                    {r.removed.length > 0 && (
-                      <span className="loadout-preview-diff is-remove">
-                        −{r.removed.join(', ')}
-                      </span>
-                    )}
-                    {r.added.length === 0 && r.removed.length === 0 && r.editable && (
-                      <span className="loadout-preview-diff is-same">{tr('sessions.create.loadoutPreviewSame')}</span>
-                    )}
                   </div>
-                ))}
-              </div>
-              <div className="loadout-preview-actions">
-                <button
-                  type="button"
-                  className="bd-button small"
-                  data-action="restore-selected-defaults"
-                  disabled={props.disabled || writableSelected.length === 0}
-                  onClick={restoreSelectedDefaults}
-                >
-                  {tr('sessions.create.loadoutRestoreSelected', { count: writableSelected.length })}
-                </button>
-              </div>
-            </section>
-          )}
+                )}
+                <div className="loadout-preview-rows">
+                  {preview.rows.map(r => (
+                    <div key={r.larkAppId} className="loadout-preview-row" data-preview-bot={r.larkAppId}>
+                      <div className="loadout-preview-bot">
+                        <strong>{r.botName}</strong>
+                        <small>
+                          {r.editable
+                            ? tr('sessions.create.loadoutPreviewCount', { from: r.defaultCount, to: r.finalCount })
+                            : tr('sessions.create.loadoutDefaultUnavailable')}
+                        </small>
+                      </div>
+                      {r.added.length > 0 && (
+                        <span className="loadout-preview-diff is-add">
+                          +{r.added.join(', ')}
+                        </span>
+                      )}
+                      {r.removed.length > 0 && (
+                        <span className="loadout-preview-diff is-remove">
+                          −{r.removed.join(', ')}
+                        </span>
+                      )}
+                      {r.added.length === 0 && r.removed.length === 0 && r.editable && (
+                        <span className="loadout-preview-diff is-same">{tr('sessions.create.loadoutPreviewSame')}</span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+                <div className="loadout-preview-actions">
+                  <button
+                    type="button"
+                    className="bd-button small"
+                    data-action="restore-selected-defaults"
+                    disabled={props.disabled || writableSelected.length === 0}
+                    onClick={restoreSelectedDefaults}
+                  >
+                    {tr('sessions.create.loadoutRestoreSelected', { count: writableSelected.length })}
+                  </button>
+                </div>
+              </>
+            ) : (
+              <p className="loadout-preview-empty" data-preview-empty>
+                {tr('sessions.create.loadoutPreviewEmpty')}
+              </p>
+            )}
+          </section>
         </>
       )}
     </div>
