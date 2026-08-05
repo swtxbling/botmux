@@ -14,22 +14,39 @@ async function flush() {
   await act(async () => { await new Promise(r => setTimeout(r, 0)); });
 }
 
-function mockCatalog(): { calls: string[] } {
+interface CatalogOptions {
+  skills?: number;
+  bots?: number;
+  packs?: number;
+  packsNetworkFail?: boolean;
+  /** Resolved injection mode for bot-2, which is on a global-capable CLI. */
+  bot2Injection?: 'global' | 'prompt' | 'off';
+}
+
+function mockCatalog(options: CatalogOptions = {}): { calls: string[] } {
+  const { skills = 200, bots = 200, packs = 200, packsNetworkFail = false, bot2Injection = 'global' } = options;
   const calls: string[] = [];
   vi.stubGlobal('fetch', vi.fn(async (url: string) => {
     calls.push(String(url));
     const u = String(url);
     if (u.startsWith('/api/skill-packs')) {
-      return jsonRes(200, { packs: [{ id: 'ops', name: 'Ops', include: ['skill:a'] }] });
+      if (packsNetworkFail) throw new Error('offline');
+      return packs === 200
+        ? jsonRes(200, { packs: [{ id: 'ops', name: 'Ops', include: ['skill:a'] }] })
+        : jsonRes(packs, { error: 'packs_failed' });
     }
     if (u.startsWith('/api/skills')) {
-      return jsonRes(200, { skills: [{ name: 'a', tags: [] }, { name: 'b', tags: [] }] });
+      return skills === 200
+        ? jsonRes(200, { skills: [{ name: 'a', tags: [] }, { name: 'b', tags: [] }] })
+        : jsonRes(skills, { error: 'skills_failed' });
     }
     if (u.startsWith('/api/bots')) {
-      return jsonRes(200, { bots: [
-        { larkAppId: 'bot-1', botName: 'Bot 1', skills: { include: ['skill:a'] }, skillInjectionSupport: 'dynamic' },
-        { larkAppId: 'bot-2', botName: 'Bot 2', skills: { include: [] }, skillInjectionSupport: 'global' },
-      ] });
+      return bots === 200
+        ? jsonRes(200, { bots: [
+          { larkAppId: 'bot-1', botName: 'Bot 1', skills: { include: ['skill:a'] }, skillInjectionSupport: 'dynamic', skillInjection: 'prompt' },
+          { larkAppId: 'bot-2', botName: 'Bot 2', skills: { include: [] }, skillInjectionSupport: 'global', skillInjection: bot2Injection },
+        ] })
+        : jsonRes(bots, { error: 'bots_failed' });
     }
     return jsonRes(404, {});
   }));
@@ -93,14 +110,75 @@ describe('per-session loadout accordion', () => {
     expect(row2.findAllByProps({ 'data-loadout-panel': 'open' }).length).toBeGreaterThan(0);
   });
 
-  it('warns that a global-injection bot only gets the prompt catalog', async () => {
-    mockCatalog();
+  it('warns based on the RESOLVED injection mode, not the CLI capability', async () => {
+    // skillInjectionSupport only says the CLI *can* share a global skills dir.
+    // Warning on that alone would cry wolf for every bot on such a CLI that is
+    // actually running in prompt mode.
+    mockCatalog({ bot2Injection: 'global' });
     const renderer = render({});
     await expand(renderer, 'bot-1');
     expect(renderer.root.findAllByProps({ 'data-loadout-degraded': true })).toHaveLength(0);
-
     await expand(renderer, 'bot-2');
     expect(renderer.root.findAllByProps({ 'data-loadout-degraded': true })).toHaveLength(1);
+  });
+
+  it('stays silent for a global-capable CLI that is configured for prompt injection', async () => {
+    mockCatalog({ bot2Injection: 'prompt' });
+    const renderer = render({});
+    await expand(renderer, 'bot-2');
+    expect(renderer.root.findAllByProps({ 'data-loadout-degraded': true })).toHaveLength(0);
+  });
+
+  describe('a failed catalog blocks editing instead of looking like empty data', () => {
+    // Reading a failure as "empty" is the dangerous interpretation: an errored
+    // /api/bots looks like "this bot has no policy", so the first checkbox the
+    // user ticks would submit a loadout that silently replaces the real default.
+    it.each([
+      ['skills 500', { skills: 500 }],
+      ['bots 500', { bots: 500 }],
+      ['packs 500', { packs: 500 }],
+      ['packs network error', { packsNetworkFail: true }],
+    ])('%s blocks the picker and surfaces the error', async (_label, options) => {
+      mockCatalog(options as CatalogOptions);
+      const renderer = render({});
+      await expand(renderer, 'bot-1');
+      expect(renderer.root.findAllByProps({ 'data-loadout-skill': 'a' })).toHaveLength(0);
+      expect(JSON.stringify(renderer.toJSON())).toContain('hint-warn');
+    });
+
+    it('treats an explicit packs 404 as "no packs" and still allows editing', async () => {
+      // Older daemons have no pack API at all; that is not a failure.
+      mockCatalog({ packs: 404 });
+      const renderer = render({});
+      await expand(renderer, 'bot-1');
+      expect(renderer.root.findAllByProps({ 'data-loadout-skill': 'a' })).toHaveLength(1);
+      expect(renderer.root.findAllByProps({ 'data-loadout-pack': 'ops' })).toHaveLength(0);
+    });
+  });
+
+  it('editing back to the bot default drops the draft instead of submitting an override', async () => {
+    // Check then uncheck: the summary says "inherit", so the wire must agree.
+    mockCatalog();
+    let received: LoadoutDrafts = {};
+    let renderer = render({}, drafts => { received = drafts; });
+    await expand(renderer, 'bot-1');
+    await act(async () => { renderer.root.findByProps({ 'data-loadout-skill': 'b' }).props.onChange(); });
+    expect(received['bot-1']).toBeTruthy();
+
+    renderer = render(received, drafts => { received = drafts; });
+    await expand(renderer, 'bot-1');
+    await act(async () => { renderer.root.findByProps({ 'data-loadout-skill': 'b' }).props.onChange(); });
+    expect('bot-1' in received).toBe(false);
+    expect(received).toEqual({});
+  });
+
+  it('keeps a collapsed row mounted so the close transition can play', async () => {
+    mockCatalog();
+    const renderer = render({});
+    await expand(renderer, 'bot-1');
+    await expand(renderer, 'bot-1');
+    expect(renderer.root.findAllByProps({ 'data-loadout-panel': 'closed' }).length).toBeGreaterThan(0);
+    expect(renderer.root.findAllByProps({ 'data-loadout-skill': 'a' })).toHaveLength(1);
   });
 
   it('pre-fills from the bot policy and submits the complete final set', async () => {
