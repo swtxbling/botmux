@@ -176,16 +176,66 @@ describe('per-session loadout accordion', () => {
     // `{ larkAppId, error }` with no `skills`. Left unchecked that is
     // indistinguishable from "this bot has no policy", so the first checkbox
     // ticked would submit a loadout replacing a default we never read.
-    it.each([
-      ['a malformed bots payload', { bots: 'garbage' }, 'bots_malformed_response'],
-      ['a target missing from the roster', { bots: [{ larkAppId: 'other', botName: 'Other' }] }, 'bot_missing:bot-1'],
-      ['a target returned as a failed entry', { bots: [{ larkAppId: 'bot-1', error: 'daemon offline' }] }, 'bot_unavailable:bot-1'],
-    ])('%s blocks editing', async (_label, botsPayload, marker) => {
-      mockCatalog({ botsPayload });
+    it('a malformed bots payload blocks the whole catalog', async () => {
+      mockCatalog({ botsPayload: { bots: 'garbage' } });
       const renderer = render({});
       await expand(renderer, 'bot-1');
       expect(renderer.root.findAllByProps({ 'data-loadout-skill': 'a' })).toHaveLength(0);
+      expect(JSON.stringify(renderer.toJSON())).toContain('bots_malformed_response');
+    });
+
+    it.each([
+      ['a target missing from the roster', { bots: [{ larkAppId: 'other', botName: 'Other' }] }, 'bot_missing:bot-1'],
+      ['a target returned as a failed entry', { bots: [{ larkAppId: 'bot-1', error: 'daemon offline' }] }, 'bot_unavailable:bot-1'],
+    ])('%s blocks that row only', async (_label, botsPayload, marker) => {
+      mockCatalog({ botsPayload });
+      const renderer = render({});
+      await expand(renderer, 'bot-1');
+      const row = renderer.root.findByProps({ 'data-loadout-row': 'bot-1' });
+      expect(row.findAllByProps({ 'data-loadout-skill': 'a' })).toHaveLength(0);
+      expect(row.findAllByProps({ 'data-loadout-blocked': 'bot-1' })).toHaveLength(1);
       expect(JSON.stringify(renderer.toJSON())).toContain(marker as string);
+    });
+
+    it('validates a target added AFTER the catalog was cached', async () => {
+      // loadCatalog() short-circuits once cached, so validating at fetch time
+      // would let a newly checked, unhealthy bot straight into an editable
+      // picker built on a policy that was never read.
+      mockCatalog({ botsPayload: { bots: [
+        { larkAppId: 'bot-1', botName: 'Bot 1', skills: { include: ['skill:a'] }, skillInjectionSupport: 'dynamic', skillInjection: 'prompt' },
+        { larkAppId: 'bot-2', error: 'daemon offline' },
+      ] } });
+
+      let drafts: LoadoutDrafts = {};
+      let renderer!: TestRenderer.ReactTestRenderer;
+      act(() => {
+        renderer = TestRenderer.create(React.createElement(SessionLoadoutAccordion, {
+          targets: [{ larkAppId: 'bot-1', botName: 'Bot 1' }],
+          drafts,
+          onChange: (next: LoadoutDrafts) => { drafts = next; },
+        }));
+      });
+      await expand(renderer, 'bot-1');
+      expect(renderer.root.findAllByProps({ 'data-loadout-skill': 'a' })).toHaveLength(1);
+
+      // Now check the unhealthy bot; the catalog is already cached.
+      await act(async () => {
+        renderer.update(React.createElement(SessionLoadoutAccordion, {
+          targets: [{ larkAppId: 'bot-1', botName: 'Bot 1' }, { larkAppId: 'bot-2', botName: 'Bot 2' }],
+          drafts,
+          onChange: (next: LoadoutDrafts) => { drafts = next; },
+        }));
+      });
+      await expand(renderer, 'bot-2');
+
+      const row2 = renderer.root.findByProps({ 'data-loadout-row': 'bot-2' });
+      expect(row2.findAllByProps({ 'data-loadout-skill': 'a' })).toHaveLength(0);
+      expect(row2.findAllByProps({ 'data-loadout-blocked': 'bot-2' })).toHaveLength(1);
+      expect(row2.findAllByProps({ 'data-action': 'retry-loadout-catalog' })).toHaveLength(1);
+      // The healthy row is unaffected, and no draft was ever recorded.
+      expect(renderer.root.findByProps({ 'data-loadout-row': 'bot-1' })
+        .findAllByProps({ 'data-loadout-blocked': 'bot-1' })).toHaveLength(0);
+      expect(drafts).toEqual({});
     });
   });
 
@@ -207,7 +257,11 @@ describe('per-session loadout accordion', () => {
     expect(summary.props['aria-controls']).toBe(open.props.id);
 
     await expand(renderer, 'bot-1');
-    const closed = renderer.root.findByProps({ 'data-loadout-panel': 'closed' });
+    // Scope to the row: every other row is collapsed too, so an unscoped query
+    // matches more than one panel.
+    const closed = renderer.root
+      .findByProps({ 'data-loadout-row': 'bot-1' })
+      .findByProps({ 'data-loadout-panel': 'closed' });
     expect(closed.props.inert).toBe(true);
     expect(closed.props['aria-hidden']).toBe(true);
   });
@@ -233,8 +287,9 @@ describe('per-session loadout accordion', () => {
     const renderer = render({});
     await expand(renderer, 'bot-1');
     await expand(renderer, 'bot-1');
-    expect(renderer.root.findAllByProps({ 'data-loadout-panel': 'closed' }).length).toBeGreaterThan(0);
-    expect(renderer.root.findAllByProps({ 'data-loadout-skill': 'a' })).toHaveLength(1);
+    const row = renderer.root.findByProps({ 'data-loadout-row': 'bot-1' });
+    expect(row.findAllByProps({ 'data-loadout-panel': 'closed' })).toHaveLength(1);
+    expect(row.findAllByProps({ 'data-loadout-skill': 'a' })).toHaveLength(1);
   });
 
   it('pre-fills from the bot policy and submits the complete final set', async () => {
