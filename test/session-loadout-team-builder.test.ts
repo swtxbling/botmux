@@ -281,6 +281,53 @@ describe('SessionLoadoutTeamBuilder', () => {
     expect(lineup).toBeTruthy();
   });
 
+  it('switches mobile panels by click and keyboard without leaking custom perks', async () => {
+    const { renderer } = await openAndLoad();
+    const tab = (name: 'lineup' | 'builds' | 'preview') =>
+      renderer.root.findByProps({ 'data-mobile-tab': name });
+    const panel = (name: 'lineup' | 'builds' | 'preview') =>
+      renderer.root.findByProps({ id: `loadout-panel-${name}` });
+
+    expect(tab('lineup').props['aria-selected']).toBe(true);
+    expect(tab('lineup').props.tabIndex).toBe(0);
+    expect(tab('builds').props.tabIndex).toBe(-1);
+    expect(panel('lineup').props['data-tab-active']).toBe(true);
+    expect(renderer.root.findByProps({ 'data-preview-empty': true })).toBeTruthy();
+
+    await act(async () => { await tab('builds').props.onClick(); });
+    expect(tab('builds').props['aria-selected']).toBe(true);
+    expect(tab('builds').props.tabIndex).toBe(0);
+    expect(panel('lineup').props['data-tab-active']).toBe(false);
+    expect(panel('builds').props['data-tab-active']).toBe(true);
+
+    await selectBot(renderer, 'bot-1');
+    await openCustom(renderer);
+    const custom = renderer.root.findByProps({ className: 'loadout-custom' });
+    expect(custom.props['data-tab-active']).toBe(true);
+
+    await act(async () => { await tab('preview').props.onClick(); });
+    expect(tab('preview').props['aria-selected']).toBe(true);
+    expect(panel('preview').props['data-tab-active']).toBe(true);
+    expect(custom.props['data-tab-active']).toBe(false);
+
+    const preventDefault = vi.fn();
+    await act(async () => {
+      await tab('preview').props.onKeyDown({ key: 'ArrowLeft', preventDefault });
+    });
+    expect(preventDefault).toHaveBeenCalledOnce();
+    expect(tab('builds').props['aria-selected']).toBe(true);
+
+    await act(async () => {
+      await tab('builds').props.onKeyDown({ key: 'Home', preventDefault: vi.fn() });
+    });
+    expect(tab('lineup').props['aria-selected']).toBe(true);
+
+    await act(async () => {
+      await tab('lineup').props.onKeyDown({ key: 'End', preventDefault: vi.fn() });
+    });
+    expect(tab('preview').props['aria-selected']).toBe(true);
+  });
+
   // ── P2: drag sets dataTransfer ──
   it('pack drag start sets dataTransfer payload', async () => {
     const { renderer } = await openAndLoad();

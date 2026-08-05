@@ -28416,8 +28416,10 @@ button.skills-issue-badge:hover {
   .loadout-workshop-body .session-loadout-head { display: none; }
   .loadout-workshop-body .loadout-lineup,
   .loadout-workshop-body .loadout-builds,
+  .loadout-workshop-body .loadout-custom,
   .loadout-workshop-body .loadout-preview { display: none; }
   .loadout-workshop-body .loadout-lineup[data-tab-active="true"],
   .loadout-workshop-body .loadout-builds[data-tab-active="true"],
+  .loadout-workshop-body .loadout-custom[data-tab-active="true"],
   .loadout-workshop-body .loadout-preview[data-tab-active="true"] { display: block; }
 }
