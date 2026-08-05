@@ -8,6 +8,16 @@ import type { BotSkillPolicy } from '../../core/skills/types.js';
  *  accidentally strip a bot's skills just by being opened. */
 export type LoadoutDrafts = Record<string, BotSkillPolicy>;
 
+/** The Lead the request will actually carry.
+ *
+ *  The dialog's Lead <select> is empty until the user touches it, but submit
+ *  falls back to the first checked bot — so reading the raw state would make
+ *  the loadout rows disagree with the bots that really spawn. Both call sites
+ *  go through here so they cannot drift apart. */
+export function effectiveLeadLarkAppId(lead: string, checkedIds: readonly string[]): string {
+  return lead || checkedIds[0] || '';
+}
+
 /** Which bots should get a loadout row, given the current mode.
  *
  *  Mirrors the server's selectCreateSessionTargets: in Lead mode only the Lead

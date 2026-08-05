@@ -27691,6 +27691,31 @@ button.skills-issue-badge:hover {
 }
 
 .session-loadout-degraded { font-size: 11.5px; }
+/* 阻断态：目录没加载出来，或这个 Bot 的策略读不到。刻意做成卡片而不是一行文案，
+   因为它必须带着出口一起出现——没有重试入口的错误读起来像永久判决。 */
+.session-loadout-blocked {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--surface-muted);
+}
+.session-loadout-blocked .hint-warn { margin: 0; font-size: 11.5px; }
+.session-loadout-blocked button {
+  height: 26px;
+  padding: 0 11px;
+  font-size: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  background: var(--surface);
+  color: var(--fg);
+  font-family: inherit;
+  cursor: pointer;
+}
+.session-loadout-blocked button:disabled { opacity: 0.5; cursor: not-allowed; }
 .session-loadout-actions {
   display: flex;
   justify-content: flex-end;
