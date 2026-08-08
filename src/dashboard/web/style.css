@@ -27627,15 +27627,22 @@ button.skills-issue-badge:hover {
 .loadout-bot-default {
   display: inline-flex; align-items: center; gap: 3px; flex-shrink: 0;
 }
-.loadout-bot-default-badge {
-  display: inline-flex; align-items: baseline; gap: 1px;
-  font-size: 10px; padding: 1px 5px; border-radius: var(--radius-full);
-  background: var(--surface-2); color: var(--muted); white-space: nowrap;
-  line-height: 1.4;
+.loadout-bot-default-text {
+  font-size: 10.5px; color: var(--muted); white-space: nowrap;
 }
-.loadout-bot-default-badge b { font-size: 9px; opacity: 0.7; }
-.loadout-bot-default-badge[data-default-packs] { color: var(--accent); }
-.loadout-bot-card.is-unavailable .loadout-bot-default { display: none; }
+.loadout-bot-default[data-loadout-default-unavailable] .loadout-bot-default-text {
+  color: var(--warn);
+}
+/* Outer drop-zone wrapper around each bot card. The inner button stays
+   real-disabled for unavailable bots; the wrapper handles DnD events. */
+.loadout-bot-slot { position: relative; border-radius: var(--radius); }
+.loadout-bot-slot.is-drop-target { outline: 2px dashed var(--accent); outline-offset: 2px; }
+.loadout-bot-slot.is-drop-rejected { outline: 2px dashed var(--warn); outline-offset: 2px; }
+.loadout-bot-slot[data-drop-disabled='true'] { cursor: not-allowed; }
+
+/* Perk drag wrapper so individual skills are draggable from the fine-tune list. */
+.loadout-perk-drag { display: flex; }
+.loadout-perk-drag .loadout-perk { flex: 1; }
 
 .loadout-build-grid {
   display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px;

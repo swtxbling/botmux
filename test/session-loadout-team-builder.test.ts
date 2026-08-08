@@ -65,6 +65,11 @@ async function openCustom(renderer: TestRenderer.ReactTestRenderer) {
   await flush();
 }
 
+/** Find the outer drop-zone wrapper for a bot. */
+function botSlot(renderer: TestRenderer.ReactTestRenderer, larkAppId: string) {
+  return renderer.root.findByProps({ 'data-loadout-bot-slot': larkAppId });
+}
+
 describe('SessionLoadoutTeamBuilder', () => {
   afterEach(() => { vi.unstubAllGlobals(); });
 
@@ -75,24 +80,16 @@ describe('SessionLoadoutTeamBuilder', () => {
     await selectBot(renderer, 'bot-2');
     await openCustom(renderer);
 
-    // bot-1 has skill:a, bot-2 has nothing → mixed for 'a', none for 'b'
     const perkA = renderer.root.findByProps({ 'data-loadout-perk': 'a' });
     expect(perkA.props['data-perk-state']).toBe('mixed');
     const perkB = renderer.root.findByProps({ 'data-loadout-perk': 'b' });
     expect(perkB.props['data-perk-state']).toBe('none');
 
-    // Click mixed 'a' → should equip on ALL selected bots (not swap)
     await act(async () => { await perkA.props.onClick(); });
     expect(onChange).toHaveBeenCalledTimes(1);
     const drafts = onChange.mock.calls[0][0];
-    // bot-1 already had 'a', bot-2 should now have 'a'
     expect(drafts['bot-2']).toEqual({ include: ['skill:a'] });
-    // bot-1 unchanged from default → no draft key
     expect(drafts['bot-1']).toBeUndefined();
-
-    // Now 'a' should be 'all'
-    const perkAAfter = renderer.root.findByProps({ 'data-loadout-perk': 'a' });
-    // Re-render with new drafts to verify state
   });
 
   it('clicking an "all" perk removes from all selected bots', async () => {
@@ -109,9 +106,7 @@ describe('SessionLoadoutTeamBuilder', () => {
     expect(drafts['bot-2']).toEqual({ include: ['skill:b'] });
   });
 
-  // ── P1-5: pack-provided skill tri-state ──
   it('pack-provided skill shows "all" tri-state, not "none"', async () => {
-    // ops pack = [skill:a, skill:b]; bot-1 draft = pack:ops → a should be "all"
     const { renderer } = await openAndLoad({ drafts: { 'bot-1': { include: ['pack:ops'] } } });
     await selectBot(renderer, 'bot-1');
     await openCustom(renderer);
@@ -126,18 +121,14 @@ describe('SessionLoadoutTeamBuilder', () => {
     await openCustom(renderer);
     const perkA = renderer.root.findByProps({ 'data-loadout-perk': 'a' });
     expect(perkA.props['data-perk-state']).toBe('all');
-    // Clicking "all" should disable → but a is pack-provided, so it must
-    // materialize direct skills, drop the pack, then remove a.
     await act(async () => { await perkA.props.onClick(); });
     const drafts = onChange.mock.calls[0][0];
-    // Should NOT have pack:ops anymore; should have skill:b (materialized) but not skill:a
     expect(drafts['bot-1'].include).not.toContain('pack:ops');
     expect(drafts['bot-1'].include).toContain('skill:b');
     expect(drafts['bot-1'].include).not.toContain('skill:a');
   });
 
   it('mixed perk has aria-pressed="mixed"', async () => {
-    // bot-1 has skill:a (direct), bot-2 has nothing → mixed for 'a'
     const { renderer } = await openAndLoad({ drafts: { 'bot-1': { include: ['skill:a'] } } });
     await selectBot(renderer, 'bot-1');
     await selectBot(renderer, 'bot-2');
@@ -156,11 +147,9 @@ describe('SessionLoadoutTeamBuilder', () => {
     await selectBot(renderer, 'bot-2');
     await openCustom(renderer);
 
-    // Initially bot-1 default = [skill:a], bot-2 default = [] → 'a' is mixed
     let perkA = renderer.root.findByProps({ 'data-loadout-perk': 'a' });
     expect(perkA.props['data-perk-state']).toBe('mixed');
 
-    // Simulate onChange being called and props re-rendered with new drafts
     const newDrafts = { 'bot-2': { include: ['skill:a'] } };
     await act(async () => {
       renderer.update(React.createElement(SessionLoadoutTeamBuilder, {
@@ -168,22 +157,20 @@ describe('SessionLoadoutTeamBuilder', () => {
       }));
     });
     await flush();
-    // Now both bots have 'a' → should be 'all'
     perkA = renderer.root.findByProps({ 'data-loadout-perk': 'a' });
     expect(perkA.props['data-perk-state']).toBe('all');
   });
 
-  // ── P1-6: zero-config bot empty state ──
+  // ── Zero-config bot empty state ──
   it('zero-config bot shows "未配置默认装备" label', async () => {
-    // bot-2 default = [] (no skills) → should show empty label
     const { renderer } = await openAndLoad();
     const bot2Card = renderer.root.findByProps({ 'data-loadout-bot': 'bot-2' });
     const stateSmall = bot2Card.findByProps({ 'data-loadout-state': 'empty' });
     expect(stateSmall).toBeTruthy();
   });
 
-  // ── Batch pack ──
-  it('applies a pack to two selected bots and writes per-bot drafts', async () => {
+  // ── Batch pack (incremental, not replacement) ──
+  it('applies a pack to two selected bots incrementally (preserves existing skills)', async () => {
     const { renderer, onChange } = await openAndLoad();
     await selectBot(renderer, 'bot-1');
     await selectBot(renderer, 'bot-2');
@@ -193,9 +180,28 @@ describe('SessionLoadoutTeamBuilder', () => {
 
     expect(onChange).toHaveBeenCalledTimes(1);
     const drafts = onChange.mock.calls[0][0];
-    // ops pack = [skill:a, skill:b]; bot-1 default = [skill:a] → customised → draft
-    expect(drafts['bot-1']).toEqual({ include: ['pack:ops'] });
-    // bot-2 default = [] → customised → draft
+    // bot-1 default = [skill:a]; adding pack:ops keeps skill:a → [skill:a, pack:ops]
+    expect(drafts['bot-1']).toEqual({ include: ['skill:a', 'pack:ops'] });
+    // bot-2 default = []; adding pack:ops → [pack:ops]
+    expect(drafts['bot-2']).toEqual({ include: ['pack:ops'] });
+  });
+
+  // ── Pack tri-state button ──
+  it('pack button shows none/mixed/all tri-state and toggles', async () => {
+    const { renderer, onChange } = await openAndLoad();
+    await selectBot(renderer, 'bot-1');
+    await selectBot(renderer, 'bot-2');
+
+    // Initially neither bot has pack:ops → none
+    const btn = renderer.root.findByProps({ 'data-action': 'apply-pack', 'data-pack-id': 'ops' });
+    expect(btn.props['data-pack-state']).toBe('none');
+    expect(btn.props['aria-pressed']).toBe(false);
+
+    // Click → add to both → all
+    await act(async () => { await btn.props.onClick(); });
+    expect(onChange).toHaveBeenCalledTimes(1);
+    const drafts = onChange.mock.calls[0][0];
+    expect(drafts['bot-1']).toEqual({ include: ['skill:a', 'pack:ops'] });
     expect(drafts['bot-2']).toEqual({ include: ['pack:ops'] });
   });
 
@@ -213,7 +219,7 @@ describe('SessionLoadoutTeamBuilder', () => {
     expect(drafts['bot-2']).toBeUndefined();
   });
 
-  // ── P1-4: non-editable bot cannot be selected ──
+  // ── Non-editable bot ──
   it('non-editable bot card is disabled and excluded from batch count', async () => {
     mockApis({ bots: [
       { larkAppId: 'bot-1', botName: 'Bot 1', skills: { include: ['skill:a'] }, skillInjectionSupport: 'dynamic', skillInjection: 'prompt' },
@@ -227,7 +233,6 @@ describe('SessionLoadoutTeamBuilder', () => {
     expect(bot2.props.disabled).toBe(true);
     expect(bot2.props['data-loadout-bot-editable']).toBe('false');
 
-    // selectAll should only select bot-1
     const selectAllBtn = renderer.root.findAllByType('button').find(b => b.props.children === '全选' || b.props.children?.includes('全选'));
     await act(async () => { await selectAllBtn?.props.onClick(); });
     await flush();
@@ -235,24 +240,34 @@ describe('SessionLoadoutTeamBuilder', () => {
     expect(count).toBeTruthy();
   });
 
-  // ── P1-4: targets shrink prunes selection ──
+  it('non-editable bot shows unavailable label, not empty', async () => {
+    mockApis({ bots: [
+      { larkAppId: 'bot-1', botName: 'Bot 1', error: 'daemon_down', skillInjectionSupport: 'dynamic', skillInjection: 'prompt' },
+    ] });
+    const renderer = render({ targets: [bots[0]], drafts: {}, onChange: vi.fn() });
+    await flush();
+    const bot1 = renderer.root.findByProps({ 'data-loadout-bot': 'bot-1' });
+    // Must show 'unavailable' state, NOT 'empty'
+    expect(bot1.findByProps({ 'data-loadout-state': 'unavailable' })).toBeTruthy();
+    expect(() => bot1.findByProps({ 'data-loadout-state': 'empty' })).toThrow();
+  });
+
+  // ── Targets shrink prunes selection ──
   it('prunes selected bots when targets shrink', async () => {
     const { renderer } = await openAndLoad();
     await selectBot(renderer, 'bot-1');
     await selectBot(renderer, 'bot-2');
-    // Simulate targets shrinking to just bot-1
     await act(async () => {
       renderer.update(React.createElement(SessionLoadoutTeamBuilder, {
         targets: [bots[0]], drafts: {}, onChange: vi.fn(),
       }));
     });
     await flush();
-    // bot-1 is still in targets → stays selected (count=1); bot-2 pruned
     const countEl = renderer.root.findByProps({ 'data-selected-count': 1 });
     expect(countEl).toBeTruthy();
   });
 
-  // ── Zero-config bot ──
+  // ── Zero-config bot editable ──
   it('zero-config bot shows empty default and is editable', async () => {
     mockApis({ bots: [
       { larkAppId: 'bot-1', botName: 'Bot 1', skills: { include: [] }, skillInjectionSupport: 'dynamic', skillInjection: 'prompt' },
@@ -264,6 +279,145 @@ describe('SessionLoadoutTeamBuilder', () => {
     expect(bot1.props['data-loadout-bot-editable']).toBe('true');
   });
 
+  // ── Default summary (visible short text, three states) ──
+  it('renders default summary text with packs, skills, and final count', async () => {
+    mockApis({ bots: [
+      { larkAppId: 'bot-1', botName: 'Bot 1', skills: { include: ['pack:ops', 'skill:c'] }, skillInjectionSupport: 'dynamic', skillInjection: 'prompt' },
+    ] });
+    const renderer = render({ targets: [bots[0]], drafts: {}, onChange: vi.fn() });
+    await flush();
+    const bot1 = renderer.root.findByProps({ 'data-loadout-bot': 'bot-1' });
+    const summary = bot1.findByProps({ className: 'loadout-bot-default' });
+    expect(summary).toBeTruthy();
+    expect(summary.props['data-loadout-default-summary']).toBe(true);
+    const textSpan = summary.findByProps({ className: 'loadout-bot-default-text' });
+    const text = typeof textSpan.children === 'string' ? textSpan.children : textSpan.children.join('');
+    expect(text).toMatch(/1/); // packs
+    expect(text).toMatch(/1/); // skills
+    expect(text).toMatch(/3/); // final (ops→a,b + c = 3)
+  });
+
+  it('renders default summary with zeros when default is empty', async () => {
+    const { renderer } = await openAndLoad();
+    const bot2 = renderer.root.findByProps({ 'data-loadout-bot': 'bot-2' });
+    const summary = bot2.findByProps({ className: 'loadout-bot-default' });
+    expect(summary).toBeTruthy();
+    expect(summary.props['data-loadout-default-summary']).toBe(true);
+    expect(bot2.findByProps({ 'data-loadout-state': 'empty' })).toBeTruthy();
+  });
+
+  it('renders unavailable summary when bot is unavailable', async () => {
+    mockApis({ bots: [
+      { larkAppId: 'bot-1', botName: 'Bot 1', skills: { include: ['pack:ops', 'skill:a'] }, error: 'daemon_down', skillInjectionSupport: 'dynamic', skillInjection: 'prompt' },
+    ] });
+    const renderer = render({ targets: [bots[0]], drafts: {}, onChange: vi.fn() });
+    await flush();
+    const bot1 = renderer.root.findByProps({ 'data-loadout-bot': 'bot-1' });
+    const summary = bot1.findByProps({ className: 'loadout-bot-default' });
+    expect(summary.props['data-loadout-default-unavailable']).toBe(true);
+    expect(summary.props['data-loadout-default-summary']).toBeFalsy();
+    expect(bot1.findByProps({ 'data-loadout-state': 'unavailable' })).toBeTruthy();
+  });
+
+  // ── Single-card drop (point-to-point, superposition) ──
+  it('drops a pack on a single bot without changing selectedBots', async () => {
+    const { renderer, onChange } = await openAndLoad();
+    // Select bot-1, then drop pack on bot-2 (not selected)
+    await selectBot(renderer, 'bot-1');
+
+    const slot2 = botSlot(renderer, 'bot-2');
+    const preventDefault = vi.fn();
+    const dropEvent = { preventDefault, dataTransfer: { dropEffect: '' } } as any;
+    const dragOverEvent = { preventDefault: vi.fn(), dataTransfer: { dropEffect: '', effectAllowed: 'copy' } } as any;
+
+    // Simulate drag start on the pack card
+    const packCard = renderer.root.findByProps({ 'data-loadout-pack': 'ops' });
+    await act(async () => { await packCard.props.onDragStart({ dataTransfer: { effectAllowed: '', setData: vi.fn() }, preventDefault: vi.fn() } as any); });
+    await flush();
+
+    // dragOver on bot-2 (editable) → should preventDefault
+    await act(async () => { await slot2.props.onDragOver(dragOverEvent, 'bot-2', true); });
+    expect(dragOverEvent.preventDefault).toHaveBeenCalled();
+
+    // drop on bot-2 → should only modify bot-2
+    await act(async () => { await slot2.props.onDrop(dropEvent, 'bot-2', true); });
+    expect(onChange).toHaveBeenCalledTimes(1);
+    const drafts = onChange.mock.calls[0][0];
+    // bot-2 gets the pack; bot-1 (selected) is untouched
+    expect(drafts['bot-2']).toEqual({ include: ['pack:ops'] });
+    expect(drafts['bot-1']).toBeUndefined();
+  });
+
+  it('drops a skill on a single bot (superposition, no-op if already effective)', async () => {
+    const { renderer, onChange } = await openAndLoad();
+    // bot-1 default has skill:a; dropping skill:a should be no-op
+    await selectBot(renderer, 'bot-1');
+    await openCustom(renderer);
+    const perkWrappers = renderer.root.findAllByProps({ className: 'loadout-perk-drag' });
+    // Start drag on skill 'a' wrapper (first perk)
+    await act(async () => { await perkWrappers[0].props.onDragStart({ dataTransfer: { effectAllowed: '', setData: vi.fn() }, preventDefault: vi.fn() } as any); });
+    await flush();
+
+    const slot1 = botSlot(renderer, 'bot-1');
+    await act(async () => { await slot1.props.onDrop({ preventDefault: vi.fn(), dataTransfer: {} } as any, 'bot-1', true); });
+    // skill:a already in default → no-op → onChange should not fire for bot-1
+    // (dragItem is skill:a, bot-1 already has it effective)
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it('non-editable bot rejects drop (no preventDefault, no onChange)', async () => {
+    mockApis({ bots: [
+      { larkAppId: 'bot-1', botName: 'Bot 1', skills: { include: ['skill:a'] }, skillInjectionSupport: 'dynamic', skillInjection: 'prompt' },
+      { larkAppId: 'bot-2', botName: 'Bot 2', error: 'daemon_down', skillInjectionSupport: 'dynamic', skillInjection: 'prompt' },
+    ] });
+    const onChange = vi.fn();
+    const renderer = render({ onChange });
+    await flush();
+
+    // Start a drag so dragItem is not null
+    const packCard = renderer.root.findByProps({ 'data-loadout-pack': 'ops' });
+    await act(async () => { await packCard.props.onDragStart({ dataTransfer: { effectAllowed: '', setData: vi.fn() }, preventDefault: vi.fn() } as any); });
+    await flush();
+
+    const slot2 = botSlot(renderer, 'bot-2');
+    expect(slot2.props['data-drop-disabled']).toBe('true');
+
+    const dragOverEvent = { preventDefault: vi.fn(), dataTransfer: { dropEffect: '' } } as any;
+    await act(async () => { await slot2.props.onDragOver(dragOverEvent, 'bot-2', false); });
+    // Non-editable: must NOT preventDefault
+    expect(dragOverEvent.preventDefault).not.toHaveBeenCalled();
+    expect(dragOverEvent.dataTransfer.dropEffect).toBe('none');
+
+    // Drop should not call onChange
+    await act(async () => { await slot2.props.onDrop({ preventDefault: vi.fn(), dataTransfer: {} } as any, 'bot-2', false); });
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  // ── Equivalent default deletes override ──
+  it('editing back to default deletes the draft key', async () => {
+    const { renderer, onChange } = await openAndLoad({ drafts: { 'bot-1': { include: ['skill:a', 'skill:b'] } } });
+    await selectBot(renderer, 'bot-1');
+    await openCustom(renderer);
+    // Remove skill:b → back to default [skill:a] → should delete draft
+    const perkB = renderer.root.findByProps({ 'data-loadout-perk': 'b' });
+    await act(async () => { await perkB.props.onClick(); });
+    const drafts = onChange.mock.calls[0][0];
+    expect(drafts['bot-1']).toBeUndefined();
+  });
+
+  // ── Explicit clear produces {include: []} ──
+  it('clearing a skill that empties the loadout produces explicit empty include array', async () => {
+    // bot-1 default = [skill:a]; remove it → explicit empty { include: [] }
+    const { renderer, onChange } = await openAndLoad();
+    await selectBot(renderer, 'bot-1');
+    await openCustom(renderer);
+    const perkA = renderer.root.findByProps({ 'data-loadout-perk': 'a' });
+    expect(perkA.props['data-perk-state']).toBe('all');
+    await act(async () => { await perkA.props.onClick(); });
+    const drafts = onChange.mock.calls[onChange.mock.calls.length - 1][0];
+    expect(drafts['bot-1']).toEqual({ include: [] });
+  });
+
   // ── Failure retry ──
   it('shows error card and retries on API failure', async () => {
     mockApis({ fail: true });
@@ -272,15 +426,14 @@ describe('SessionLoadoutTeamBuilder', () => {
     const errorCard = renderer.root.findByProps({ 'data-action': 'retry-loadout-catalog' });
     expect(errorCard).toBeTruthy();
 
-    // Retry should re-fetch
     mockApis();
     await act(async () => { await errorCard.props.onClick(); });
     await flush();
-    // After retry, lineup should render
     const lineup = renderer.root.findByProps({ 'data-loadout-lineup': true });
     expect(lineup).toBeTruthy();
   });
 
+  // ── Mobile segmented control (button group, aria-pressed) ──
   it('switches mobile panels by click and keyboard without leaking custom perks', async () => {
     const { renderer } = await openAndLoad();
     const tab = (name: 'lineup' | 'builds' | 'preview') =>
@@ -288,14 +441,15 @@ describe('SessionLoadoutTeamBuilder', () => {
     const panel = (name: 'lineup' | 'builds' | 'preview') =>
       renderer.root.findByProps({ id: `loadout-panel-${name}` });
 
-    expect(tab('lineup').props['aria-selected']).toBe(true);
+    // Button group uses aria-pressed, not aria-selected
+    expect(tab('lineup').props['aria-pressed']).toBe(true);
     expect(tab('lineup').props.tabIndex).toBe(0);
     expect(tab('builds').props.tabIndex).toBe(-1);
     expect(panel('lineup').props['data-tab-active']).toBe(true);
     expect(renderer.root.findByProps({ 'data-preview-empty': true })).toBeTruthy();
 
     await act(async () => { await tab('builds').props.onClick(); });
-    expect(tab('builds').props['aria-selected']).toBe(true);
+    expect(tab('builds').props['aria-pressed']).toBe(true);
     expect(tab('builds').props.tabIndex).toBe(0);
     expect(panel('lineup').props['data-tab-active']).toBe(false);
     expect(panel('builds').props['data-tab-active']).toBe(true);
@@ -306,7 +460,7 @@ describe('SessionLoadoutTeamBuilder', () => {
     expect(custom.props['data-tab-active']).toBe(true);
 
     await act(async () => { await tab('preview').props.onClick(); });
-    expect(tab('preview').props['aria-selected']).toBe(true);
+    expect(tab('preview').props['aria-pressed']).toBe(true);
     expect(panel('preview').props['data-tab-active']).toBe(true);
     expect(custom.props['data-tab-active']).toBe(false);
 
@@ -315,23 +469,22 @@ describe('SessionLoadoutTeamBuilder', () => {
       await tab('preview').props.onKeyDown({ key: 'ArrowLeft', preventDefault });
     });
     expect(preventDefault).toHaveBeenCalledOnce();
-    expect(tab('builds').props['aria-selected']).toBe(true);
+    expect(tab('builds').props['aria-pressed']).toBe(true);
 
     await act(async () => {
       await tab('builds').props.onKeyDown({ key: 'Home', preventDefault: vi.fn() });
     });
-    expect(tab('lineup').props['aria-selected']).toBe(true);
+    expect(tab('lineup').props['aria-pressed']).toBe(true);
 
     await act(async () => {
       await tab('lineup').props.onKeyDown({ key: 'End', preventDefault: vi.fn() });
     });
-    expect(tab('preview').props['aria-selected']).toBe(true);
+    expect(tab('preview').props['aria-pressed']).toBe(true);
   });
 
-  // ── P2: drag sets dataTransfer ──
+  // ── Drag start payload ──
   it('pack drag start sets dataTransfer payload', async () => {
     const { renderer } = await openAndLoad();
-    await selectBot(renderer, 'bot-1');
     const packCard = renderer.root.findByProps({ 'data-loadout-pack': 'ops' });
     const setData = vi.fn();
     const event = { dataTransfer: { effectAllowed: '', setData }, preventDefault: vi.fn() } as any;
@@ -339,11 +492,36 @@ describe('SessionLoadoutTeamBuilder', () => {
     expect(setData).toHaveBeenCalledWith('text/plain', 'pack:ops');
   });
 
-  // ── Not expanded does not request data ──
+  it('skill drag start sets dataTransfer payload', async () => {
+    const { renderer } = await openAndLoad();
+    await selectBot(renderer, 'bot-1');
+    await openCustom(renderer);
+    const perkWrappers = renderer.root.findAllByProps({ className: 'loadout-perk-drag' });
+    expect(perkWrappers.length).toBeGreaterThan(0);
+    const setData = vi.fn();
+    const event = { dataTransfer: { effectAllowed: '', setData }, preventDefault: vi.fn() } as any;
+    await act(async () => { await perkWrappers[0].props.onDragStart(event); });
+    expect(setData).toHaveBeenCalledWith('text/plain', 'skill:a');
+  });
+
+  // ── No fetch until mounted ──
   it('does not fetch catalog until mounted (parent controls mount)', () => {
     const fetch = vi.fn(async () => jsonRes(200, {}));
     vi.stubGlobal('fetch', fetch);
-    // Component is only mounted when Advanced Settings opens; simulate not mounted
     expect(fetch).not.toHaveBeenCalled();
+  });
+
+  // ── ARIA structure: no tabpanel roles, button group not tablist ──
+  it('uses button group (not tablist) and sections without tabpanel role', async () => {
+    const { renderer } = await openAndLoad();
+    const nav = renderer.root.findByProps({ className: 'loadout-mobile-tabs' });
+    expect(nav.props.role).toBe('group');
+    // Panels should not have role="tabpanel"
+    const lineupPanel = renderer.root.findByProps({ id: 'loadout-panel-lineup' });
+    expect(lineupPanel.props.role).toBeUndefined();
+    const buildsPanel = renderer.root.findByProps({ id: 'loadout-panel-builds' });
+    expect(buildsPanel.props.role).toBeUndefined();
+    const previewPanel = renderer.root.findByProps({ id: 'loadout-panel-preview' });
+    expect(previewPanel.props.role).toBeUndefined();
   });
 });

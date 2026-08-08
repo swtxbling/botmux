@@ -20,8 +20,14 @@ interface LoadoutCatalog {
   bots: BotRow[];
 }
 
-/** Tri-state of a skill across the currently selected (writable) bots. */
-type SkillTriState = 'all' | 'none' | 'mixed';
+/** Tri-state of a skill/pack across the currently selected (writable) bots. */
+type TriState = 'all' | 'none' | 'mixed';
+
+/** Unified drag payload: kind discriminates skill vs pack, id is the name/packId. */
+interface DragItem {
+  kind: 'skill' | 'pack';
+  id: string;
+}
 
 /** Game-style "team → loadout → fine-tune" builder.
  *
@@ -31,7 +37,12 @@ type SkillTriState = 'all' | 'none' | 'mixed';
  *    3. Fine-tune — individual Skills (Perks), only in the custom drawer
  *
  *  Backend contract is unchanged: `LoadoutDrafts` is still a per-bot map,
- *  absent = inherit, `{ include: [] }` = explicit clear. */
+ *  absent = inherit, `{ include: [] }` = explicit clear.
+ *
+ *  Drag-and-drop is point-to-point: a Pack or Skill dropped on an editable
+ *  Bot card is ADDED (superposition) to that bot only, without changing the
+ *  selected set. Batch buttons / keyboard toggles still operate on the
+ *  selected set. Non-editable cards reject drops. */
 export function SessionLoadoutTeamBuilder(props: {
   targets: Array<{ larkAppId: string; botName: string }>;
   drafts: LoadoutDrafts;
@@ -47,13 +58,23 @@ export function SessionLoadoutTeamBuilder(props: {
   const [loadError, setLoadError] = useState<string | null>(null);
   const mountedRef = useRef(true);
   const inFlightRef = useRef(false);
+  const catalogRef = useRef<LoadoutCatalog | null>(null);
   const tabRefs = useRef<Record<string, HTMLButtonElement | null>>({});
+
+  // ── Unified drag state ──
+  const [dragItem, setDragItem] = useState<DragItem | null>(null);
+  /** Bot currently showing a drop-reject highlight (non-editable target). */
+  const [rejectTarget, setRejectTarget] = useState<string | null>(null);
 
   useEffect(() => () => { mountedRef.current = false; }, []);
 
   const loadCatalog = useCallback(async (opts?: { force?: boolean }) => {
     if (inFlightRef.current) return;
-    if (catalog && !opts?.force) return;
+    // catalogRef guards against the stale-closure retry bug: a retry runs in
+    // the same tick as the click, before React re-renders with cleared state,
+    // so reading `catalog` from closure would still see the stale value and
+    // silently no-op. catalogRef always reflects the latest committed catalog.
+    if (catalogRef.current && !opts?.force) return;
     inFlightRef.current = true;
     setLoading(true);
     setLoadError(null);
@@ -78,18 +99,20 @@ export function SessionLoadoutTeamBuilder(props: {
       }
       if (!Array.isArray(botsBody.bots)) throw new Error('bots_malformed_response');
       if (!mountedRef.current) return;
-      setCatalog({
+      const next: LoadoutCatalog = {
         skills: Array.isArray(skillsBody.skills) ? skillsBody.skills : [],
         packs,
         bots: botsBody.bots,
-      });
+      };
+      catalogRef.current = next;
+      setCatalog(next);
     } catch (err: any) {
       if (mountedRef.current) setLoadError(err?.message ?? String(err));
     } finally {
       inFlightRef.current = false;
       if (mountedRef.current) setLoading(false);
     }
-  }, [catalog]);
+  }, []);
 
   useEffect(() => {
     if (props.targets.length > 0) void loadCatalog();
@@ -150,28 +173,81 @@ export function SessionLoadoutTeamBuilder(props: {
   }, []);
 
   const selectAll = useCallback(() => {
-    // Only select editable bots; non-editable cards are disabled and cannot
-    // be picked, so the count always matches the real writable target set.
     const editable = props.targets.filter(t => botStatusOf(t.larkAppId).ok).map(t => t.larkAppId);
     setSelectedBots(new Set(editable));
   }, [props.targets, botStatusOf]);
 
   const clearSelection = useCallback(() => setSelectedBots(new Set()), []);
 
-  // ── Batch operations ──────────────────────────────────────────────
-  /** Apply a pack's include to all writable selected bots. */
-  const applyPackToSelected = useCallback((packId: string) => {
+  // ── Superposition helpers ─────────────────────────────────────────
+  /** Add a pack to a single bot's loadout (superposition: keep existing
+   *  skills/packs, union the new pack). No-op if the pack is already present. */
+  const addPackToBot = useCallback((larkAppId: string, packId: string) => {
     if (!catalog) return;
-    const pack = catalog.packs.find(p => p.id === packId);
-    if (!pack) return;
+    const status = botStatusOf(larkAppId);
+    if (!status.ok) return;
+    const base = props.drafts[larkAppId] ?? botPolicyOf(larkAppId);
+    const { skills, packs } = selectionFromPolicy(base);
+    if (packs.has(packId)) return; // idempotent
+    const nextPacks = new Set(packs);
+    nextPacks.add(packId);
+    const policy = policyFromSelection(skills, nextPacks);
     const next = { ...props.drafts };
-    for (const larkAppId of writableSelected) {
-      const policy = policyFromSelection([], [packId]);
-      if (isLoadoutCustomised(policy, botPolicyOf(larkAppId))) next[larkAppId] = policy;
-      else delete next[larkAppId];
-    }
+    if (isLoadoutCustomised(policy, botPolicyOf(larkAppId))) next[larkAppId] = policy;
+    else delete next[larkAppId];
     props.onChange(next);
-  }, [catalog, writableSelected, props.drafts, props.onChange, botPolicyOf]);
+  }, [catalog, props.drafts, props.onChange, botStatusOf, botPolicyOf]);
+
+  /** Add a single skill to a single bot's loadout (superposition). No-op if
+   *  the skill is already effective (direct or via a pack). */
+  const addSkillToBot = useCallback((larkAppId: string, skillName: string) => {
+    if (!catalog) return;
+    const status = botStatusOf(larkAppId);
+    if (!status.ok) return;
+    const base = props.drafts[larkAppId] ?? botPolicyOf(larkAppId);
+    const { skills, packs } = selectionFromPolicy(base);
+    const effective = new Set(
+      resolveLoadoutPreview(skills, packs, catalog.packs).map(e => e.name),
+    );
+    if (effective.has(skillName)) return; // already effective → no-op
+    const nextSkills = new Set(skills);
+    nextSkills.add(skillName);
+    const policy = policyFromSelection(nextSkills, packs);
+    const next = { ...props.drafts };
+    if (isLoadoutCustomised(policy, botPolicyOf(larkAppId))) next[larkAppId] = policy;
+    else delete next[larkAppId];
+    props.onChange(next);
+  }, [catalog, props.drafts, props.onChange, botStatusOf, botPolicyOf]);
+
+  /** Remove a pack from a single bot, keeping all other skills/packs. */
+  const removePackFromBot = useCallback((larkAppId: string, packId: string) => {
+    if (!catalog) return;
+    const base = props.drafts[larkAppId] ?? botPolicyOf(larkAppId);
+    const { skills, packs } = selectionFromPolicy(base);
+    if (!packs.has(packId)) return;
+    const nextPacks = new Set(packs);
+    nextPacks.delete(packId);
+    const policy = policyFromSelection(skills, nextPacks);
+    const next = { ...props.drafts };
+    if (isLoadoutCustomised(policy, botPolicyOf(larkAppId))) next[larkAppId] = policy;
+    else delete next[larkAppId];
+    props.onChange(next);
+  }, [catalog, props.drafts, props.onChange, botPolicyOf]);
+
+  // ── Batch operations (operate on the selected set) ────────────────
+  /** Incrementally add a pack to all writable selected bots (superposition). */
+  const applyPackToSelected = useCallback((packId: string) => {
+    const next = { ...props.drafts };
+    for (const larkAppId of writableSelected) addPackToBotMut(next, larkAppId, packId, catalog, botPolicyOf);
+    props.onChange(next);
+  }, [writableSelected, props.drafts, props.onChange, catalog, botPolicyOf]);
+
+  /** Remove a pack from all writable selected bots, keeping other skills/packs. */
+  const removePackFromSelected = useCallback((packId: string) => {
+    const next = { ...props.drafts };
+    for (const larkAppId of writableSelected) removePackFromBotMut(next, larkAppId, packId, catalog, botPolicyOf);
+    props.onChange(next);
+  }, [writableSelected, props.drafts, props.onChange, catalog, botPolicyOf]);
 
   /** Restore each writable selected bot to its own default (delete the draft key). */
   const restoreSelectedDefaults = useCallback(() => {
@@ -180,16 +256,7 @@ export function SessionLoadoutTeamBuilder(props: {
     props.onChange(next);
   }, [writableSelected, props.drafts, props.onChange]);
 
-  /** Set a skill to a uniform state across all writable selected bots.
-   *  `enabled: true` forces the skill on for everyone; `false` forces it off.
-   *
-   *  Must account for pack-provided skills:
-   *  - Enabling a skill already provided by a pack is a no-op (no duplicate
-   *    direct selector; the effective set is unchanged).
-   *  - Disabling a pack-provided skill requires materializing the current
-   *    effective skill set as direct selectors, dropping the pack(s) that
-   *    provide the target skill, then removing the target — so the final
-   *    effective set actually shrinks. This is "from loadout to custom". */
+  /** Set a skill to a uniform state across all writable selected bots. */
   const setSkillForSelected = useCallback((skillName: string, enabled: boolean) => {
     if (!catalog) return;
     const next = { ...props.drafts };
@@ -202,7 +269,6 @@ export function SessionLoadoutTeamBuilder(props: {
       );
 
       if (enabled) {
-        // Already effective (direct or via pack) → no-op.
         if (effective.has(skillName)) continue;
         const nextSkills = new Set(directSkills);
         nextSkills.add(skillName);
@@ -210,10 +276,7 @@ export function SessionLoadoutTeamBuilder(props: {
         if (isLoadoutCustomised(policy, botPolicyOf(larkAppId))) next[larkAppId] = policy;
         else delete next[larkAppId];
       } else {
-        // Not effective → nothing to remove.
         if (!effective.has(skillName)) continue;
-        // If a pack provides this skill, materialize all effective skills as
-        // direct selectors and drop the providing pack(s).
         const packList = [...packs];
         const providingPacks = packList.filter(packId => {
           const pack = catalog.packs.find(p => p.id === packId);
@@ -227,7 +290,6 @@ export function SessionLoadoutTeamBuilder(props: {
           if (isLoadoutCustomised(policy, botPolicyOf(larkAppId))) next[larkAppId] = policy;
           else delete next[larkAppId];
         } else {
-          // Purely direct selector → just remove it.
           const nextSkills = new Set(directSkills);
           nextSkills.delete(skillName);
           const policy = policyFromSelection(nextSkills, packs);
@@ -239,10 +301,8 @@ export function SessionLoadoutTeamBuilder(props: {
     props.onChange(next);
   }, [catalog, writableSelected, props.drafts, props.onChange, botPolicyOf]);
 
-  /** Tri-state of a skill across writable selected bots, for the perk UI.
-   *  Based on EFFECTIVE skills (direct + pack-expanded), not just direct
-   *  selectors — otherwise a skill provided only by a pack reads as "none". */
-  const skillTriState = useCallback((skillName: string): SkillTriState => {
+  /** Tri-state of a skill across writable selected bots (effective skills). */
+  const skillTriState = useCallback((skillName: string): TriState => {
     if (writableSelected.length === 0) return 'none';
     let onCount = 0;
     for (const larkAppId of writableSelected) {
@@ -254,6 +314,19 @@ export function SessionLoadoutTeamBuilder(props: {
     if (onCount === writableSelected.length) return 'all';
     return 'mixed';
   }, [writableSelected, props.drafts, botPolicyOf, catalog]);
+
+  /** Tri-state of a pack across writable selected bots (direct pack selector). */
+  const packTriState = useCallback((packId: string): TriState => {
+    if (writableSelected.length === 0) return 'none';
+    let onCount = 0;
+    for (const larkAppId of writableSelected) {
+      const sel = selectionFromPolicy(props.drafts[larkAppId] ?? botPolicyOf(larkAppId));
+      if (sel.packs.has(packId)) onCount++;
+    }
+    if (onCount === 0) return 'none';
+    if (onCount === writableSelected.length) return 'all';
+    return 'mixed';
+  }, [writableSelected, props.drafts, botPolicyOf]);
 
   // ── Diff preview ──────────────────────────────────────────────────
   const preview = useMemo<null | {
@@ -308,15 +381,51 @@ export function SessionLoadoutTeamBuilder(props: {
     return { rows, commonSkills };
   }, [catalog, props.targets, selectedBots, props.drafts, botStatusOf, botPolicyOf]);
 
-  // ── Drag-and-drop: drop a pack on the lineup to apply to all selected ──
-  const [dragPackId, setDragPackId] = useState<string | null>(null);
-
-  const startPackDrag = useCallback((event: DragEvent<HTMLElement>, packId: string) => {
-    setDragPackId(packId);
+  // ── Drag start (unified for packs and skills) ──
+  const startDrag = useCallback((event: DragEvent<HTMLElement>, item: DragItem) => {
+    setDragItem(item);
     event.dataTransfer.effectAllowed = 'copy';
     // Firefox refuses to begin native DnD unless at least one payload is set.
-    event.dataTransfer.setData('text/plain', `pack:${packId}`);
+    event.dataTransfer.setData('text/plain', `${item.kind}:${item.id}`);
   }, []);
+
+  const clearDrag = useCallback(() => {
+    setDragItem(null);
+    setRejectTarget(null);
+  }, []);
+
+  // ── Single-bot drop handlers (point-to-point, superposition) ──
+  const onBotDragOver = useCallback((event: DragEvent<HTMLElement>, larkAppId: string, editable: boolean) => {
+    if (!dragItem) return;
+    if (!editable) {
+      // Non-editable: signal rejection, do NOT preventDefault (so the browser
+      // shows no-drop cursor and the drop never fires).
+      event.dataTransfer.dropEffect = 'none';
+      setRejectTarget(larkAppId);
+      return;
+    }
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'copy';
+  }, [dragItem]);
+
+  const onBotDragLeave = useCallback((larkAppId: string) => {
+    setRejectTarget(prev => prev === larkAppId ? null : prev);
+  }, []);
+
+  const onBotDrop = useCallback((event: DragEvent<HTMLElement>, larkAppId: string, editable: boolean) => {
+    if (!dragItem) return;
+    if (!editable) {
+      // Defensive: should never fire because dragOver didn't preventDefault,
+      // but guard anyway so onChange is never called for a non-editable bot.
+      event.preventDefault();
+      clearDrag();
+      return;
+    }
+    event.preventDefault();
+    if (dragItem.kind === 'pack') addPackToBot(larkAppId, dragItem.id);
+    else addSkillToBot(larkAppId, dragItem.id);
+    clearDrag();
+  }, [dragItem, addPackToBot, addSkillToBot, clearDrag]);
 
   if (props.targets.length === 0) return null;
 
@@ -342,8 +451,11 @@ export function SessionLoadoutTeamBuilder(props: {
       {catalog && (
         <>
           {/* Mobile segmented control — switches between lineup/builds/preview.
-              Hidden on desktop where the 3-column grid shows all sections. */}
-          <nav className="loadout-mobile-tabs" role="tablist" aria-label={tr('sessions.create.loadoutMobileTabs')}>
+              Hidden on desktop where the 3-column grid shows all sections.
+              Uses a button group with aria-pressed (not tablist/tab) so the
+              structure stays valid when the tablist is hidden on desktop and
+              panels are all visible at once. Roving tabindex + arrow keys kept. */}
+          <nav className="loadout-mobile-tabs" role="group" aria-label={tr('sessions.create.loadoutMobileTabs')}>
             {(['lineup', 'builds', 'preview'] as const).map((tab, idx) => {
               const tabs = ['lineup', 'builds', 'preview'] as const;
               const active = mobileTab === tab;
@@ -351,9 +463,8 @@ export function SessionLoadoutTeamBuilder(props: {
                 <button
                   key={tab}
                   type="button"
-                  role="tab"
                   id={`loadout-tab-${tab}`}
-                  aria-selected={active}
+                  aria-pressed={active}
                   aria-controls={`loadout-panel-${tab}`}
                   tabIndex={active ? 0 : -1}
                   className={`loadout-mobile-tab${active ? ' is-active' : ''}`}
@@ -369,7 +480,6 @@ export function SessionLoadoutTeamBuilder(props: {
                     if (next >= 0) {
                       e.preventDefault();
                       setMobileTab(tabs[next]);
-                      // Move focus to the newly activated tab (roving tabindex).
                       tabRefs.current[tabs[next]]?.focus();
                     }
                   }}
@@ -384,7 +494,7 @@ export function SessionLoadoutTeamBuilder(props: {
             })}
           </nav>
           {/* ── Layer 1: Lineup ── */}
-          <section className="loadout-lineup" data-tab="lineup" data-tab-active={mobileTab === 'lineup'} role="tabpanel" id="loadout-panel-lineup" aria-labelledby="loadout-tab-lineup" aria-label={tr('sessions.create.loadoutLineup')}>
+          <section className="loadout-lineup" data-tab="lineup" data-tab-active={mobileTab === 'lineup'} id="loadout-panel-lineup" aria-label={tr('sessions.create.loadoutLineup')}>
             <div className="loadout-lineup-head">
               <span>
                 <strong>{tr('sessions.create.loadoutLineup')}</strong>
@@ -403,12 +513,9 @@ export function SessionLoadoutTeamBuilder(props: {
               </span>
             </div>
 
-            <div
-              className="loadout-lineup-grid"
-              data-loadout-lineup
-              onDragOver={e => { if (dragPackId) e.preventDefault(); }}
-              onDrop={e => { if (dragPackId) { e.preventDefault(); applyPackToSelected(dragPackId); setDragPackId(null); } }}
-            >
+            {/* Lineup grid: NO container-level drag handlers. Each bot card
+                has its own outer drop zone so drops land on a precise target. */}
+            <div className="loadout-lineup-grid" data-loadout-lineup>
               {props.targets.map(target => {
                 const status = botStatusOf(target.larkAppId);
                 const botPolicy = botPolicyOf(target.larkAppId);
@@ -420,69 +527,75 @@ export function SessionLoadoutTeamBuilder(props: {
                 const defaultCount = resolveLoadoutPreview(defaultSel.skills, defaultSel.packs, catalog.packs).length;
                 const isEmptyDefault = !customised && defaultCount === 0;
                 const selected = selectedBots.has(target.larkAppId);
-                const disabled = props.disabled || !status.ok;
+                const editable = status.ok && !props.disabled;
+                const isReject = rejectTarget === target.larkAppId;
+                // State label: distinguish unavailable (default unreadable) from
+                // empty default — previously both collapsed to "empty".
+                const stateLabel = !status.ok
+                  ? tr('sessions.create.loadoutDefaultUnavailable')
+                  : customised
+                    ? tr('sessions.create.loadoutCustomLabel')
+                    : isEmptyDefault
+                      ? tr('sessions.create.loadoutDefaultEmpty')
+                      : tr('sessions.create.loadoutDefaultLabel');
+                const stateKind = !status.ok ? 'unavailable' : customised ? 'custom' : isEmptyDefault ? 'empty' : 'inherit';
                 return (
-                  <button
+                  <div
                     key={target.larkAppId}
-                    type="button"
-                    className={`loadout-bot-card${selected ? ' is-selected' : ''}${customised ? ' is-customised' : ''}${!status.ok ? ' is-unavailable' : ''}`}
-                    data-loadout-bot={target.larkAppId}
-                    data-loadout-bot-editable={status.ok ? 'true' : 'false'}
-                    aria-pressed={selected}
-                    aria-disabled={disabled || undefined}
-                    title={status.ok ? target.botName : tr('sessions.create.loadoutBotUnavailable', { reason: status.reason })}
-                    disabled={disabled}
-                    onClick={() => toggleBot(target.larkAppId)}
+                    className={`loadout-bot-slot${isReject ? ' is-drop-rejected' : ''}${dragItem && editable ? ' is-drop-target' : ''}`}
+                    data-loadout-bot-slot={target.larkAppId}
+                    data-drop-disabled={!editable ? 'true' : undefined}
+                    onDragOver={e => onBotDragOver(e, target.larkAppId, editable)}
+                    onDragLeave={() => onBotDragLeave(target.larkAppId)}
+                    onDrop={e => onBotDrop(e, target.larkAppId, editable)}
                   >
-                    <span className="loadout-bot-check" aria-hidden="true">{selected ? '✓' : ''}</span>
-                    <span className="loadout-bot-name">
-                      <strong>{target.botName}</strong>
-                    </span>
-                    <span className="loadout-bot-meta">
-                      <small data-loadout-state={customised ? 'custom' : isEmptyDefault ? 'empty' : 'inherit'}>
-                        {customised
-                          ? tr('sessions.create.loadoutCustomLabel')
-                          : isEmptyDefault
-                            ? tr('sessions.create.loadoutDefaultEmpty')
-                            : tr('sessions.create.loadoutDefaultLabel')}
-                      </small>
-                      {/* Default loadout breakdown: packs + direct skills, so each
-                          Bot's original equipment is visible at a glance. Only
-                          shown when the default is readable (status.ok). */}
-                      {status.ok && (defaultSel.packs.size > 0 || defaultSel.skills.size > 0) && (
-                        <span className="loadout-bot-default" data-loadout-default-breakdown>
-                          {defaultSel.packs.size > 0 && (
-                            <span
-                              className="loadout-bot-default-badge"
-                              data-default-packs={defaultSel.packs.size}
-                              title={tr('sessions.create.loadoutDefaultPacks', { count: defaultSel.packs.size })}
-                            >
-                              <b aria-hidden="true">P</b>{defaultSel.packs.size}
-                            </span>
-                          )}
-                          {defaultSel.skills.size > 0 && (
-                            <span
-                              className="loadout-bot-default-badge"
-                              data-default-skills={defaultSel.skills.size}
-                              title={tr('sessions.create.loadoutDefaultDirect', { count: defaultSel.skills.size })}
-                            >
-                              <b aria-hidden="true">S</b>{defaultSel.skills.size}
-                            </span>
-                          )}
-                        </span>
-                      )}
-                      <span className="loadout-bot-count" data-loadout-final-count={finalCount}>
-                        {tr('sessions.create.loadoutFinalCount', { count: finalCount })}
+                    <button
+                      type="button"
+                      className={`loadout-bot-card${selected ? ' is-selected' : ''}${customised ? ' is-customised' : ''}${!status.ok ? ' is-unavailable' : ''}`}
+                      data-loadout-bot={target.larkAppId}
+                      data-loadout-bot-editable={status.ok ? 'true' : 'false'}
+                      aria-pressed={selected}
+                      disabled={!editable}
+                      title={status.ok ? target.botName : tr('sessions.create.loadoutBotUnavailable', { reason: status.reason })}
+                      onClick={() => toggleBot(target.larkAppId)}
+                    >
+                      <span className="loadout-bot-check" aria-hidden="true">{selected ? '✓' : ''}</span>
+                      <span className="loadout-bot-name">
+                        <strong>{target.botName}</strong>
                       </span>
-                    </span>
-                  </button>
+                      <span className="loadout-bot-meta">
+                        <small data-loadout-state={stateKind}>{stateLabel}</small>
+                        {/* Visible, localizable default summary — replaces the
+                            old P:N/S:N hover-only badges. Reads: "默认 1 包 · 1 Skill · 最终 3".
+                            Only shown when the default is readable. */}
+                        {status.ok && (
+                          <span className="loadout-bot-default" data-loadout-default-summary>
+                            <span className="loadout-bot-default-text">
+                              {tr('sessions.create.loadoutDefaultSummary', {
+                                packs: defaultSel.packs.size,
+                                skills: defaultSel.skills.size,
+                                final: finalCount,
+                              })}
+                            </span>
+                          </span>
+                        )}
+                        {!status.ok && (
+                          <span className="loadout-bot-default" data-loadout-default-unavailable>
+                            <span className="loadout-bot-default-text">
+                              {tr('sessions.create.loadoutDefaultUnavailable')}
+                            </span>
+                          </span>
+                        )}
+                      </span>
+                    </button>
+                  </div>
                 );
               })}
             </div>
           </section>
 
           {/* ── Layer 2: Loadouts (Packs / Builds) ── */}
-          <section className="loadout-builds" data-tab="builds" data-tab-active={mobileTab === 'builds'} role="tabpanel" id="loadout-panel-builds" aria-labelledby="loadout-tab-builds" aria-label={tr('sessions.create.loadoutBuilds')}>
+          <section className="loadout-builds" data-tab="builds" data-tab-active={mobileTab === 'builds'} id="loadout-panel-builds" aria-label={tr('sessions.create.loadoutBuilds')}>
             <div className="loadout-builds-head">
               <span>
                 <strong>{tr('sessions.create.loadoutBuilds')}</strong>
@@ -505,18 +618,24 @@ export function SessionLoadoutTeamBuilder(props: {
 
             <div className="loadout-build-grid">
               {catalog.packs.map(pack => {
+                const tri = packTriState(pack.id);
                 const appliedCount = preview?.rows.filter(r => {
                   const sel = selectionFromPolicy(props.drafts[r.larkAppId] ?? botPolicyOf(r.larkAppId));
                   return sel.packs.has(pack.id);
                 }).length ?? 0;
+                const buttonLabel = tri === 'all'
+                  ? tr('sessions.create.loadoutPackUnequip', { count: writableSelected.length })
+                  : tri === 'mixed'
+                    ? tr('sessions.create.loadoutPackEquipAll', { count: writableSelected.length })
+                    : tr('sessions.create.loadoutPackEquip', { count: writableSelected.length });
                 return (
                   <div
                     key={pack.id}
                     className="loadout-build-card"
                     data-loadout-pack={pack.id}
-                    draggable={!props.disabled && writableSelected.length > 0}
-                    onDragStart={e => startPackDrag(e, pack.id)}
-                    onDragEnd={() => setDragPackId(null)}
+                    draggable={!props.disabled}
+                    onDragStart={e => startDrag(e, { kind: 'pack', id: pack.id })}
+                    onDragEnd={clearDrag}
                   >
                     <div className="loadout-build-card-head">
                       <strong>{pack.name}</strong>
@@ -530,13 +649,15 @@ export function SessionLoadoutTeamBuilder(props: {
                     </div>
                     <button
                       type="button"
-                      className="bd-button primary small loadout-build-apply"
+                      className={`bd-button small loadout-build-apply${tri === 'all' ? ' is-active' : ''}`}
                       data-action="apply-pack"
                       data-pack-id={pack.id}
+                      data-pack-state={tri}
+                      aria-pressed={tri === 'mixed' ? 'mixed' : tri === 'all'}
                       disabled={props.disabled || writableSelected.length === 0}
-                      onClick={() => applyPackToSelected(pack.id)}
+                      onClick={() => (tri === 'all' ? removePackFromSelected(pack.id) : applyPackToSelected(pack.id))}
                     >
-                      {tr('sessions.create.loadoutApplyBuild', { count: writableSelected.length })}
+                      {buttonLabel}
                     </button>
                     {appliedCount > 0 && (
                       <span className="loadout-build-applied" data-pack-applied={appliedCount}>
@@ -550,57 +671,67 @@ export function SessionLoadoutTeamBuilder(props: {
                 <small className="muted">{tr('skills.packsEmpty')}</small>
               )}
             </div>
+
+            {/* ── Custom fine-tune (Perks — skills only, no packs) ──
+                NOT a tabpanel: it's a sub-section of the builds panel,
+                toggled by the "自定义微调" button. Giving it role="tabpanel"
+                created an invalid one-tab-two-panels ARIA structure. */}
+            {showCustom && writableSelected.length > 0 && (
+              <div className="loadout-custom" data-loadout-custom data-tab="builds" data-tab-active={mobileTab === 'builds'}>
+                <div className="loadout-custom-head">
+                  <strong>{tr('sessions.create.loadoutCustomFine')}</strong>
+                  <small>{tr('sessions.create.loadoutCustomHint', { count: writableSelected.length })}</small>
+                </div>
+                {writableSelected.length > 1 && (
+                  <p className="hint-warn loadout-custom-multi">
+                    {tr('sessions.create.loadoutMultiWarning')}
+                  </p>
+                )}
+                <div className="loadout-perk-list" data-loadout-perk-list>
+                  {catalog.skills.map(skill => {
+                    const state = skillTriState(skill.name);
+                    const enabled = state === 'all';
+                    return (
+                      <div
+                        key={skill.name}
+                        className="loadout-perk-drag"
+                        draggable={!props.disabled}
+                        onDragStart={e => startDrag(e, { kind: 'skill', id: skill.name })}
+                        onDragEnd={clearDrag}
+                      >
+                        <button
+                          type="button"
+                          className={`loadout-perk${enabled ? ' is-on' : ''}${state === 'mixed' ? ' is-mixed' : ''}`}
+                          data-loadout-perk={skill.name}
+                          data-perk-state={state}
+                          aria-pressed={state === 'mixed' ? 'mixed' : enabled}
+                          disabled={props.disabled}
+                          onClick={() => setSkillForSelected(skill.name, !enabled)}
+                        >
+                          <span className="loadout-perk-check" aria-hidden="true">
+                            {state === 'all' ? '✓' : state === 'mixed' ? '−' : ''}
+                          </span>
+                          <span className="loadout-perk-name">
+                            <strong>{skill.name}</strong>
+                            {skill.description && <small>{skill.description}</small>}
+                          </span>
+                          <span className="loadout-perk-state">
+                            {state === 'all' ? tr('sessions.create.loadoutPerkAll') : state === 'mixed' ? tr('sessions.create.loadoutPerkMixed') : tr('sessions.create.loadoutPerkNone')}
+                          </span>
+                        </button>
+                      </div>
+                    );
+                  })}
+                  {catalog.skills.length === 0 && (
+                    <small className="muted">{tr('skills.emptyTitle')}</small>
+                  )}
+                </div>
+              </div>
+            )}
           </section>
 
-          {/* ── Layer 3: Custom fine-tune (Perks — skills only, no packs) ── */}
-          {showCustom && writableSelected.length > 0 && (
-            <section className="loadout-custom" data-tab="builds" data-tab-active={mobileTab === 'builds'} role="tabpanel" aria-label={tr('sessions.create.loadoutCustomFine')}>
-              <div className="loadout-custom-head">
-                <strong>{tr('sessions.create.loadoutCustomFine')}</strong>
-                <small>{tr('sessions.create.loadoutCustomHint', { count: writableSelected.length })}</small>
-              </div>
-              {writableSelected.length > 1 && (
-                <p className="hint-warn loadout-custom-multi">
-                  {tr('sessions.create.loadoutMultiWarning')}
-                </p>
-              )}
-              <div className="loadout-perk-list" data-loadout-perk-list>
-                {catalog.skills.map(skill => {
-                  const state = skillTriState(skill.name);
-                  const enabled = state === 'all';
-                  return (
-                    <button
-                      key={skill.name}
-                      type="button"
-                      className={`loadout-perk${enabled ? ' is-on' : ''}${state === 'mixed' ? ' is-mixed' : ''}`}
-                      data-loadout-perk={skill.name}
-                      data-perk-state={state}
-                      aria-pressed={state === 'mixed' ? 'mixed' : enabled}
-                      disabled={props.disabled}
-                      onClick={() => setSkillForSelected(skill.name, !enabled)}
-                    >
-                      <span className="loadout-perk-check" aria-hidden="true">
-                        {state === 'all' ? '✓' : state === 'mixed' ? '−' : ''}
-                      </span>
-                      <span className="loadout-perk-name">
-                        <strong>{skill.name}</strong>
-                        {skill.description && <small>{skill.description}</small>}
-                      </span>
-                      <span className="loadout-perk-state">
-                        {state === 'all' ? tr('sessions.create.loadoutPerkAll') : state === 'mixed' ? tr('sessions.create.loadoutPerkMixed') : tr('sessions.create.loadoutPerkNone')}
-                      </span>
-                    </button>
-                  );
-                })}
-                {catalog.skills.length === 0 && (
-                  <small className="muted">{tr('skills.emptyTitle')}</small>
-                )}
-              </div>
-            </section>
-          )}
-
           {/* ── Diff preview ── */}
-          <section className="loadout-preview" data-tab="preview" data-tab-active={mobileTab === 'preview'} role="tabpanel" id="loadout-panel-preview" aria-labelledby="loadout-tab-preview" aria-label={tr('sessions.create.loadoutPreview')}>
+          <section className="loadout-preview" data-tab="preview" data-tab-active={mobileTab === 'preview'} id="loadout-panel-preview" aria-label={tr('sessions.create.loadoutPreview')}>
             <div className="loadout-preview-head">
               <strong>{tr('sessions.create.loadoutPreview')}</strong>
               <small>{tr('sessions.create.loadoutPreviewHint')}</small>
@@ -666,4 +797,44 @@ export function SessionLoadoutTeamBuilder(props: {
       )}
     </div>
   );
+}
+
+// ── Mutation helpers (operate on a draft object, no React state) ──
+// These exist so batch loops can accumulate changes into a single `next`
+// object before calling onChange once, instead of firing onChange per bot.
+
+function addPackToBotMut(
+  next: LoadoutDrafts,
+  larkAppId: string,
+  packId: string,
+  catalog: LoadoutCatalog | null,
+  botPolicyOf: (id: string) => { include?: readonly string[] } | undefined,
+) {
+  if (!catalog) return;
+  const base = next[larkAppId] ?? botPolicyOf(larkAppId);
+  const { skills, packs } = selectionFromPolicy(base);
+  if (packs.has(packId)) return;
+  const nextPacks = new Set(packs);
+  nextPacks.add(packId);
+  const policy = policyFromSelection(skills, nextPacks);
+  if (isLoadoutCustomised(policy, botPolicyOf(larkAppId))) next[larkAppId] = policy;
+  else delete next[larkAppId];
+}
+
+function removePackFromBotMut(
+  next: LoadoutDrafts,
+  larkAppId: string,
+  packId: string,
+  catalog: LoadoutCatalog | null,
+  botPolicyOf: (id: string) => { include?: readonly string[] } | undefined,
+) {
+  if (!catalog) return;
+  const base = next[larkAppId] ?? botPolicyOf(larkAppId);
+  const { skills, packs } = selectionFromPolicy(base);
+  if (!packs.has(packId)) return;
+  const nextPacks = new Set(packs);
+  nextPacks.delete(packId);
+  const policy = policyFromSelection(skills, nextPacks);
+  if (isLoadoutCustomised(policy, botPolicyOf(larkAppId))) next[larkAppId] = policy;
+  else delete next[larkAppId];
 }
