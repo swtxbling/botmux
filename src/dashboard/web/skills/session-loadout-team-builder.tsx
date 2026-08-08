@@ -446,6 +446,31 @@ export function SessionLoadoutTeamBuilder(props: {
                             ? tr('sessions.create.loadoutDefaultEmpty')
                             : tr('sessions.create.loadoutDefaultLabel')}
                       </small>
+                      {/* Default loadout breakdown: packs + direct skills, so each
+                          Bot's original equipment is visible at a glance. Only
+                          shown when the default is readable (status.ok). */}
+                      {status.ok && (defaultSel.packs.size > 0 || defaultSel.skills.size > 0) && (
+                        <span className="loadout-bot-default" data-loadout-default-breakdown>
+                          {defaultSel.packs.size > 0 && (
+                            <span
+                              className="loadout-bot-default-badge"
+                              data-default-packs={defaultSel.packs.size}
+                              title={tr('sessions.create.loadoutDefaultPacks', { count: defaultSel.packs.size })}
+                            >
+                              <b aria-hidden="true">P</b>{defaultSel.packs.size}
+                            </span>
+                          )}
+                          {defaultSel.skills.size > 0 && (
+                            <span
+                              className="loadout-bot-default-badge"
+                              data-default-skills={defaultSel.skills.size}
+                              title={tr('sessions.create.loadoutDefaultDirect', { count: defaultSel.skills.size })}
+                            >
+                              <b aria-hidden="true">S</b>{defaultSel.skills.size}
+                            </span>
+                          )}
+                        </span>
+                      )}
                       <span className="loadout-bot-count" data-loadout-final-count={finalCount}>
                         {tr('sessions.create.loadoutFinalCount', { count: finalCount })}
                       </span>

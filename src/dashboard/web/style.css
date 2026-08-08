@@ -28260,6 +28260,18 @@ button.skills-issue-badge:hover {
   padding-left: 28px;
 }
 .loadout-bot-count { font-size: 11px; color: var(--muted); white-space: nowrap; flex-shrink: 0; }
+.loadout-bot-default {
+  display: inline-flex; align-items: center; gap: 3px; flex-shrink: 0;
+}
+.loadout-bot-default-badge {
+  display: inline-flex; align-items: baseline; gap: 1px;
+  font-size: 10px; padding: 1px 5px; border-radius: var(--radius-full);
+  background: var(--surface-2); color: var(--muted); white-space: nowrap;
+  line-height: 1.4;
+}
+.loadout-bot-default-badge b { font-size: 9px; opacity: 0.7; }
+.loadout-bot-default-badge[data-default-packs] { color: var(--accent); }
+.loadout-bot-card.is-unavailable .loadout-bot-default { display: none; }
 
 .loadout-build-grid {
   display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px;
