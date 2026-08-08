@@ -27596,7 +27596,7 @@ button.skills-issue-badge:hover {
   padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius);
   background: var(--surface); cursor: pointer; text-align: left; font-family: inherit;
   transition: border-color .15s, background .15s;
-  min-width: 0;
+  min-width: 0; width: 100%;
 }
 .loadout-bot-card:hover:not(:disabled) { border-color: var(--accent); }
 .loadout-bot-card.is-selected { border-color: var(--accent); background: var(--accent-soft); }
