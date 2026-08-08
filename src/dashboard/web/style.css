@@ -27631,13 +27631,13 @@ button.skills-issue-badge:hover {
   font-size: 10.5px; color: var(--muted); white-space: nowrap;
 }
 .loadout-bot-default[data-loadout-default-unavailable] .loadout-bot-default-text {
-  color: var(--warn);
+  color: var(--warning);
 }
 /* Outer drop-zone wrapper around each bot card. The inner button stays
    real-disabled for unavailable bots; the wrapper handles DnD events. */
 .loadout-bot-slot { position: relative; border-radius: var(--radius); }
 .loadout-bot-slot.is-drop-target { outline: 2px dashed var(--accent); outline-offset: 2px; }
-.loadout-bot-slot.is-drop-rejected { outline: 2px dashed var(--warn); outline-offset: 2px; }
+.loadout-bot-slot.is-drop-rejected { outline: 2px dashed var(--warning); outline-offset: 2px; }
 .loadout-bot-slot[data-drop-disabled='true'] { cursor: not-allowed; }
 .loadout-bot-current {
   font-size: 10.5px; color: var(--accent); white-space: nowrap; flex-shrink: 0;

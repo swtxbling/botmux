@@ -306,17 +306,18 @@ describe('SessionLoadoutTeamBuilder', () => {
     expect(bot2.findByProps({ 'data-loadout-state': 'empty' })).toBeTruthy();
   });
 
-  it('renders unavailable summary when bot is unavailable', async () => {
+  it('renders unavailable state label (not empty, not default summary) when bot is unavailable', async () => {
     mockApis({ bots: [
       { larkAppId: 'bot-1', botName: 'Bot 1', skills: { include: ['pack:ops', 'skill:a'] }, error: 'daemon_down', skillInjectionSupport: 'dynamic', skillInjection: 'prompt' },
     ] });
     const renderer = render({ targets: [bots[0]], drafts: {}, onChange: vi.fn() });
     await flush();
     const bot1 = renderer.root.findByProps({ 'data-loadout-bot': 'bot-1' });
-    const summary = bot1.findByProps({ className: 'loadout-bot-default' });
-    expect(summary.props['data-loadout-default-unavailable']).toBe(true);
-    expect(summary.props['data-loadout-default-summary']).toBeFalsy();
+    // State label must be 'unavailable', NOT 'empty'
     expect(bot1.findByProps({ 'data-loadout-state': 'unavailable' })).toBeTruthy();
+    expect(() => bot1.findByProps({ 'data-loadout-state': 'empty' })).toThrow();
+    // No default summary rendered for unavailable bot
+    expect(() => bot1.findByProps({ 'data-loadout-default-summary': true })).toThrow();
   });
 
   // ── Single-card drop (point-to-point, superposition) ──
@@ -523,5 +524,203 @@ describe('SessionLoadoutTeamBuilder', () => {
     expect(buildsPanel.props.role).toBeUndefined();
     const previewPanel = renderer.root.findByProps({ id: 'loadout-panel-preview' });
     expect(previewPanel.props.role).toBeUndefined();
+  });
+
+  // ── Single Skill drop: actual add, preserves others, other bots unchanged ──
+  it('drops a new skill on a bot: adds it, preserves existing skill, other bots unchanged', async () => {
+    const { renderer, onChange } = await openAndLoad();
+    const slot1 = botSlot(renderer, 'bot-1');
+    const skillCard = renderer.root.findByProps({ 'data-loadout-skill': 'c' });
+    await act(async () => { await skillCard.props.onDragStart({ dataTransfer: { effectAllowed: '', setData: vi.fn() }, preventDefault: vi.fn() } as any); });
+    await flush();
+    await act(async () => { await slot1.props.onDrop({ preventDefault: vi.fn(), dataTransfer: {} } as any, 'bot-1', true); });
+    expect(onChange).toHaveBeenCalledTimes(1);
+    const drafts = onChange.mock.calls[0][0];
+    expect(drafts['bot-1']).toEqual({ include: ['skill:a', 'skill:c'] });
+    expect(drafts['bot-2']).toBeUndefined();
+  });
+
+  it('drops a skill already effective: no-op, no onChange', async () => {
+    const { renderer, onChange } = await openAndLoad();
+    const slot1 = botSlot(renderer, 'bot-1');
+    const skillCard = renderer.root.findByProps({ 'data-loadout-skill': 'a' });
+    await act(async () => { await skillCard.props.onDragStart({ dataTransfer: { effectAllowed: '', setData: vi.fn() }, preventDefault: vi.fn() } as any); });
+    await flush();
+    await act(async () => { await slot1.props.onDrop({ preventDefault: vi.fn(), dataTransfer: {} } as any, 'bot-1', true); });
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  // ── Single Pack drop: preserves non-empty base, idempotent on repeat ──
+  it('drops a pack on a bot with existing skills: preserves them, adds pack', async () => {
+    const { renderer, onChange } = await openAndLoad();
+    const slot1 = botSlot(renderer, 'bot-1');
+    const packCard = renderer.root.findByProps({ 'data-loadout-pack': 'ops' });
+    await act(async () => { await packCard.props.onDragStart({ dataTransfer: { effectAllowed: '', setData: vi.fn() }, preventDefault: vi.fn() } as any); });
+    await flush();
+    await act(async () => { await slot1.props.onDrop({ preventDefault: vi.fn(), dataTransfer: {} } as any, 'bot-1', true); });
+    expect(onChange).toHaveBeenCalledTimes(1);
+    const drafts = onChange.mock.calls[0][0];
+    expect(drafts['bot-1']).toEqual({ include: ['skill:a', 'pack:ops'] });
+  });
+
+  it('drops the same pack twice: second drop is idempotent no-op', async () => {
+    const { renderer, onChange } = await openAndLoad();
+    const slot1 = botSlot(renderer, 'bot-1');
+    const packCard = renderer.root.findByProps({ 'data-loadout-pack': 'ops' });
+    await act(async () => { await packCard.props.onDragStart({ dataTransfer: { effectAllowed: '', setData: vi.fn() }, preventDefault: vi.fn() } as any); });
+    await flush();
+    await act(async () => { await slot1.props.onDrop({ preventDefault: vi.fn(), dataTransfer: {} } as any, 'bot-1', true); });
+    expect(onChange).toHaveBeenCalledTimes(1);
+    // Simulate parent re-render with new drafts (as would happen in real usage)
+    const firstDrafts = onChange.mock.calls[0][0];
+    await act(async () => {
+      renderer.update(React.createElement(SessionLoadoutTeamBuilder, { targets: bots, drafts: firstDrafts, onChange }));
+    });
+    await flush();
+    // Second drop of same pack → no-op (pack already present in updated drafts)
+    const slot1After = botSlot(renderer, 'bot-1');
+    const packCardAfter = renderer.root.findByProps({ 'data-loadout-pack': 'ops' });
+    await act(async () => { await packCardAfter.props.onDragStart({ dataTransfer: { effectAllowed: '', setData: vi.fn() }, preventDefault: vi.fn() } as any); });
+    await flush();
+    await act(async () => { await slot1After.props.onDrop({ preventDefault: vi.fn(), dataTransfer: {} } as any, 'bot-1', true); });
+    expect(onChange).toHaveBeenCalledTimes(1);
+  });
+
+  // ── Pack tri-state: none → all, all → uninstall ──
+  it('pack button: none → click → all (equip to selected bots)', async () => {
+    const { renderer, onChange } = await openAndLoad();
+    await selectBot(renderer, 'bot-1');
+    await selectBot(renderer, 'bot-2');
+    const btn = renderer.root.findByProps({ 'data-action': 'apply-pack', 'data-pack-id': 'ops' });
+    expect(btn.props['data-pack-state']).toBe('none');
+    await act(async () => { await btn.props.onClick(); });
+    expect(onChange).toHaveBeenCalledTimes(1);
+    const drafts = onChange.mock.calls[0][0];
+    expect(drafts['bot-1']).toEqual({ include: ['skill:a', 'pack:ops'] });
+    expect(drafts['bot-2']).toEqual({ include: ['pack:ops'] });
+  });
+
+  it('pack button: all → click → uninstall (removes pack, restores default)', async () => {
+    const { renderer, onChange } = await openAndLoad({ drafts: { 'bot-1': { include: ['skill:a', 'pack:ops'] }, 'bot-2': { include: ['pack:ops'] } } });
+    await selectBot(renderer, 'bot-1');
+    await selectBot(renderer, 'bot-2');
+    const btn = renderer.root.findByProps({ 'data-action': 'apply-pack', 'data-pack-id': 'ops' });
+    expect(btn.props['data-pack-state']).toBe('all');
+    await act(async () => { await btn.props.onClick(); });
+    expect(onChange).toHaveBeenCalledTimes(1);
+    const drafts = onChange.mock.calls[0][0];
+    // bot-1: removed pack:ops → back to default [skill:a] → equivalent to default → key deleted
+    expect(drafts['bot-1']).toBeUndefined();
+    // bot-2: removed pack:ops → back to default [] → equivalent to default → key deleted
+    expect(drafts['bot-2']).toBeUndefined();
+  });
+
+  it('pack button: partial change still fires onChange once', async () => {
+    // bot-1 already has pack:ops, bot-2 does not → only bot-2 changes, but onChange fires once
+    const { renderer, onChange } = await openAndLoad({ drafts: { 'bot-1': { include: ['skill:a', 'pack:ops'] } } });
+    await selectBot(renderer, 'bot-1');
+    await selectBot(renderer, 'bot-2');
+    const btn = renderer.root.findByProps({ 'data-action': 'apply-pack', 'data-pack-id': 'ops' });
+    expect(btn.props['data-pack-state']).toBe('mixed');
+    await act(async () => { await btn.props.onClick(); });
+    expect(onChange).toHaveBeenCalledTimes(1);
+    const drafts = onChange.mock.calls[0][0];
+    expect(drafts['bot-1']).toEqual({ include: ['skill:a', 'pack:ops'] }); // unchanged
+    expect(drafts['bot-2']).toEqual({ include: ['pack:ops'] }); // newly added
+  });
+
+  // ── data-drop-rejected + dragLeave cleanup ──
+  it('non-editable bot: dragOver sets data-drop-rejected, dragLeave clears it', async () => {
+    mockApis({ bots: [
+      { larkAppId: 'bot-1', botName: 'Bot 1', skills: { include: ['skill:a'] }, skillInjectionSupport: 'dynamic', skillInjection: 'prompt' },
+      { larkAppId: 'bot-2', botName: 'Bot 2', error: 'daemon_down', skillInjectionSupport: 'dynamic', skillInjection: 'prompt' },
+    ] });
+    const renderer = render({ targets: bots, drafts: {}, onChange: vi.fn() });
+    await flush();
+    const packCard = renderer.root.findByProps({ 'data-loadout-pack': 'ops' });
+    await act(async () => { await packCard.props.onDragStart({ dataTransfer: { effectAllowed: '', setData: vi.fn() }, preventDefault: vi.fn() } as any); });
+    await flush();
+    const slot2 = botSlot(renderer, 'bot-2');
+    expect(slot2.props['data-drop-rejected']).toBeFalsy();
+    const dragOverEvent = { preventDefault: vi.fn(), dataTransfer: { dropEffect: '' } } as any;
+    await act(async () => { await slot2.props.onDragOver(dragOverEvent, 'bot-2', false); });
+    await flush();
+    const slot2After = botSlot(renderer, 'bot-2');
+    expect(slot2After.props['data-drop-rejected']).toBe('true');
+    // dragLeave clears reject state
+    await act(async () => { await slot2After.props.onDragLeave(); });
+    await flush();
+    const slot2Final = botSlot(renderer, 'bot-2');
+    expect(slot2Final.props['data-drop-rejected']).toBeFalsy();
+  });
+
+  // ── Continuous retry: two consecutive retries both fetch ──
+  it('retry after failure fetches again; second retry also fetches (catalogRef guard)', async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      const u = String(url);
+      if (u.startsWith('/api/')) return jsonRes(500, { error: 'boom' });
+      if (u.startsWith('/api/skill-packs')) return jsonRes(200, { packs: [{ id: 'ops', name: 'Ops', include: ['skill:a', 'skill:b'] }] });
+      if (u.startsWith('/api/skills')) return jsonRes(200, { skills: [{ name: 'a' }, { name: 'b' }] });
+      if (u.startsWith('/api/bots')) return jsonRes(200, { bots: [{ larkAppId: 'bot-1', botName: 'Bot 1', skills: { include: ['skill:a'] }, skillInjectionSupport: 'dynamic', skillInjection: 'prompt' }] });
+      return jsonRes(404, {});
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const renderer = render();
+    await flush();
+    const callsAfterFirstLoad = fetchMock.mock.calls.length;
+    expect(callsAfterFirstLoad).toBe(3);
+    // First retry
+    let retryBtn = renderer.root.findByProps({ 'data-action': 'retry-loadout-catalog' });
+    await act(async () => { await retryBtn.props.onClick(); });
+    await flush();
+    expect(fetchMock.mock.calls.length).toBe(callsAfterFirstLoad + 3);
+    // Second retry — must re-fetch (catalogRef guard must not block force retry)
+    retryBtn = renderer.root.findByProps({ 'data-action': 'retry-loadout-catalog' });
+    await act(async () => { await retryBtn.props.onClick(); });
+    await flush();
+    expect(fetchMock.mock.calls.length).toBe(callsAfterFirstLoad + 6);
+  });
+
+  // ── Zero-selection: skill catalog draggable, button disabled, unselected ──
+  it('zero-selection: skill catalog item is draggable, batch button disabled, state=unselected', async () => {
+    const { renderer } = await openAndLoad();
+    const skillCard = renderer.root.findByProps({ 'data-loadout-skill': 'a' });
+    expect(skillCard.props.draggable).toBe(true);
+    const applyBtn = skillCard.findByProps({ 'data-action': 'apply-skill' });
+    expect(applyBtn.props.disabled).toBe(true);
+    expect(skillCard.props['data-skill-state']).toBe('unselected');
+    expect(renderer.root.findByProps({ 'data-skill-catalog-empty': true })).toBeTruthy();
+  });
+
+  it('zero-selection: clicking disabled skill button does not fire onChange', async () => {
+    const { renderer, onChange } = await openAndLoad();
+    const skillCard = renderer.root.findByProps({ 'data-loadout-skill': 'a' });
+    const applyBtn = skillCard.findByProps({ 'data-action': 'apply-skill' });
+    expect(applyBtn.props.disabled).toBe(true);
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  // ── default ≠ current: exact assertions ──
+  it('customised bot: default summary uses defaultCount, current final count differs', async () => {
+    const { renderer } = await openAndLoad({ drafts: { 'bot-1': { include: ['skill:a', 'skill:c'] } } });
+    const bot1 = renderer.root.findByProps({ 'data-loadout-bot': 'bot-1' });
+    const defaultSummary = bot1.findByProps({ className: 'loadout-bot-default' });
+    const defaultText = defaultSummary.findByProps({ className: 'loadout-bot-default-text' }).children.join('');
+    // Default: 0 packs · 1 skill · 1 final (defaultCount=1)
+    expect(defaultText).toBe('默认 0 包 · 1 Skill · 最终 1');
+    // Current: 2 skills (finalCount=2)
+    const currentFinal = bot1.findByProps({ 'data-loadout-final-count': 2 });
+    expect(currentFinal).toBeTruthy();
+    expect(currentFinal.children.join('')).toBe('本次 2 个 Skill');
+  });
+
+  it('non-customised bot: default final count equals current final count', async () => {
+    const { renderer } = await openAndLoad();
+    const bot1 = renderer.root.findByProps({ 'data-loadout-bot': 'bot-1' });
+    const defaultSummary = bot1.findByProps({ className: 'loadout-bot-default' });
+    const defaultText = defaultSummary.findByProps({ className: 'loadout-bot-default-text' }).children.join('');
+    expect(defaultText).toBe('默认 0 包 · 1 Skill · 最终 1');
+    const currentFinal = bot1.findByProps({ 'data-loadout-final-count': 1 });
+    expect(currentFinal).toBeTruthy();
   });
 });
