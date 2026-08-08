@@ -513,6 +513,7 @@ export function SessionLoadoutTeamBuilder(props: {
                     className={`loadout-bot-slot${isReject ? ' is-drop-rejected' : ''}${dragItem && editable ? ' is-drop-target' : ''}`}
                     data-loadout-bot-slot={target.larkAppId}
                     data-drop-disabled={!editable ? 'true' : undefined}
+                    data-drop-rejected={isReject ? 'true' : undefined}
                     onDragOver={e => onBotDragOver(e, target.larkAppId, editable)}
                     onDragLeave={() => onBotDragLeave(target.larkAppId)}
                     onDrop={e => onBotDrop(e, target.larkAppId, editable)}
@@ -546,13 +547,6 @@ export function SessionLoadoutTeamBuilder(props: {
                                 skills: defaultSel.skills.size,
                                 final: defaultCount,
                               })}
-                            </span>
-                          </span>
-                        )}
-                        {!status.ok && (
-                          <span className="loadout-bot-default" data-loadout-default-unavailable>
-                            <span className="loadout-bot-default-text">
-                              {tr('sessions.create.loadoutDefaultUnavailable')}
                             </span>
                           </span>
                         )}

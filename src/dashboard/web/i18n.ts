@@ -3424,7 +3424,7 @@ const en: Record<keyof typeof zh, string> = {
   'sessions.create.loadoutCurrentFinal': 'This session: {count} skills',
   'sessions.create.loadoutDefaultPacks': '{count} default packs',
   'sessions.create.loadoutDefaultDirect': '{count} default direct Skills',
-  'sessions.create.loadoutDefaultSummary': '{packs} packs · {skills} skills · {final} final',
+  'sessions.create.loadoutDefaultSummary': 'Default: {packs} packs · {skills} skills · {final} final',
   'sessions.create.loadoutPackEquip': 'Equip',
   'sessions.create.loadoutPackEquipAll': 'Equip all',
   'sessions.create.loadoutPackUnequip': 'Remove',

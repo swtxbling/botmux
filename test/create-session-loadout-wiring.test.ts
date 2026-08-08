@@ -166,6 +166,26 @@ describe('create-session dialog ↔ skillLoadouts wiring', () => {
     expect(bodies[0].skillLoadouts).toEqual({ 'bot-1': { include: ['skill:a', 'skill:b'] } });
   });
 
+  it('sends explicit empty include for a cleared bot, omits unchanged bots', async () => {
+    const { bodies } = mockApis();
+    const renderer = renderDialog();
+    await checkBot(renderer, 'bot-1', true);
+    await setContent(renderer, 'go');
+    await selectLineupBot(renderer, 'bot-1');
+
+    // bot-1 default = [skill:a]; remove skill:a → explicit empty { include: [] }
+    await openCustomDrawer(renderer);
+    await act(async () => { renderer.root.findByProps({ 'data-loadout-perk': 'a' }).props.onClick(); });
+    await commitWorkshop(renderer);
+    await submit(renderer);
+
+    expect(bodies).toHaveLength(1);
+    // bot-1's explicit empty override must be in the request body
+    expect(bodies[0].skillLoadouts).toEqual({ 'bot-1': { include: [] } });
+    // bot-2 was never touched → must not appear in skillLoadouts
+    expect('bot-2' in bodies[0].skillLoadouts).toBe(false);
+  });
+
   it('drops the loadout of a bot the user unchecked before submitting', async () => {
     const { bodies } = mockApis();
     const renderer = renderDialog();
