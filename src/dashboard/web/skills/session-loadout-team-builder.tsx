@@ -586,7 +586,7 @@ export function SessionLoadoutTeamBuilder(props: {
             </div>
 
             {writableSelected.length === 0 && (
-              <p className="loadout-empty-hint">{tr('sessions.create.loadoutSelectBotsFirst')}</p>
+              <p className="loadout-empty-hint" id="loadout-select-bots-hint">{tr('sessions.create.loadoutSelectBotsFirst')}</p>
             )}
 
             <div className="loadout-build-grid">
@@ -649,17 +649,17 @@ export function SessionLoadoutTeamBuilder(props: {
                 Individual Skills are draggable from here onto any editable Bot
                 card — no pre-selection required, matching the "逐项从左拖到每个
                 Bot" contract. The batch button inside each card is disabled until
-                at least one bot is selected; at zero-selection it shows
-                "unselected" state (not "none") and the "先选 Bot" hint. The
-                custom drawer below still offers full tri-state fine-tuning. */}
+                at least one bot is selected; at zero-selection the card carries
+                the "unselected" state (not "none") and the button points at the
+                single "先选 Bot" hint above via aria-describedby — the hint text
+                itself is rendered exactly once for the whole panel, never
+                repeated per card. The custom drawer below still offers full
+                tri-state fine-tuning. */}
             <div className="loadout-skill-catalog" data-loadout-skill-catalog>
               <div className="loadout-skill-catalog-head">
                 <strong>{tr('sessions.create.loadoutSkillCatalog')}</strong>
                 <small>{tr('sessions.create.loadoutSkillCatalogHint')}</small>
               </div>
-              {writableSelected.length === 0 && (
-                <p className="loadout-empty-hint" data-skill-catalog-empty>{tr('sessions.create.loadoutSelectBotsFirst')}</p>
-              )}
               <div className="loadout-skill-catalog-list">
                 {catalog.skills.map(skill => {
                   const noSelection = writableSelected.length === 0;
@@ -684,18 +684,21 @@ export function SessionLoadoutTeamBuilder(props: {
                         className={`bd-button small loadout-skill-apply${enabled ? ' is-active' : ''}`}
                         data-action="apply-skill"
                         data-skill-name={skill.name}
-                        data-perk-state={state}
                         aria-pressed={noSelection ? undefined : state === 'mixed' ? 'mixed' : enabled}
+                        aria-describedby={noSelection ? 'loadout-select-bots-hint' : undefined}
                         disabled={props.disabled || noSelection}
                         onClick={() => setSkillForSelected(skill.name, !enabled)}
                       >
-                        {noSelection
-                          ? tr('sessions.create.loadoutSelectBotsFirst')
-                          : enabled
-                            ? tr('sessions.create.loadoutPerkAll')
-                            : state === 'mixed'
-                              ? tr('sessions.create.loadoutPerkMixed')
-                              : tr('sessions.create.loadoutPerkNone')}
+                        {/* Label is the ACTION the click performs, never a state
+                            word and never the hint sentence. At state 'all' the
+                            click removes the skill, so the label must read
+                            "卸下" — same vocabulary as the Pack card, so the two
+                            controls stay mentally identical. */}
+                        {enabled
+                          ? tr('sessions.create.loadoutPackUnequip')
+                          : state === 'mixed'
+                            ? tr('sessions.create.loadoutPackEquipAll')
+                            : tr('sessions.create.loadoutPackEquip')}
                       </button>
                     </div>
                   );

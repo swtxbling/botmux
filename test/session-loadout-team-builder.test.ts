@@ -654,6 +654,36 @@ describe('SessionLoadoutTeamBuilder', () => {
     expect(slot2Final.props['data-drop-rejected']).toBeFalsy();
   });
 
+  // ── data-drop-rejected + dragEnd cleanup ──
+  // Separate from the dragLeave case on purpose: dragEnd fires on the DRAG
+  // SOURCE, not the slot. Without this, dropping the source outside any card
+  // (or pressing Esc) would leave the reject outline stuck on screen forever
+  // and every existing test would still pass.
+  it('non-editable bot: dragEnd on the drag source clears data-drop-rejected', async () => {
+    mockApis({ bots: [
+      { larkAppId: 'bot-1', botName: 'Bot 1', skills: { include: ['skill:a'] }, skillInjectionSupport: 'dynamic', skillInjection: 'prompt' },
+      { larkAppId: 'bot-2', botName: 'Bot 2', error: 'daemon_down', skillInjectionSupport: 'dynamic', skillInjection: 'prompt' },
+    ] });
+    const renderer = render({ targets: bots, drafts: {}, onChange: vi.fn() });
+    await flush();
+    const packCard = renderer.root.findByProps({ 'data-loadout-pack': 'ops' });
+    await act(async () => { await packCard.props.onDragStart({ dataTransfer: { effectAllowed: '', setData: vi.fn() }, preventDefault: vi.fn() } as any); });
+    await flush();
+
+    await act(async () => {
+      await botSlot(renderer, 'bot-2').props.onDragOver(
+        { preventDefault: vi.fn(), dataTransfer: { dropEffect: '' } } as any, 'bot-2', false,
+      );
+    });
+    await flush();
+    expect(botSlot(renderer, 'bot-2').props['data-drop-rejected']).toBe('true');
+
+    // Abort the drag at the source — reject state must not survive it.
+    await act(async () => { await renderer.root.findByProps({ 'data-loadout-pack': 'ops' }).props.onDragEnd(); });
+    await flush();
+    expect(botSlot(renderer, 'bot-2').props['data-drop-rejected']).toBeFalsy();
+  });
+
   // ── Continuous retry: two consecutive retries both fetch ──
   it('retry after failure fetches again; second retry also fetches (catalogRef guard)', async () => {
     const fetchMock = vi.fn(async (url: string) => {
@@ -682,14 +712,54 @@ describe('SessionLoadoutTeamBuilder', () => {
   });
 
   // ── Zero-selection: skill catalog draggable, button disabled, unselected ──
-  it('zero-selection: skill catalog item is draggable, batch button disabled, state=unselected', async () => {
+  it('zero-selection: skill catalog item is draggable, batch button disabled+action word+aria-describedby, state=unselected', async () => {
     const { renderer } = await openAndLoad();
+    // Only ONE hint on the page (builds layer), no duplicate in skill catalog
+    const hints = renderer.root.findAllByProps({ id: 'loadout-select-bots-hint' });
+    expect(hints).toHaveLength(1);
+    expect(() => renderer.root.findByProps({ 'data-skill-catalog-empty': true })).toThrow();
+
     const skillCard = renderer.root.findByProps({ 'data-loadout-skill': 'a' });
     expect(skillCard.props.draggable).toBe(true);
+    expect(skillCard.props['data-skill-state']).toBe('unselected');
+    // No data-perk-state on catalog item (single state hook)
+    expect(skillCard.props['data-perk-state']).toBeUndefined();
+
     const applyBtn = skillCard.findByProps({ 'data-action': 'apply-skill' });
     expect(applyBtn.props.disabled).toBe(true);
-    expect(skillCard.props['data-skill-state']).toBe('unselected');
-    expect(renderer.root.findByProps({ 'data-skill-catalog-empty': true })).toBeTruthy();
+    // Button shows action word, not the hint sentence
+    expect(applyBtn.props.children).toBe('装备');
+    // aria-describedby points to the single hint
+    expect(applyBtn.props['aria-describedby']).toBe('loadout-select-bots-hint');
+  });
+
+  // The label must always name the action the click performs. A fixed "装备"
+  // would read "equip" while the click on an already-equipped skill removes it.
+  it('selected: skill catalog button label tracks tri-state as an action word', async () => {
+    const { renderer } = await openAndLoad({
+      drafts: {
+        'bot-1': { include: ['skill:a', 'skill:c'] },
+        'bot-2': { include: ['skill:a'] },
+      },
+    });
+    await selectBot(renderer, 'bot-1');
+    await selectBot(renderer, 'bot-2');
+
+    const labelOf = (name: string) => {
+      const card = renderer.root.findByProps({ 'data-loadout-skill': name });
+      return {
+        state: card.props['data-skill-state'],
+        label: card.findByProps({ 'data-action': 'apply-skill' }).props.children,
+        pressed: card.findByProps({ 'data-action': 'apply-skill' }).props['aria-pressed'],
+      };
+    };
+
+    // 'a' on both bots → all → clicking removes it → "卸下"
+    expect(labelOf('a')).toEqual({ state: 'all', label: '卸下', pressed: true });
+    // 'c' on bot-1 only → mixed → clicking equips everyone → "统一装备"
+    expect(labelOf('c')).toEqual({ state: 'mixed', label: '统一装备', pressed: 'mixed' });
+    // 'b' on neither → none → clicking equips → "装备"
+    expect(labelOf('b')).toEqual({ state: 'none', label: '装备', pressed: false });
   });
 
   it('zero-selection: clicking disabled skill button does not fire onChange', async () => {
