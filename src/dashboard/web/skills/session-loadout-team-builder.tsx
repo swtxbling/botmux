@@ -12,7 +12,6 @@ import {
   type LoadoutDrafts,
 } from '../create-session-loadout.js';
 import type { BotRow, SkillRow } from './types.js';
-import type { BotSkillPolicy } from '../../../core/skills/types.js';
 
 interface LoadoutCatalog {
   skills: SkillRow[];
@@ -133,11 +132,6 @@ export function SessionLoadoutTeamBuilder(props: {
     });
   }, [props.targets]);
 
-  const installedNames = useMemo(
-    () => new Set((catalog?.skills ?? []).map(s => s.name)),
-    [catalog],
-  );
-
   const botStatusOf = useCallback((larkAppId: string): { ok: true; row: BotRow } | { ok: false; reason: string } => {
     if (!catalog) return { ok: false, reason: 'catalog_unavailable' };
     const row = catalog.bots.find(b => b.larkAppId === larkAppId);
@@ -179,127 +173,101 @@ export function SessionLoadoutTeamBuilder(props: {
 
   const clearSelection = useCallback(() => setSelectedBots(new Set()), []);
 
-  // ── Superposition helpers ─────────────────────────────────────────
-  /** Add a pack to a single bot's loadout (superposition: keep existing
-   *  skills/packs, union the new pack). No-op if the pack is already present. */
+  // ── Superposition helpers (single-card: wrap the shared Mut) ──────
+  /** Add a pack to a single bot — delegates to addPackToBotMut so the
+   *  single-card drop path and the batch path share one implementation.
+   *  Only fires onChange if the draft actually changed. */
   const addPackToBot = useCallback((larkAppId: string, packId: string) => {
-    if (!catalog) return;
-    const status = botStatusOf(larkAppId);
-    if (!status.ok) return;
-    const base = props.drafts[larkAppId] ?? botPolicyOf(larkAppId);
-    const { skills, packs } = selectionFromPolicy(base);
-    if (packs.has(packId)) return; // idempotent
-    const nextPacks = new Set(packs);
-    nextPacks.add(packId);
-    const policy = policyFromSelection(skills, nextPacks);
     const next = { ...props.drafts };
-    if (isLoadoutCustomised(policy, botPolicyOf(larkAppId))) next[larkAppId] = policy;
-    else delete next[larkAppId];
-    props.onChange(next);
-  }, [catalog, props.drafts, props.onChange, botStatusOf, botPolicyOf]);
+    if (addPackToBotMut(next, larkAppId, packId, catalog, botPolicyOf, botStatusOf)) {
+      props.onChange(next);
+    }
+  }, [props.drafts, props.onChange, catalog, botPolicyOf, botStatusOf]);
 
-  /** Add a single skill to a single bot's loadout (superposition). No-op if
-   *  the skill is already effective (direct or via a pack). */
+  /** Add a single skill to a single bot — delegates to addSkillToBotMut.
+   *  Only fires onChange if the draft actually changed. */
   const addSkillToBot = useCallback((larkAppId: string, skillName: string) => {
-    if (!catalog) return;
-    const status = botStatusOf(larkAppId);
-    if (!status.ok) return;
-    const base = props.drafts[larkAppId] ?? botPolicyOf(larkAppId);
-    const { skills, packs } = selectionFromPolicy(base);
-    const effective = new Set(
-      resolveLoadoutPreview(skills, packs, catalog.packs).map(e => e.name),
-    );
-    if (effective.has(skillName)) return; // already effective → no-op
-    const nextSkills = new Set(skills);
-    nextSkills.add(skillName);
-    const policy = policyFromSelection(nextSkills, packs);
     const next = { ...props.drafts };
-    if (isLoadoutCustomised(policy, botPolicyOf(larkAppId))) next[larkAppId] = policy;
-    else delete next[larkAppId];
-    props.onChange(next);
-  }, [catalog, props.drafts, props.onChange, botStatusOf, botPolicyOf]);
-
-  /** Remove a pack from a single bot, keeping all other skills/packs. */
-  const removePackFromBot = useCallback((larkAppId: string, packId: string) => {
-    if (!catalog) return;
-    const base = props.drafts[larkAppId] ?? botPolicyOf(larkAppId);
-    const { skills, packs } = selectionFromPolicy(base);
-    if (!packs.has(packId)) return;
-    const nextPacks = new Set(packs);
-    nextPacks.delete(packId);
-    const policy = policyFromSelection(skills, nextPacks);
-    const next = { ...props.drafts };
-    if (isLoadoutCustomised(policy, botPolicyOf(larkAppId))) next[larkAppId] = policy;
-    else delete next[larkAppId];
-    props.onChange(next);
-  }, [catalog, props.drafts, props.onChange, botPolicyOf]);
+    if (addSkillToBotMut(next, larkAppId, skillName, catalog, botPolicyOf, botStatusOf)) {
+      props.onChange(next);
+    }
+  }, [props.drafts, props.onChange, catalog, botPolicyOf, botStatusOf]);
 
   // ── Batch operations (operate on the selected set) ────────────────
-  /** Incrementally add a pack to all writable selected bots (superposition). */
+  /** Incrementally add a pack to all writable selected bots (superposition).
+   *  Fires onChange once if ANY bot changed; skips entirely if all no-ops. */
   const applyPackToSelected = useCallback((packId: string) => {
     const next = { ...props.drafts };
-    for (const larkAppId of writableSelected) addPackToBotMut(next, larkAppId, packId, catalog, botPolicyOf);
-    props.onChange(next);
-  }, [writableSelected, props.drafts, props.onChange, catalog, botPolicyOf]);
+    let changed = false;
+    for (const larkAppId of writableSelected) {
+      if (addPackToBotMut(next, larkAppId, packId, catalog, botPolicyOf, botStatusOf)) changed = true;
+    }
+    if (changed) props.onChange(next);
+  }, [writableSelected, props.drafts, props.onChange, catalog, botPolicyOf, botStatusOf]);
 
   /** Remove a pack from all writable selected bots, keeping other skills/packs. */
   const removePackFromSelected = useCallback((packId: string) => {
     const next = { ...props.drafts };
-    for (const larkAppId of writableSelected) removePackFromBotMut(next, larkAppId, packId, catalog, botPolicyOf);
-    props.onChange(next);
-  }, [writableSelected, props.drafts, props.onChange, catalog, botPolicyOf]);
+    let changed = false;
+    for (const larkAppId of writableSelected) {
+      if (removePackFromBotMut(next, larkAppId, packId, catalog, botPolicyOf, botStatusOf)) changed = true;
+    }
+    if (changed) props.onChange(next);
+  }, [writableSelected, props.drafts, props.onChange, catalog, botPolicyOf, botStatusOf]);
 
   /** Restore each writable selected bot to its own default (delete the draft key). */
   const restoreSelectedDefaults = useCallback(() => {
     const next = { ...props.drafts };
-    for (const larkAppId of writableSelected) delete next[larkAppId];
-    props.onChange(next);
+    let changed = false;
+    for (const larkAppId of writableSelected) {
+      if (larkAppId in next) { delete next[larkAppId]; changed = true; }
+    }
+    if (changed) props.onChange(next);
   }, [writableSelected, props.drafts, props.onChange]);
 
-  /** Set a skill to a uniform state across all writable selected bots. */
+  /** Set a skill to a uniform state across all writable selected bots.
+   *  Add branch delegates to addSkillToBotMut (shared with single-card drop);
+   *  remove branch keeps its pack-materialization logic (structurally asymmetric,
+   *  has dedicated test coverage). */
   const setSkillForSelected = useCallback((skillName: string, enabled: boolean) => {
     if (!catalog) return;
     const next = { ...props.drafts };
+    let changed = false;
     for (const larkAppId of writableSelected) {
-      const draft = next[larkAppId];
-      const base = draft ?? botPolicyOf(larkAppId);
+      if (enabled) {
+        if (addSkillToBotMut(next, larkAppId, skillName, catalog, botPolicyOf, botStatusOf)) changed = true;
+        continue;
+      }
+      // Remove branch: materialize if pack-provided, else just drop the direct selector.
+      const base = next[larkAppId] ?? botPolicyOf(larkAppId);
       const { skills: directSkills, packs } = selectionFromPolicy(base);
       const effective = new Set(
         resolveLoadoutPreview(directSkills, packs, catalog.packs).map(e => e.name),
       );
-
-      if (enabled) {
-        if (effective.has(skillName)) continue;
-        const nextSkills = new Set(directSkills);
-        nextSkills.add(skillName);
-        const policy = policyFromSelection(nextSkills, packs);
+      if (!effective.has(skillName)) continue;
+      const packList = [...packs];
+      const providingPacks = packList.filter(packId => {
+        const pack = catalog.packs.find(p => p.id === packId);
+        return pack?.include.some(sel => sel === `skill:${skillName}`);
+      });
+      if (providingPacks.length > 0) {
+        const materialized = new Set(effective);
+        materialized.delete(skillName);
+        const remainingPacks = packList.filter(packId => !providingPacks.includes(packId));
+        const policy = policyFromSelection(materialized, remainingPacks);
         if (isLoadoutCustomised(policy, botPolicyOf(larkAppId))) next[larkAppId] = policy;
         else delete next[larkAppId];
       } else {
-        if (!effective.has(skillName)) continue;
-        const packList = [...packs];
-        const providingPacks = packList.filter(packId => {
-          const pack = catalog.packs.find(p => p.id === packId);
-          return pack?.include.some(sel => sel === `skill:${skillName}`);
-        });
-        if (providingPacks.length > 0) {
-          const materialized = new Set(effective);
-          materialized.delete(skillName);
-          const remainingPacks = packList.filter(packId => !providingPacks.includes(packId));
-          const policy = policyFromSelection(materialized, remainingPacks);
-          if (isLoadoutCustomised(policy, botPolicyOf(larkAppId))) next[larkAppId] = policy;
-          else delete next[larkAppId];
-        } else {
-          const nextSkills = new Set(directSkills);
-          nextSkills.delete(skillName);
-          const policy = policyFromSelection(nextSkills, packs);
-          if (isLoadoutCustomised(policy, botPolicyOf(larkAppId))) next[larkAppId] = policy;
-          else delete next[larkAppId];
-        }
+        const nextSkills = new Set(directSkills);
+        nextSkills.delete(skillName);
+        const policy = policyFromSelection(nextSkills, packs);
+        if (isLoadoutCustomised(policy, botPolicyOf(larkAppId))) next[larkAppId] = policy;
+        else delete next[larkAppId];
       }
+      changed = true;
     }
-    props.onChange(next);
-  }, [catalog, writableSelected, props.drafts, props.onChange, botPolicyOf]);
+    if (changed) props.onChange(next);
+  }, [catalog, writableSelected, props.drafts, props.onChange, botPolicyOf, botStatusOf]);
 
   /** Tri-state of a skill across writable selected bots (effective skills). */
   const skillTriState = useCallback((skillName: string): TriState => {
@@ -567,14 +535,16 @@ export function SessionLoadoutTeamBuilder(props: {
                         <small data-loadout-state={stateKind}>{stateLabel}</small>
                         {/* Visible, localizable default summary — replaces the
                             old P:N/S:N hover-only badges. Reads: "默认 1 包 · 1 Skill · 最终 3".
-                            Only shown when the default is readable. */}
+                            Uses DEFAULT counts (defaultSel/defaultCount), NOT the current
+                            draft's finalCount — otherwise a customised bot would pass off
+                            its post-edit total as the original default. */}
                         {status.ok && (
                           <span className="loadout-bot-default" data-loadout-default-summary>
                             <span className="loadout-bot-default-text">
                               {tr('sessions.create.loadoutDefaultSummary', {
                                 packs: defaultSel.packs.size,
                                 skills: defaultSel.skills.size,
-                                final: finalCount,
+                                final: defaultCount,
                               })}
                             </span>
                           </span>
@@ -584,6 +554,15 @@ export function SessionLoadoutTeamBuilder(props: {
                             <span className="loadout-bot-default-text">
                               {tr('sessions.create.loadoutDefaultUnavailable')}
                             </span>
+                          </span>
+                        )}
+                        {/* Independent current final count — distinct from the default
+                            summary's "最终" so a customised bot shows "默认 M → 本次 N".
+                            Uses finalCount (draft??default) so the user sees the live
+                            post-edit total without switching to the preview panel. */}
+                        {status.ok && (
+                          <span className="loadout-bot-current" data-loadout-final-count={finalCount}>
+                            {tr('sessions.create.loadoutCurrentFinal', { count: finalCount })}
                           </span>
                         )}
                       </span>
@@ -670,6 +649,67 @@ export function SessionLoadoutTeamBuilder(props: {
               {catalog.packs.length === 0 && (
                 <small className="muted">{tr('skills.packsEmpty')}</small>
               )}
+            </div>
+
+            {/* ── Skill catalog (always visible, always draggable) ──
+                Individual Skills are draggable from here onto any editable Bot
+                card — no pre-selection required, matching the "逐项从左拖到每个
+                Bot" contract. The batch button inside each card is disabled until
+                at least one bot is selected; at zero-selection it shows
+                "unselected" state (not "none") and the "先选 Bot" hint. The
+                custom drawer below still offers full tri-state fine-tuning. */}
+            <div className="loadout-skill-catalog" data-loadout-skill-catalog>
+              <div className="loadout-skill-catalog-head">
+                <strong>{tr('sessions.create.loadoutSkillCatalog')}</strong>
+                <small>{tr('sessions.create.loadoutSkillCatalogHint')}</small>
+              </div>
+              {writableSelected.length === 0 && (
+                <p className="loadout-empty-hint" data-skill-catalog-empty>{tr('sessions.create.loadoutSelectBotsFirst')}</p>
+              )}
+              <div className="loadout-skill-catalog-list">
+                {catalog.skills.map(skill => {
+                  const noSelection = writableSelected.length === 0;
+                  const state = noSelection ? 'unselected' : skillTriState(skill.name);
+                  const enabled = state === 'all';
+                  return (
+                    <div
+                      key={skill.name}
+                      className="loadout-skill-card"
+                      data-loadout-skill={skill.name}
+                      data-skill-state={state}
+                      draggable={!props.disabled}
+                      onDragStart={e => startDrag(e, { kind: 'skill', id: skill.name })}
+                      onDragEnd={clearDrag}
+                    >
+                      <span className="loadout-skill-card-name">
+                        <strong>{skill.name}</strong>
+                        {skill.description && <small>{skill.description}</small>}
+                      </span>
+                      <button
+                        type="button"
+                        className={`bd-button small loadout-skill-apply${enabled ? ' is-active' : ''}`}
+                        data-action="apply-skill"
+                        data-skill-name={skill.name}
+                        data-perk-state={state}
+                        aria-pressed={noSelection ? undefined : state === 'mixed' ? 'mixed' : enabled}
+                        disabled={props.disabled || noSelection}
+                        onClick={() => setSkillForSelected(skill.name, !enabled)}
+                      >
+                        {noSelection
+                          ? tr('sessions.create.loadoutSelectBotsFirst')
+                          : enabled
+                            ? tr('sessions.create.loadoutPerkAll')
+                            : state === 'mixed'
+                              ? tr('sessions.create.loadoutPerkMixed')
+                              : tr('sessions.create.loadoutPerkNone')}
+                      </button>
+                    </div>
+                  );
+                })}
+                {catalog.skills.length === 0 && (
+                  <small className="muted">{tr('skills.emptyTitle')}</small>
+                )}
+              </div>
             </div>
 
             {/* ── Custom fine-tune (Perks — skills only, no packs) ──
@@ -800,8 +840,9 @@ export function SessionLoadoutTeamBuilder(props: {
 }
 
 // ── Mutation helpers (operate on a draft object, no React state) ──
-// These exist so batch loops can accumulate changes into a single `next`
-// object before calling onChange once, instead of firing onChange per bot.
+// Single implementation shared by single-card drop and batch operations.
+// Each checks catalog + botStatusOf().ok, mutates `next` in place, and
+// returns true if the draft actually changed (so callers can skip no-op onChange).
 
 function addPackToBotMut(
   next: LoadoutDrafts,
@@ -809,16 +850,18 @@ function addPackToBotMut(
   packId: string,
   catalog: LoadoutCatalog | null,
   botPolicyOf: (id: string) => { include?: readonly string[] } | undefined,
-) {
-  if (!catalog) return;
+  botStatusOf: (id: string) => { ok: boolean },
+): boolean {
+  if (!catalog || !botStatusOf(larkAppId).ok) return false;
   const base = next[larkAppId] ?? botPolicyOf(larkAppId);
   const { skills, packs } = selectionFromPolicy(base);
-  if (packs.has(packId)) return;
+  if (packs.has(packId)) return false; // idempotent
   const nextPacks = new Set(packs);
   nextPacks.add(packId);
   const policy = policyFromSelection(skills, nextPacks);
   if (isLoadoutCustomised(policy, botPolicyOf(larkAppId))) next[larkAppId] = policy;
   else delete next[larkAppId];
+  return true;
 }
 
 function removePackFromBotMut(
@@ -827,14 +870,39 @@ function removePackFromBotMut(
   packId: string,
   catalog: LoadoutCatalog | null,
   botPolicyOf: (id: string) => { include?: readonly string[] } | undefined,
-) {
-  if (!catalog) return;
+  botStatusOf: (id: string) => { ok: boolean },
+): boolean {
+  if (!catalog || !botStatusOf(larkAppId).ok) return false;
   const base = next[larkAppId] ?? botPolicyOf(larkAppId);
   const { skills, packs } = selectionFromPolicy(base);
-  if (!packs.has(packId)) return;
+  if (!packs.has(packId)) return false;
   const nextPacks = new Set(packs);
   nextPacks.delete(packId);
   const policy = policyFromSelection(skills, nextPacks);
   if (isLoadoutCustomised(policy, botPolicyOf(larkAppId))) next[larkAppId] = policy;
   else delete next[larkAppId];
+  return true;
+}
+
+function addSkillToBotMut(
+  next: LoadoutDrafts,
+  larkAppId: string,
+  skillName: string,
+  catalog: LoadoutCatalog | null,
+  botPolicyOf: (id: string) => { include?: readonly string[] } | undefined,
+  botStatusOf: (id: string) => { ok: boolean },
+): boolean {
+  if (!catalog || !botStatusOf(larkAppId).ok) return false;
+  const base = next[larkAppId] ?? botPolicyOf(larkAppId);
+  const { skills, packs } = selectionFromPolicy(base);
+  const effective = new Set(
+    resolveLoadoutPreview(skills, packs, catalog.packs).map(e => e.name),
+  );
+  if (effective.has(skillName)) return false; // already effective → no-op
+  const nextSkills = new Set(skills);
+  nextSkills.add(skillName);
+  const policy = policyFromSelection(nextSkills, packs);
+  if (isLoadoutCustomised(policy, botPolicyOf(larkAppId))) next[larkAppId] = policy;
+  else delete next[larkAppId];
+  return true;
 }

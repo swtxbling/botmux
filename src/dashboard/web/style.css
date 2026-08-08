@@ -27639,6 +27639,29 @@ button.skills-issue-badge:hover {
 .loadout-bot-slot.is-drop-target { outline: 2px dashed var(--accent); outline-offset: 2px; }
 .loadout-bot-slot.is-drop-rejected { outline: 2px dashed var(--warn); outline-offset: 2px; }
 .loadout-bot-slot[data-drop-disabled='true'] { cursor: not-allowed; }
+.loadout-bot-current {
+  font-size: 10.5px; color: var(--accent); white-space: nowrap; flex-shrink: 0;
+  font-weight: 600;
+}
+
+/* Always-visible Skill catalog in the builds layer — zero-selection drag source. */
+.loadout-skill-catalog { margin-top: 12px; }
+.loadout-skill-catalog-head { display: flex; flex-direction: column; gap: 2px; margin-bottom: 6px; }
+.loadout-skill-catalog-head strong { font-size: 12px; }
+.loadout-skill-catalog-head small { font-size: 10.5px; color: var(--muted); }
+.loadout-skill-catalog-list {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 6px;
+}
+.loadout-skill-card {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--surface); cursor: grab;
+}
+.loadout-skill-card:active { cursor: grabbing; }
+.loadout-skill-card-name { display: flex; flex-direction: column; min-width: 0; }
+.loadout-skill-card-name strong { font-size: 11.5px; }
+.loadout-skill-card-name small { font-size: 10px; color: var(--muted); }
+.loadout-skill-apply { flex-shrink: 0; }
 
 /* Perk drag wrapper so individual skills are draggable from the fine-tune list. */
 .loadout-perk-drag { display: flex; }
