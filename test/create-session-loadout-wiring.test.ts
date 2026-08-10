@@ -127,9 +127,9 @@ async function selectLineupBot(renderer: TestRenderer.ReactTestRenderer, larkApp
   await flush();
 }
 
-/** Open the custom fine-tune drawer so individual skills are reachable. */
-async function openCustomDrawer(renderer: TestRenderer.ReactTestRenderer) {
-  const btn = renderer.root.findByProps({ 'aria-expanded': false });
+/** Switch the equipment shelf from Skill Packs to individual Skills. */
+async function openSkillCatalog(renderer: TestRenderer.ReactTestRenderer) {
+  const btn = renderer.root.findByProps({ 'data-catalog-tab': 'skills' });
   await act(async () => { await btn.props.onClick(); });
   await flush();
 }
@@ -163,9 +163,9 @@ describe('create-session dialog ↔ skillLoadouts wiring', () => {
     await selectLineupBot(renderer, 'bot-1');
 
     // bot-1's own policy is skill:a; applying the Ops pack (skill:a) is a no-op,
-    // so toggle skill:b in the custom drawer to make a real override.
-    await openCustomDrawer(renderer);
-    await act(async () => { renderer.root.findByProps({ 'data-loadout-perk': 'b' }).props.onClick(); });
+    // so equip skill:b from the individual-Skill shelf to make a real override.
+    await openSkillCatalog(renderer);
+    await act(async () => { renderer.root.findByProps({ 'data-action': 'apply-skill', 'data-skill-name': 'b' }).props.onClick(); });
     // Commit the workshop so drafts are staged back to the parent form.
     await commitWorkshop(renderer);
     await submit(renderer);
@@ -182,8 +182,7 @@ describe('create-session dialog ↔ skillLoadouts wiring', () => {
     await selectLineupBot(renderer, 'bot-1');
 
     // bot-1 default = [skill:a]; remove skill:a → explicit empty { include: [] }
-    await openCustomDrawer(renderer);
-    await act(async () => { renderer.root.findByProps({ 'data-loadout-perk': 'a' }).props.onClick(); });
+    await act(async () => { renderer.root.findByProps({ 'data-equipped-skill': 'a' }).props.onClick(); });
     await commitWorkshop(renderer);
     await submit(renderer);
 
@@ -203,8 +202,8 @@ describe('create-session dialog ↔ skillLoadouts wiring', () => {
     await setContent(renderer, 'go');
 
     await selectLineupBot(renderer, 'bot-2');
-    await openCustomDrawer(renderer);
-    await act(async () => { renderer.root.findByProps({ 'data-loadout-perk': 'b' }).props.onClick(); });
+    await openSkillCatalog(renderer);
+    await act(async () => { renderer.root.findByProps({ 'data-action': 'apply-skill', 'data-skill-name': 'b' }).props.onClick(); });
     // Commit the workshop so drafts are staged, then uncheck bot-2.
     await commitWorkshop(renderer);
     await checkBot(renderer, 'bot-2', false);
@@ -220,8 +219,8 @@ describe('create-session dialog ↔ skillLoadouts wiring', () => {
     await checkBot(renderer, 'bot-1', true);
     await setContent(renderer, 'go');
     await selectLineupBot(renderer, 'bot-1');
-    await openCustomDrawer(renderer);
-    await act(async () => { renderer.root.findByProps({ 'data-loadout-perk': 'b' }).props.onClick(); });
+    await openSkillCatalog(renderer);
+    await act(async () => { renderer.root.findByProps({ 'data-action': 'apply-skill', 'data-skill-name': 'b' }).props.onClick(); });
     // Cancel the workshop — drafts must NOT be staged back to the parent.
     await act(async () => { renderer.root.findByProps({ 'data-action': 'workshop-cancel' }).props.onClick(); });
     await flush();

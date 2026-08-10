@@ -54,7 +54,7 @@ import {
   loadoutTargetBots,
   type LoadoutDrafts,
 } from './create-session-loadout.js';
-import { SessionLoadoutTeamBuilder } from './skills/session-loadout-team-builder.js';
+import { SessionLoadoutBoard } from './skills/session-loadout-board.js';
 import {
   BOARD_COLUMNS,
   CLI_FILTER_OPTIONS,
@@ -2700,7 +2700,7 @@ export function CreateSessionDialog(props: {
           </legend>
           {advancedOpen ? (
           <div id="cs-advanced-fields" className="cs-advanced-fields">
-            {/* Summary card + entry to the fullscreen workshop. The TeamBuilder
+            {/* Summary card + entry to the fullscreen workshop. The equipment board
                 is only mounted inside the workshop, so no catalog fetch happens
                 until the user explicitly opens it. */}
             <div className="loadout-summary-card" data-loadout-summary>
@@ -2808,7 +2808,7 @@ export function CreateSessionDialog(props: {
             </div>
           </header>
           <div className="loadout-workshop-body">
-            <SessionLoadoutTeamBuilder
+            <SessionLoadoutBoard
               targets={loadoutTargets}
               drafts={workspaceDrafts}
               onChange={setWorkspaceDrafts}
