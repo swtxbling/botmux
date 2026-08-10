@@ -64,6 +64,14 @@ function mockApis(): { bodies: any[]; calls: string[] } {
 }
 
 function renderDialog() {
+  // v3.12's FeedGroupPicker installs document-level outside-click/Escape
+  // listeners. This wiring suite runs in Vitest's node environment, so provide
+  // only the listener surface the real browser supplies; the picker itself is
+  // not under test here.
+  vi.stubGlobal('document', {
+    addEventListener: vi.fn(),
+    removeEventListener: vi.fn(),
+  });
   let renderer!: TestRenderer.ReactTestRenderer;
   act(() => {
     renderer = TestRenderer.create(React.createElement(CreateSessionDialog, {
