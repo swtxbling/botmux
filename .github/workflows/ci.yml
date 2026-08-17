@@ -44,5 +44,9 @@ jobs:
       - run: npm install -g pnpm@9.5.0
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
-      - run: pnpm test
-      - run: pnpm workflow-core:test
+      - name: Debug runner cgroup context
+        run: |
+          cat /proc/self/cgroup
+          ls /sys/fs/cgroup | head -20
+          echo "sh is: $(readlink -f /bin/sh)"
+      - run: npx vitest run test/mojo-preexec-enrollment.test.ts

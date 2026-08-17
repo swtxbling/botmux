@@ -130,6 +130,20 @@ describe('backend wiring through a synthetic cgroup root (layer 2)', () => {
     backend.spawn('', [], {} as never);
     backend.write('turn');
     expect(await waitFor(() => existsSync(seen))).toBe(true);
+    // CI-DEBUG: dump everything relevant before the assertion that fails in CI.
+    const walk = (d: string): string[] => existsSync(d)
+      ? readdirSync(d, { withFileTypes: true }).flatMap(e => {
+          const p = join(d, e.name);
+          return e.isDirectory() ? [p + '/', ...walk(p)] : [p];
+        })
+      : ['<missing>'];
+    console.log('CI-DEBUG /proc/self/cgroup:', JSON.stringify(readFileSync('/proc/self/cgroup', 'utf8')));
+    console.log('CI-DEBUG seen:', JSON.stringify(readFileSync(seen, 'utf8')));
+    console.log('CI-DEBUG tree under cgroupRoot:', JSON.stringify(walk(cgroupRoot), null, 1));
+    for (const f of walk(cgroupRoot).filter(p => p.endsWith('cgroup.procs'))) {
+      console.log('CI-DEBUG procs file', f, '=', JSON.stringify(readFileSync(f, 'utf8')));
+    }
+    console.log('CI-DEBUG handles:', JSON.stringify(containmentHandles('sess-preexec-synth')));
     expect(readFileSync(seen, 'utf8').trim()).toBe('enrolled');
     // The handle minted for the turn is STRONG and points at the prepared
     // boundary — no acquireContainmentHandle migration write involved.
