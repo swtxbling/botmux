@@ -315,8 +315,8 @@ describe('botmux routing prose XML boundaries', () => {
   });
 
   it.each([
-    ['zh', '&lt;对方 bot 的 open_id&gt;'],
-    ['en', '&lt;other-bot-open-id&gt;'],
+    ['zh', '&lt;对方 open_id&gt;'],
+    ['en', '&lt;their open_id&gt;'],
   ] as const)('escapes tag-like placeholders in the %s system-prompt prose while preserving real structure and heredoc syntax', (locale, mentionPlaceholder) => {
     const prompt = buildBotmuxSystemPromptText({
       locale,
@@ -409,11 +409,10 @@ describe('buildFollowUpContent', () => {
     expect(content.indexOf('<sender ')).toBeGreaterThan(content.indexOf('</user_message>'));
     expect(content.indexOf('<mentions>')).toBeGreaterThan(content.indexOf('</user_message>'));
     // Complex send guidance is discoverable once in the opening catalog; keep
-    // Complex send guidance is discoverable once in the opening catalog; keep
     // every follow-up reminder intentionally tiny. By default (experimental
-    // anti-resend toggle OFF) it is exactly #554's BOTMUX_NO_REPLY sentinel
+    // anti-resend toggle OFF) it is exactly #554's nothing-to-send sentinel
     // baseline — no anti-resend clause appended.
-    expect(content).toContain('<botmux_reminder>需要回复时必须 botmux send；无需回复时不要解释沉默，final 只输出 BOTMUX_NO_REPLY</botmux_reminder>');
+    expect(content).toContain('<botmux_reminder>发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND</botmux_reminder>');
     expect(content).not.toContain('别因「无输出」提示重发');
     expect(content).not.toContain('JSON.stringify');
     expect(content).not.toContain('botmux skill show botmux-send');
@@ -424,7 +423,7 @@ describe('buildFollowUpContent', () => {
     try {
       const content = buildFollowUpContent('hello', SESSION_ID, { cliId: 'codex' });
       // ON variant must inherit #554's sentinel semantics AND add anti-resend.
-      expect(content).toContain('final 只输出 BOTMUX_NO_REPLY');
+      expect(content).toContain('final 只输出 BOTMUX_NOTHING_TO_SEND');
       expect(content).toMatch(/<botmux_reminder>[^<]*别因「无输出」提示重发[^<]*<\/botmux_reminder>/);
     } finally {
       delete (config as { noVisibleOutputHint?: boolean }).noVisibleOutputHint;
@@ -437,10 +436,10 @@ describe('buildFollowUpContent', () => {
     // (preserveMarkTimeMs). That reverse hint weakened multi-agent collaboration
     // (bridge-forwarded finals can't carry an @mention), so Hermes now shares
     // the standard path. With the anti-resend toggle OFF (default) that is
-    // exactly #554's BOTMUX_NO_REPLY sentinel baseline — same as codex/traex.
+    // exactly #554's nothing-to-send sentinel baseline — same as codex/traex.
     const content = buildFollowUpContent('hello', SESSION_ID, { cliId: 'hermes' });
 
-    expect(content).toContain('<botmux_reminder>需要回复时必须 botmux send；无需回复时不要解释沉默，final 只输出 BOTMUX_NO_REPLY</botmux_reminder>');
+    expect(content).toContain('<botmux_reminder>发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND</botmux_reminder>');
     expect(content).not.toContain('普通文字回复不要调用 `botmux send`');
     expect(content).not.toContain('直接把给用户看的答案写在 final');
   });
@@ -452,7 +451,7 @@ describe('buildFollowUpContent', () => {
     (config as { noVisibleOutputHint?: boolean }).noVisibleOutputHint = true;
     try {
       const content = buildFollowUpContent('hello', SESSION_ID, { cliId: 'hermes' });
-      expect(content).toContain('final 只输出 BOTMUX_NO_REPLY');
+      expect(content).toContain('final 只输出 BOTMUX_NOTHING_TO_SEND');
       expect(content).toMatch(/<botmux_reminder>[^<]*别因「无输出」提示重发[^<]*<\/botmux_reminder>/);
     } finally {
       delete (config as { noVisibleOutputHint?: boolean }).noVisibleOutputHint;

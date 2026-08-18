@@ -452,8 +452,8 @@ botmux send --mention ou_xxx "帮忙看下这段代码"
 
 > ⚠️ \`--mention-back\` / \`--no-mention\` 是开关，后面不跟任何参数；要 @ 具体的人用 \`--mention <open_id:名字>\`。正文来源按 \`--content-file > 位置参数 > stdin\` 选择，多行正文推荐只放在 heredoc/stdin 中。
 
-决策规则（**按内容价值判断，不是按"人还是 bot"**）：
-- **有实质结论、需要对方继续看 / 确认 / 决策** → \`--mention-back\`（@回触发者）或 \`--mention\` 点名，确保对方看到。
+决策规则（**先按内容价值决定要不要 @，再按收件人是谁选 @ 方式**）：
+- **有实质结论、需要对方继续看 / 确认 / 决策** → 需要 @：收件人就是触发这轮的那个人/bot 用 \`--mention-back\`；收件人是别人用 \`--mention\` 点名。⚠️ 多人 / 多 bot 会话里，回复对象常常**不是**触发这轮的人——这种情况别用 \`--mention-back\`（它只会 @ 触发者），要用 \`--mention <open_id:名字>\` 显式点名你真正想回的人。
 - **纯记录 / 低优先级进度 / 简短确认（"收到""在看"）** → \`--no-mention\`，别打扰。
 - **如果只是没信息量的"收到"** → 不如不发，等下一条有内容时再回。
 - ⚠️ 别把 \`--no-mention\` 当默认随手带；也别无意义地 @ 打扰人。
@@ -1052,6 +1052,12 @@ botmux ask buttons --options "yes=继续,no=停止" "继续吗？"
 
 兼容 alias：\`botmux ask --options "yes,no" "继续吗？"\` 可以用，但文档和新脚本优先写 \`botmux ask buttons\`，给未来 \`ask text\` / \`ask confirm\` 留空间。
 
+多选加 \`--multi\`，stdout 返回逗号分隔的 key；需要完整结构时加 \`--json\` 读取 \`answers[0]\`（多选下 \`selected\` 恒为 \`null\`，因为它只表示单问单选的兼容值）：
+
+\`\`\`bash
+choices=$(botmux ask buttons --multi --options "lint=Lint,test=测试,build=构建" "要执行哪些检查？")
+\`\`\`
+
 ## JSON 输出
 
 \`\`\`bash
@@ -1062,12 +1068,13 @@ stdout 为一行 JSON。注意：\`--json\` 覆盖所有结果类型；超时 / 
 同时保留非 0 exit code。脚本判断超时必须看 exit code 或 \`timedOut\` 字段。
 
 \`\`\`json
-{"selected":"yes","by":"ou_xxx","timedOut":false,"comment":null}
+{"selected":"yes","answers":[["yes"]],"by":"ou_xxx","timedOut":false,"comment":null}
 \`\`\`
 
 ## 退出码和 stdout 契约
 
 - 成功：stdout 一行 \`<selected_key>\`，exit 0
+- \`--multi\` 成功：stdout 一行逗号分隔的 \`<selected_key>\`，exit 0
 - \`--json\`：stdout 一行 JSON（包括超时 / 失效），exit code 仍按结果返回
 - 超时：默认模式 stdout 为空，exit 124；\`--json\` 时 \`{"selected":null,"timedOut":true,...}\`
 - 缺少 botmux 环境变量 / 参数错误：stdout 为空，exit 2
@@ -1079,7 +1086,7 @@ stdout 为一行 JSON。注意：\`--json\` 覆盖所有结果类型；超时 / 
 
 - \`--options\` 必填，至少 2 项，逗号分隔
 - 推荐 \`key=label\`，key 用稳定英文短词，label 给用户看
-- 不支持 comment / multi-select / free-form text（v0.1.7 范围外）
+- \`--multi\` 开启多选；\`--json\` 的 \`answers[0]\` 保留完整 key 数组，且 \`selected\` 恒为 \`null\`（多选不要读 \`selected\`）
 - 默认超时 300 秒，可用 \`--timeout <seconds>\` 调整
 `;
 

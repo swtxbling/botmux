@@ -10,6 +10,7 @@ import { spawn } from 'node:child_process';
 import { createServer, type IncomingMessage } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import {
+  chmodSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -17,13 +18,17 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { RELAY_ORIGIN_CAPABILITY_BASENAME } from '../src/core/managed-origin-capability.js';
+import {
+  managedOriginCapabilityPath,
+  RELAY_ORIGIN_CAPABILITY_BASENAME,
+} from '../src/core/managed-origin-capability.js';
 
 const CLI_PATH = join(__dirname, '..', 'src', 'cli.ts');
 const APP_ID = 'cli_delete_test';
 const CAPABILITY = 'ab'.repeat(32);
+const ORIGIN_CHANNEL = 'cd'.repeat(32);
 const tempDirs: string[] = [];
 
 interface StoredSession {
@@ -83,10 +88,25 @@ function writeDaemonDescriptor(dataDir: string, port: number): void {
 
 function writeRelayCapability(relayDir: string): void {
   mkdirSync(relayDir, { recursive: true });
+  const path = join(relayDir, RELAY_ORIGIN_CAPABILITY_BASENAME);
   writeFileSync(
-    join(relayDir, RELAY_ORIGIN_CAPABILITY_BASENAME),
+    path,
     JSON.stringify({ token: CAPABILITY, turnId: 'turn-delete', dispatchAttempt: 3 }),
   );
+  chmodSync(path, 0o600);
+}
+
+function writeReadIsolatedCapability(dataDir: string, sessionId: string): void {
+  const path = managedOriginCapabilityPath(dataDir, sessionId, ORIGIN_CHANNEL);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, JSON.stringify({
+    sessionId,
+    channelId: ORIGIN_CHANNEL,
+    capability: CAPABILITY,
+    turnId: 'turn-delete',
+    dispatchAttempt: 3,
+  }));
+  chmodSync(path, 0o600);
 }
 
 function runDelete(
@@ -134,11 +154,11 @@ function readRequestBody(req: IncomingMessage): Promise<Record<string, unknown>>
 describe('botmux delete — daemon-first close', () => {
   it('delegates a current-session close to the daemon with its rotating capability', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-data-'));
-    const relayDir = mkdtempSync(join(tmpdir(), 'botmux-delete-relay-'));
-    tempDirs.push(dataDir, relayDir);
+    const homeDir = mkdtempSync(join(tmpdir(), 'botmux-delete-home-'));
+    tempDirs.push(dataDir, homeDir);
     const session = makeSession('sess-delete-current');
     const sessionsPath = writeSessions(dataDir, [session]);
-    writeRelayCapability(relayDir);
+    writeReadIsolatedCapability(dataDir, session.sessionId);
 
     let requestUrl = '';
     let requestBody: Record<string, unknown> = {};
@@ -146,7 +166,7 @@ describe('botmux delete — daemon-first close', () => {
       requestUrl = req.url ?? '';
       requestBody = await readRequestBody(req);
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end('{"ok":true,"alreadyClosed":false}');
+      res.end('{"ok":true,"outcome":"closed","alreadyClosed":false}');
     });
     await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
 
@@ -156,8 +176,10 @@ describe('botmux delete — daemon-first close', () => {
       const result = await runDelete(dataDir, [session.sessionId], {
         BOTMUX_SESSION_ID: session.sessionId,
         BOTMUX_LARK_APP_ID: APP_ID,
-        BOTMUX_SEND_RELAY: relayDir,
+        BOTMUX_SEND_RELAY: undefined,
+        BOTMUX_ORIGIN_CHANNEL_ID: ORIGIN_CHANNEL,
         BOTMUX_DAEMON_IPC_PORT: String(port),
+        HOME: homeDir,
       });
 
       expect(result.status).toBe(0);
@@ -172,6 +194,56 @@ describe('botmux delete — daemon-first close', () => {
       // the CLI did not run the legacy local fallback after an IPC success.
       const stored = JSON.parse(readFileSync(sessionsPath, 'utf8'));
       expect(stored[session.sessionId].status).toBe('active');
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        server.close(err => err ? reject(err) : resolve());
+      });
+    }
+  });
+
+  it('does NOT claim a plain delete when the daemon reports an uncancelled remote', async () => {
+    // The daemon closed the local row but could not cancel the remote session. The
+    // CLI used to flatten the whole response into {ok:true} and print the green
+    // "已关闭 N 个会话", so the operator walked away from a live agent that still
+    // holds the injected credential.
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-data-'));
+    const homeDir = mkdtempSync(join(tmpdir(), 'botmux-delete-home-'));
+    tempDirs.push(dataDir, homeDir);
+    const session = makeSession('sess-delete-residual');
+    writeSessions(dataDir, [session]);
+    writeReadIsolatedCapability(dataDir, session.sessionId);
+
+    const server = createServer(async (req, res) => {
+      await readRequestBody(req);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        outcome: 'closed_with_residual',
+        residual: { reason: 'mojo_lineage_quarantined', taskId: 'mojo-parked-9' },
+        alreadyClosed: false,
+      }));
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+
+    try {
+      const port = (server.address() as AddressInfo).port;
+      writeDaemonDescriptor(dataDir, port);
+      const result = await runDelete(dataDir, [session.sessionId], {
+        BOTMUX_SESSION_ID: session.sessionId,
+        BOTMUX_LARK_APP_ID: APP_ID,
+        BOTMUX_SEND_RELAY: undefined,
+        BOTMUX_ORIGIN_CHANNEL_ID: ORIGIN_CHANNEL,
+        BOTMUX_DAEMON_IPC_PORT: String(port),
+        HOME: homeDir,
+      });
+
+      const output = `${result.stdout}\n${result.stderr}`;
+      expect(output).toContain('mojo-parked-9');
+      expect(output).toContain('远端会话未取消');
+      // The summary must flag it rather than reporting an unqualified success.
+      // (Wording is residual-kind-neutral now that a LOCAL subtree residual can
+      // also appear here — the per-line message above still names the remote one.)
+      expect(output).toContain('有残留需人工清理');
     } finally {
       await new Promise<void>((resolve, reject) => {
         server.close(err => err ? reject(err) : resolve());
@@ -253,7 +325,7 @@ describe('botmux delete — daemon-first close', () => {
       seen.push(req.url ?? '');
       await readRequestBody(req);
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end('{"ok":true,"alreadyClosed":false}');
+      res.end('{"ok":true,"outcome":"closed","alreadyClosed":false}');
     });
     await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
 
@@ -293,7 +365,7 @@ describe('botmux delete — daemon-first close', () => {
       seen.push(req.url ?? '');
       await readRequestBody(req);
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end('{"ok":true,"alreadyClosed":false}');
+      res.end('{"ok":true,"outcome":"closed","alreadyClosed":false}');
     });
     await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
 
@@ -339,7 +411,7 @@ describe('botmux delete — daemon-first close', () => {
       seen.push(req.url ?? '');
       await readRequestBody(req);
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end('{"ok":true,"alreadyClosed":false}');
+      res.end('{"ok":true,"outcome":"closed","alreadyClosed":false}');
     });
     await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
 

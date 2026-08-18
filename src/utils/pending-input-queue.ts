@@ -7,9 +7,33 @@ export interface PendingCliInput {
    * receives `content`. */
   logicalContent?: string;
   turnId?: string;
+  replyTurnId?: string;
   dispatchAttempt?: number;
+  codexAppDispatchId?: string;
+  /** Explicit positive steer authorization copied from the daemon ledger entry
+   * (plain-human-interactive turns only). Missing/false ⇒ forced serial. */
+  codexAppSteerable?: true;
+  queuedActivationToken?: string;
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
   codexAppInput?: CodexAppTurnInput;
+  /**
+   * mojo only: the credential snapshot that arrived WITH this turn.
+   *
+   * Carried on the queue item rather than applied at IPC-receive time because the
+   * two are not simultaneous — a turn can sit queued while later messages arrive.
+   * Applying on receipt made two queued credential turns collapse: queueing B then
+   * C executed as A → C → C instead of A → B → C, because both patches landed
+   * before either turn ran.
+   */
+  mojoLivePatch?: import('../adapters/backend/mojo-types.js').MojoLivePatch;
+  /** Per-item at-most-once marker: an input carrying this must NEVER be replayed
+   *  onto an auto-restarted CLI — excluded from both the pendingMessages drain and
+   *  the InflightInputTracker carry-over (codex #776 round-7 finding #1). Set on
+   *  the KEYED idempotency-lease init prompt (from init.atMostOnce); scoped
+   *  per-item so a later PLAIN follow-up turn folded into the same http_async_
+   *  session is NOT dropped (codex #776 round-8). The worker's CLI-exit carry
+   *  predicate and pending-drop both honor it. */
+  noReplay?: boolean;
 }
 
 /**
@@ -66,6 +90,8 @@ export function mergeQueuedCliInput(
   // per-message attribution/context, so concatenating only their visible text
   // would drop or mis-attach the sidecar.
   if (tail.dispatchAttempt !== undefined || next.dispatchAttempt !== undefined
+    || tail.codexAppDispatchId || next.codexAppDispatchId
+    || tail.queuedActivationToken || next.queuedActivationToken
     || tail.vcMeetingImTurnOrigin || next.vcMeetingImTurnOrigin
     || tail.codexAppInput || next.codexAppInput
     || tail.logicalContent || next.logicalContent) return false;
@@ -97,10 +123,11 @@ export function shouldDeferArgsBakedDurablePrompt(opts: {
   passesInitialPromptViaArgs: boolean;
   adoptMode: boolean;
   dispatchAttempt?: number;
+  queuedActivationToken?: string;
 }): boolean {
   return opts.passesInitialPromptViaArgs
     && !opts.adoptMode
-    && opts.dispatchAttempt !== undefined;
+    && (opts.dispatchAttempt !== undefined || !!opts.queuedActivationToken);
 }
 
 /** Some backends (tmux in particular) reject long launch command strings before
@@ -206,6 +233,8 @@ export function shouldStopPendingBatch(
 ): boolean {
   return written.dispatchAttempt !== undefined
     || next?.dispatchAttempt !== undefined
+    || !!written.queuedActivationToken
+    || !!next?.queuedActivationToken
     || !!written.vcMeetingImTurnOrigin
     || !!next?.vcMeetingImTurnOrigin;
 }

@@ -18,6 +18,7 @@ import {
   type ReactNode,
 } from 'react';
 import { createPortal } from 'react-dom';
+import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from '../../core/close-residual.js';
 import {
   IDLE_CLEANUP_HOUR_OPTIONS,
   parseIdleCleanupHours,
@@ -27,6 +28,8 @@ import {
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useStoreSelector, useT } from './react-hooks.js';
 import { copyText } from './clipboard.js';
+import { FeedGroupPicker } from './feed-group-picker.js';
+import { BotMultiSelect } from './bot-multi-select.js';
 import {
   KANBAN_TEAM_STORAGE_KEY,
   normalizeHiddenTableColumns,
@@ -66,6 +69,7 @@ import {
   repoBasename,
   restartConfirmMessage,
   sessionLocationText,
+  preferChatFilterLabel,
   sessionLocationTitle,
   sessionExchangePreview,
   sessionRuntimeCounts,
@@ -216,6 +220,134 @@ function StatusBadge(props: { status: unknown }): React.JSX.Element {
   return <span className={`status status-${cssToken(raw)}`}>{sessionStatusText(raw)}</span>;
 }
 
+/** 任务态徽标：机器可能空闲，但 transcript 里还有未完成的 TODO。挂在卡片上让人
+ *  一眼看出「为什么这张卡在待办列」——运行态（空闲）与任务态（未完成 TODO）正交，
+ *  单看运行态徽标解释不了列归属。openTodos 缺失或已全部完成时不渲染。 */
+function TodoBadge(props: { row: any }): React.JSX.Element | null {
+  const todos = props.row?.openTodos;
+  // 两种打开态：hover=悬浮预览（移开即关）；pinned=点击固定（不自动消失，可选中复制）。
+  const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
+  const [pinned, setPinned] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const anchorRef = useRef<HTMLSpanElement | null>(null);
+  const popRef = useRef<HTMLDivElement | null>(null);
+
+  // 固定态下：点浮层与徽标之外关闭；Esc 关闭。
+  useEffect(() => {
+    if (!pinned) return;
+    const onDown = (e: globalThis.MouseEvent) => {
+      const tgt = e.target as Node;
+      if (popRef.current?.contains(tgt) || anchorRef.current?.contains(tgt)) return;
+      setPinned(false);
+      setPos(null);
+    };
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      if (e.key === 'Escape') { setPinned(false); setPos(null); }
+    };
+    document.addEventListener('mousedown', onDown, true);
+    document.addEventListener('keydown', onKey, true);
+    return () => {
+      document.removeEventListener('mousedown', onDown, true);
+      document.removeEventListener('keydown', onKey, true);
+    };
+  }, [pinned]);
+
+  if (!todos || typeof todos.remaining !== 'number' || todos.remaining <= 0) return null;
+  const total = Number(todos.total ?? 0);
+  const done = Number(todos.done ?? 0);
+  const label = t('sessions.board.todoBadge', { done, total });
+  const title = t('sessions.board.todoBadgeTitle', { remaining: todos.remaining, total, done });
+  const items: Array<{ status: string; text: string }> = Array.isArray(todos.items) ? todos.items : [];
+  const glyph = (s: string) => (s === 'completed' ? '✓' : s === 'in_progress' ? '▶' : '○');
+  // 卡片/列都是 overflow:hidden，纯 CSS 绝对定位浮层会被裁。改用 fixed + 打开时按
+  // 徽标位置定位，再 portal 到 body 逃出裁剪。
+  const locate = (el: HTMLElement) => {
+    const r = el.getBoundingClientRect();
+    setPos({ x: r.left, y: r.bottom + 6 });
+  };
+  // 复制用纯文本清单：每行「[状态] 文字」，含顶部摘要，方便贴到别处。
+  const plainText = (): string => {
+    const mark = (s: string) => (s === 'completed' ? '[x]' : s === 'in_progress' ? '[>]' : '[ ]');
+    const lines = items.map((it, i) => `${mark(it.status)} ${it.text || `#${i + 1}`}`);
+    return `${title}\n${lines.join('\n')}`;
+  };
+  const doCopy = async () => {
+    const text = plainText();
+    try {
+      if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(text);
+      else {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+      }
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // 复制失败静默：用户仍可手动选中浮层文字。
+    }
+  };
+  const showPop = pinned || pos;
+  return (
+    <span
+      ref={anchorRef}
+      className={`session-todo-badge${todos.hasInProgress ? ' active' : ''}${pinned ? ' pinned' : ''}`}
+      tabIndex={0}
+      onMouseEnter={e => { if (!pinned) locate(e.currentTarget); }}
+      onFocus={e => { if (!pinned) locate(e.currentTarget); }}
+      onMouseLeave={() => { if (!pinned) setPos(null); }}
+      onBlur={() => { if (!pinned) setPos(null); }}
+      onClick={e => {
+        e.stopPropagation();
+        if (pinned) { setPinned(false); setPos(null); }
+        else { locate(e.currentTarget); setPinned(true); }
+      }}
+    >
+      {todos.hasInProgress ? <span className="session-todo-dot" aria-hidden="true" /> : null}
+      {label}
+      {showPop && items.length
+        ? createPortal(
+            <div
+              ref={popRef}
+              className={`session-todo-pop${pinned ? ' pinned' : ''}`}
+              role={pinned ? 'dialog' : 'tooltip'}
+              style={{ left: `${pos?.x ?? 0}px`, top: `${pos?.y ?? 0}px` }}
+              onMouseDown={e => e.stopPropagation()}
+            >
+              <div className="session-todo-pop-head">
+                <span className="session-todo-pop-title">{title}</span>
+                {pinned ? (
+                  <button
+                    type="button"
+                    className="session-todo-pop-copy"
+                    onClick={e => { e.stopPropagation(); void doCopy(); }}
+                  >
+                    {copied ? t('sessions.board.todoCopied') : t('sessions.board.todoCopy')}
+                  </button>
+                ) : (
+                  <span className="session-todo-pop-hint">{t('sessions.board.todoClickHint')}</span>
+                )}
+              </div>
+              <div className="session-todo-pop-list">
+                {items.map((it, i) => (
+                  <div key={i} className={`session-todo-pop-item st-${cssToken(it.status)}`}>
+                    <span className="session-todo-pop-glyph" aria-hidden="true">{glyph(it.status)}</span>
+                    <span className="session-todo-pop-text">{it.text || `#${i + 1}`}</span>
+                  </div>
+                ))}
+              </div>
+            </div>,
+            document.body,
+          )
+        : null}
+    </span>
+  );
+}
+
 function LockChip(props: { row: any }): React.JSX.Element | null {
   if (!props.row.locked) return null;
   return <span className="session-lock-badge" title={t('sessions.locked')}>{t('sessions.locked')}</span>;
@@ -353,6 +485,7 @@ function boardSignalLabel(s: any): string {
   if (s.pendingRepo) return t('sessions.board.signalRepo');
   if (s.tuiPromptActive) return t('sessions.board.signalPrompt');
   if (s.status === 'limited') return t('sessions.board.signalLimited');
+  if (s.status === 'stalled') return t('sessions.board.signalStalled');
   return '';
 }
 
@@ -913,7 +1046,7 @@ function SessionsTable(props: {
       case 'cliId':
         return <td data-label={labels.cliId}><span className={`badge cli-${cssToken(row.cliId)}`} title={row.runtimeId && row.runtimeId !== row.cliId ? `${row.cliId} / ${row.runtimeId}` : undefined}>{sessionCliDisplayName(row)}</span></td>;
       case 'status':
-        return <td data-label={labels.status}><StatusBadge status={row.status} /><LockChip row={row} /></td>;
+        return <td data-label={labels.status}><StatusBadge status={row.status} /><TodoBadge row={row} /><LockChip row={row} /></td>;
       case 'chat':
         return <td className="session-location-cell" data-label={labels.chat} title={sessionLocationTitle(row)}>{sessionLocationText(row)}</td>;
       case 'tokenIn':
@@ -1259,6 +1392,7 @@ function BoardCard(props: {
         </div>
         <span className="session-card-status-group">
           <StatusBadge status={row.status} />
+          <TodoBadge row={row} />
           <LockChip row={row} />
         </span>
       </div>
@@ -1876,6 +2010,7 @@ function Drawer(props: {
             </div>
             <span className="drawer-status-line">
               <StatusBadge status={row.status} />
+              <TodoBadge row={row} />
               <LockChip row={row} />
             </span>
             <p><code>{row.sessionId}</code> <CopyButton value={row.sessionId} /></p>
@@ -1970,9 +2105,17 @@ function CreateSessionDialog(props: {
   const [bindWorkingDir, setBindWorkingDir] = useState('');
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
-  const [botQuery, setBotQuery] = useState('');
   const [keepOpen, setKeepOpen] = useState(() => readStoredCreateKeepOpen(windowStorage()));
   const [keptSuccess, setKeptSuccess] = useState<any>(null);
+  const [feedGroups, setFeedGroups] = useState<Array<{ groupId: string; name: string }>>([]);
+  const [feedGroupAppId, setFeedGroupAppId] = useState('');
+  const [feedGroupId, setFeedGroupId] = useState('');
+  const [newFeedGroupName, setNewFeedGroupName] = useState('');
+  const [feedGroupError, setFeedGroupError] = useState('');
+  const [feedGroupLoading, setFeedGroupLoading] = useState(false);
+  const [feedGroupAuthSubmitting, setFeedGroupAuthSubmitting] = useState(false);
+  const [feedGroupAuthUrl, setFeedGroupAuthUrl] = useState('');
+  const [feedGroupCallbackUrl, setFeedGroupCallbackUrl] = useState('');
   const [mentionTrigger, setMentionTrigger] = useState<MentionTrigger | null>(null);
   const [mentionIndex, setMentionIndex] = useState(0);
   const contentRef = useRef<HTMLTextAreaElement>(null);
@@ -1990,12 +2133,90 @@ function CreateSessionDialog(props: {
     setBindWorkingDir('');
     setAdvancedOpen(false);
     setSubmitting(false);
-    setBotQuery('');
     setKeptSuccess(null);
+    setFeedGroupId('');
+    setNewFeedGroupName('');
+    setFeedGroupError('');
+    setFeedGroupAuthUrl('');
+    setFeedGroupCallbackUrl('');
     setMentionTrigger(null);
     setMentionIndex(0);
     nextImageOrdinalRef.current = 1;
   }, [state]);
+
+  useEffect(() => {
+    if (!feedGroupAuthUrl) return;
+    let alive = true;
+    const timer = window.setInterval(() => {
+      void fetch('/api/feed-groups')
+        .then(async response => {
+          const body = await response.json().catch(() => ({}));
+          if (!response.ok || !body.ok || !alive) return;
+          setFeedGroups(Array.isArray(body.groups) ? body.groups : []);
+          setFeedGroupAppId(typeof body.larkAppId === 'string' ? body.larkAppId : '');
+          setFeedGroupError('');
+          setFeedGroupAuthUrl('');
+          setFeedGroupCallbackUrl('');
+        })
+        .catch(() => { /* remote/manual fallback remains visible */ });
+    }, 1_000);
+    return () => { alive = false; window.clearInterval(timer); };
+  }, [feedGroupAuthUrl]);
+
+  useEffect(() => {
+    if (!state || state.loading || state.success) return;
+    let alive = true;
+    setFeedGroupLoading(true);
+    void fetch('/api/feed-groups')
+      .then(async response => {
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok || !body.ok) throw new Error(body.message ?? body.error ?? `HTTP ${response.status}`);
+        if (!alive) return;
+        setFeedGroups(Array.isArray(body.groups) ? body.groups : []);
+        setFeedGroupAppId(typeof body.larkAppId === 'string' ? body.larkAppId : '');
+        setFeedGroupError('');
+      })
+      .catch(error => { if (alive) setFeedGroupError(error instanceof Error ? error.message : String(error)); })
+      .finally(() => { if (alive) setFeedGroupLoading(false); });
+    return () => { alive = false; };
+  }, [state]);
+
+  const openFeedGroupLogin = async (): Promise<void> => {
+    const query = feedGroupAppId ? `?larkAppId=${encodeURIComponent(feedGroupAppId)}` : '';
+    const response = await fetch(`/api/feed-groups/auth-url${query}`);
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok || !body.authUrl) {
+      alert(body.error ?? `HTTP ${response.status}`);
+      return;
+    }
+    setFeedGroupAuthUrl(String(body.authUrl));
+    setFeedGroupCallbackUrl('');
+  };
+
+  const completeFeedGroupLogin = async (callbackUrl: string): Promise<void> => {
+    setFeedGroupAuthSubmitting(true);
+    try {
+      const response = await fetch('/api/feed-groups/oauth-callback', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ callbackUrl: callbackUrl.trim() }),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok || !body.ok) throw new Error(body.message ?? body.error ?? `HTTP ${response.status}`);
+      const groupsResponse = await fetch('/api/feed-groups');
+      const groupsBody = await groupsResponse.json().catch(() => ({}));
+      if (!groupsResponse.ok || !groupsBody.ok) throw new Error(groupsBody.message ?? groupsBody.error ?? `HTTP ${groupsResponse.status}`);
+      setFeedGroups(Array.isArray(groupsBody.groups) ? groupsBody.groups : []);
+      setFeedGroupAppId(typeof groupsBody.larkAppId === 'string' ? groupsBody.larkAppId : '');
+      setFeedGroupError('');
+      setFeedGroupAuthUrl('');
+      setFeedGroupCallbackUrl('');
+    } catch (error) {
+      alert(error instanceof Error ? error.message : String(error));
+    } finally {
+      setFeedGroupAuthSubmitting(false);
+    }
+  };
 
   if (!state) return null;
   if (state.success) {
@@ -2033,11 +2254,6 @@ function CreateSessionDialog(props: {
   const checkedIds = [...selectedBots];
   const leadOptions = checkedIds;
   const nameOf = (id: string) => bots.find(bot => bot.larkAppId === id)?.botName ?? id;
-  const botQueryNorm = botQuery.trim().toLowerCase();
-  const visibleBots = botQueryNorm
-    ? bots.filter(bot =>
-      bot.botName.toLowerCase().includes(botQueryNorm) || bot.larkAppId.toLowerCase().includes(botQueryNorm))
-    : bots;
   const mentionBots = mentionTrigger
     ? filterMentionBots(bots, mentionTrigger.query).slice(0, 8)
     : [];
@@ -2156,6 +2372,9 @@ function CreateSessionDialog(props: {
           leadLarkAppId: mode === 'lead' ? leadLarkAppId : undefined,
           name: name.trim() || undefined,
           bindWorkingDir: bindWorkingDir.trim() || undefined,
+          feedGroupId: feedGroupId || undefined,
+          newFeedGroupName: newFeedGroupName.trim() || undefined,
+          feedGroupAppId: (feedGroupId || newFeedGroupName.trim()) ? feedGroupAppId : undefined,
           images: images.map(image => ({
             name: image.name,
             mimeType: image.mimeType,
@@ -2272,44 +2491,23 @@ function CreateSessionDialog(props: {
         </fieldset>
         <fieldset className="cs-bots">
           <legend>{t('sessions.create.bots')}</legend>
-          {bots.length ? (
-            <>
-              <input
-                className="cs-bot-search"
-                type="search"
-                name="botSearch"
-                placeholder={t('sessions.create.botSearchPlaceholder')}
-                aria-label={t('sessions.create.botSearchPlaceholder')}
-                value={botQuery}
-                onChange={event => setBotQuery(event.currentTarget.value)}
-              />
-              {visibleBots.length ? (
-                <div className="cs-bot-list">
-                  {visibleBots.map(bot => (
-                    <label key={bot.larkAppId} className="cs-bot">
-                      <input
-                        type="checkbox"
-                        name="bot"
-                        value={bot.larkAppId}
-                        checked={selectedBots.has(bot.larkAppId)}
-                        onChange={event => {
-                          const checked = event.currentTarget.checked;
-                          setSelectedBots(prev => {
-                            const next = new Set(prev);
-                            if (checked) next.add(bot.larkAppId);
-                            else next.delete(bot.larkAppId);
-                            if (!next.has(lead)) setLead(next.values().next().value ?? '');
-                            return next;
-                          });
-                        }}
-                      /> <span>{bot.botName}</span>
-                    </label>
-                  ))}
-                </div>
-              ) : <p className="cs-empty">{t('sessions.create.noBotMatch')}</p>}
-              {checkedIds.length ? <small>{t('sessions.create.selectedCount', { n: String(checkedIds.length) })}</small> : null}
-            </>
-          ) : <p className="cs-empty">{t('sessions.create.noBots')}</p>}
+          <BotMultiSelect
+            bots={bots}
+            selected={selectedBots}
+            onToggle={(id, checked) => {
+              setSelectedBots(prev => {
+                const next = new Set(prev);
+                if (checked) next.add(id);
+                else next.delete(id);
+                if (!next.has(lead)) setLead(next.values().next().value ?? '');
+                return next;
+              });
+            }}
+            searchPlaceholder={t('botPicker.searchPlaceholder')}
+            noMatchLabel={t('botPicker.noMatch')}
+            emptyLabel={t('sessions.create.noBots')}
+            selectedCountLabel={n => t('botPicker.selectedCount', { n: String(n) })}
+          />
         </fieldset>
         <fieldset className="cs-mode">
           <legend>{t('sessions.create.mode')}</legend>
@@ -2317,6 +2515,25 @@ function CreateSessionDialog(props: {
           <label><input type="radio" name="mode" value="all" checked={mode === 'all'} onChange={() => setMode('all')} /> {t('sessions.create.modeAll')}</label>
           <small>{t('sessions.create.modeHelp')}</small>
         </fieldset>
+        {feedGroupAuthUrl ? (
+          <div className="feed-group-auth-overlay">
+            <section className="feed-group-auth-card" role="dialog" aria-modal="true" aria-labelledby="session-feed-group-auth-title">
+              <h3 id="session-feed-group-auth-title">授权飞书标签</h3>
+              <p>点击下面的按钮，在飞书页面确认授权。如果 BotMux 与浏览器在同一台电脑，确认后会自动完成授权。如果 BotMux 运行在远程虚拟机上，浏览器会因无法访问本机地址 <code>127.0.0.1:9768</code> 而显示“无法访问”；此时请复制地址栏中的完整链接并粘贴到下方。</p>
+              <button type="button" className="primary feed-group-auth-open" onClick={() => window.open(feedGroupAuthUrl, '_blank', 'noopener')}>跳转飞书授权</button>
+              <label>
+                <span>请把点击授权后的完整链接粘贴在这里</span>
+                <input type="url" value={feedGroupCallbackUrl} placeholder="http://127.0.0.1:9768/callback?code=…&state=…" onChange={event => setFeedGroupCallbackUrl(event.currentTarget.value)} />
+              </label>
+              <div className="actions">
+                <button type="button" onClick={() => { setFeedGroupAuthUrl(''); setFeedGroupCallbackUrl(''); }}>取消</button>
+                <button type="button" className="primary" disabled={!feedGroupCallbackUrl.trim() || feedGroupAuthSubmitting} onClick={() => void completeFeedGroupLogin(feedGroupCallbackUrl)}>
+                  {feedGroupAuthSubmitting ? '正在完成授权…' : '完成授权'}
+                </button>
+              </div>
+            </section>
+          </div>
+        ) : null}
         <fieldset className="cs-lead-row" hidden={mode !== 'lead'}>
           <legend>{t('sessions.create.lead')}</legend>
           <select name="lead" disabled={leadOptions.length === 0} value={leadOptions.includes(lead) ? lead : ''} onChange={event => setLead(event.currentTarget.value)}>
@@ -2351,6 +2568,27 @@ function CreateSessionDialog(props: {
               <span>{t('sessions.create.groupName')}</span>
               <input className="cs-pill-input" type="text" name="name" maxLength={60} placeholder={t('sessions.create.groupNamePlaceholder')} value={name} onChange={event => setName(event.currentTarget.value)} />
             </label>
+            <fieldset className="cs-feed-group">
+              <legend>飞书标签（可选）</legend>
+              <FeedGroupPicker
+                groups={feedGroups}
+                selectedId={feedGroupId}
+                newName={newFeedGroupName}
+                disabled={feedGroupLoading || !!feedGroupError}
+                onChange={(selectedId, newName) => { setFeedGroupId(selectedId); setNewFeedGroupName(newName); }}
+              />
+              <small>展开后可在第一行输入新标签名称，或选择下方已有标签。</small>
+              {feedGroupLoading ? <small>正在读取飞书标签…</small> : null}
+              {feedGroupError ? (
+                <div className="cs-warn">
+                  <small>{feedGroupError}</small>{' '}
+                  <button type="button" disabled={feedGroupAuthSubmitting} onClick={() => void openFeedGroupLogin()}>
+                    {feedGroupAuthSubmitting ? '正在完成授权…' : '立即授权'}
+                  </button>
+                  <small> 授权后会弹窗提示你粘贴回调地址。</small>
+                </div>
+              ) : null}
+            </fieldset>
             <label className="cs-advanced-field">
               <span>{t('sessions.create.workingDir')}</span>
               <input className="cs-pill-input" type="text" name="bindWorkingDir" placeholder="e.g. ~/projects/foo" value={bindWorkingDir} onChange={event => setBindWorkingDir(event.currentTarget.value)} />
@@ -2472,8 +2710,7 @@ function SessionsPage(): React.JSX.Element {
       if (!chatId) continue;
       if (!filters.showUnknownChats && isUnknownChatSession(row)) continue;
       const label = sessionLocationText(row);
-      const existing = options.get(chatId);
-      if (!existing || label < existing) options.set(chatId, label);
+      options.set(chatId, preferChatFilterLabel(options.get(chatId), label, chatId));
     }
     return [...options.entries()]
       .sort((a, b) => a[1].localeCompare(b[1]))
@@ -2820,6 +3057,17 @@ function SessionsPage(): React.JSX.Element {
         if (r.status !== 401) alert(`Close failed: ${body?.error ?? r.status}`);
         return false;
       }
+      // Closed locally, but a remote session was left running (its control plane
+      // could not be verified). The drawer is about to close, so this is the only
+      // moment the operator can be told.
+      const residual = parseCloseResidual(body);
+      if (residual) {
+        alert(closeResidualIsLocal(residual)
+          ? `⚠️ Closed locally, but a credentialed host subtree could NOT be proven terminated: `
+            + `${describeCloseResidual(residual)}. The remote session WAS cancelled — inspect the local host process.`
+          : `⚠️ Closed locally, but the remote session was NOT cancelled: `
+            + `${describeCloseResidual(residual)} — manual cleanup required.`);
+      }
       setSelected(prev => {
         const next = new Set(prev);
         next.delete(row.sessionId);
@@ -2875,7 +3123,7 @@ function SessionsPage(): React.JSX.Element {
       const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/restart`, { method: 'POST' });
       const body = await r.json().catch(() => ({}));
       if (!r.ok || body?.ok === false) {
-        if (r.status !== 401) alert(`${t('sessions.restartFailed')}: ${body?.error ?? r.status}`);
+        if (r.status !== 401) alert(`${t('sessions.restartFailed')}: ${body?.message ?? body?.error ?? r.status}`);
         return false;
       }
       restartCooldownIds.current.add(row.sessionId);
@@ -2966,6 +3214,9 @@ function SessionsPage(): React.JSX.Element {
     setBulkCloseProgress({ done: 0, total: ids.length });
     let done = 0;
     let failed = 0;
+    // Counted separately: a residual is NOT a failure (the row closed) but must
+    // never be folded into the silent success total.
+    const residualIds: string[] = [];
     const queue = [...ids];
     async function worker() {
       while (queue.length) {
@@ -2973,7 +3224,12 @@ function SessionsPage(): React.JSX.Element {
         try {
           const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/close`, { method: 'POST' });
           const body = await r.json().catch(() => ({}));
-          if (!r.ok || body?.ok === false) failed += 1;
+          if (!r.ok || body?.ok === false) {
+            failed += 1;
+          } else {
+            const residual = parseCloseResidual(body);
+            if (residual) residualIds.push(describeCloseResidual(residual));
+          }
         } catch {
           failed += 1;
         } finally {
@@ -2987,6 +3243,14 @@ function SessionsPage(): React.JSX.Element {
     setSelected(new Set());
     refresh();
     if (failed > 0) alert(`Failed: ${failed}/${ids.length}`);
+    if (residualIds.length > 0) {
+      // Fires even when nothing failed — otherwise an all-residual batch is
+      // entirely silent and the operator believes everything is gone. Kind-neutral
+      // (a batch can mix a surviving remote session and a local host subtree); each
+      // label already states which.
+      alert(`⚠️ ${residualIds.length}/${ids.length} closed locally but left a residual `
+        + `requiring manual cleanup: ${residualIds.join(', ')}`);
+    }
   }, [refresh, selected]);
 
   const runBulkLock = useCallback(async (locked: boolean): Promise<void> => {
@@ -3069,6 +3333,17 @@ function SessionsPage(): React.JSX.Element {
         closed: Number(body?.closed ?? 0),
         failed: Number(body?.failed ?? 0),
       }));
+      const idleResiduals = (body?.results ?? [])
+        .filter((item: any) => item?.ok && item?.residual)
+        .map((item: any) => describeCloseResidual(item.residual));
+      if (idleResiduals.length > 0) {
+        // "closed N, failed 0" would otherwise state that everything is gone,
+        // while some rows left a residual (a remote session still running, or a
+        // local host subtree not proven terminated) needing manual cleanup.
+        // Kind-neutral: a batch can mix both, and each label already says which.
+        alert(`⚠️ ${idleResiduals.length} session(s) closed locally but left a residual `
+          + `requiring manual cleanup: ${idleResiduals.join(', ')}`);
+      }
       refresh();
     } catch (e) {
       alert(`${t('sessions.idleCleanupFailed')}: ${e}`);

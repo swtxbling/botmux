@@ -1,3 +1,4 @@
+import { isRemoteCliId } from '../../core/remote-cli-ids.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import type { CliId, ResumableSession } from '../../adapters/cli/types.js';
 import { adoptTargetKey, adoptTargetLabel, type AdoptableSession } from '../../core/session-discovery.js';
@@ -6,7 +7,7 @@ import type { CodexAppThreadSummary } from '../../services/codex-app-threads.js'
 import type { DisplayMode, StreamStatus } from '../../types.js';
 import type { CliUsageLimitState } from '../../utils/cli-usage-limit.js';
 import { t, type Locale } from '../../i18n/index.js';
-import { cardUsageFooterSegment, type CardUsageSnapshot } from './md-card.js';
+import { cardUsageFooterSegment, cardUsageRuntimeSegment, type CardUsageSnapshot } from './md-card.js';
 import { readGlobalConfig } from '../../global-config.js';
 import type { ConfigCardData } from '../../services/bot-config-store.js';
 import { isLocalCliOpenEnabled } from '../../services/local-cli-opener.js';
@@ -15,6 +16,7 @@ import {
   DEFAULT_GRANT_DURATION_MS,
   DEFAULT_GRANT_QUOTA,
   GRANT_DURATION_OPTIONS,
+  MAX_GRANT_QUOTA,
 } from '../../services/grant-policy.js';
 
 /** select_static 里代表「清回默认 / 未设置」的哨兵值（model / lang 下拉用）。 */
@@ -24,7 +26,7 @@ export const CONFIG_UNSET = '__unset__';
 const CONFIG_CARD_BOOLEAN_GROUPS: ReadonlyArray<{ sec: string; keys: readonly string[] }> = [
   { sec: 'card.config.sec.card', keys: ['disableStreamingCard', 'silentTurnReactions', 'writableTerminalLinkInCard', 'privateCard'] },
   { sec: 'card.config.sec.autostart', keys: ['autoStartOnGroupJoin', 'autoStartOnNewTopic'] },
-  { sec: 'card.config.sec.security', keys: ['disableCliBypass', 'restrictGrantCommands'] },
+  { sec: 'card.config.sec.security', keys: ['disableCliBypass', 'restrictGrantCommands', 'p2pOpen'] },
 ];
 
 function configSelect(placeholder: string, initial: string, options: Array<{ text: string; value: string }>, value: Record<string, string>): any {
@@ -44,7 +46,7 @@ function configSubheader(secKey: string, locale?: Locale): any {
 /**
  * 交互配置卡片：`/botconfig`（裸）返回它。按配置页逻辑分区（运行 / 卡片行为 / 主动开工 /
  * 安全·授权），cli·model·lang 用下拉，布尔字段用切换按钮（i18n 文案 + ✅/⬜️），消息额度
- * 用下拉。点一下即改并就地刷新（见 card-handler 的 config_set / config_toggle / config_quota）。
+ * 展示当前值并通过独立输入卡修改。即时项在卡片回调后刷新。
  * 只吃纯数据 {@link ConfigCardData}，不反向依赖 store，避免循环依赖。
  */
 export function buildConfigCard(data: ConfigCardData, locale?: Locale): string {
@@ -78,12 +80,19 @@ export function buildConfigCard(data: ConfigCardData, locale?: Locale): string {
   runSelects.push(configSelect('lang', data.lang ?? CONFIG_UNSET,
     [{ text: def, value: CONFIG_UNSET }, { text: '中文 (zh)', value: 'zh' }, { text: 'English (en)', value: 'en' }],
     { action: 'config_set', field: 'lang', ...locVal }));
-  // 私聊单聊模式：chat（默认，扁平连续会话）| thread（每条 DM 独立会话）。chat 与
-  // 未设等价，故 chat 选项用 unset 哨兵：选它即清字段、回默认（扁平连续 DM），
-  // 避免把字面 'chat' 写进 bots.json（与 dashboard 下拉一致，/botconfig get 重启
-  // 前后一致）。只有显式 'thread'（每条 DM 独立）才是需要落盘的值。
-  runSelects.push(configSelect(t('card.config.p2p.placeholder', undefined, locale), data.p2pMode === 'thread' ? 'thread' : CONFIG_UNSET,
-    [{ text: t('card.config.p2p.chat', undefined, locale), value: CONFIG_UNSET }, { text: t('card.config.p2p.thread', undefined, locale), value: 'thread' }],
+  // 私聊单聊模式：chat（默认，扁平连续会话）| thread（每条 DM 独立会话）| group
+  //（每条 DM 自动建专属会话群）。chat 与未设等价，故 chat 选项用 unset 哨兵：
+  // 选它即清字段、回默认（扁平连续 DM），避免把字面 'chat' 写进 bots.json（与
+  // dashboard 下拉一致，/botconfig get 重启前后一致）。只有显式 'thread' /
+  // 'group' 才是需要落盘的值——回显同样按这三态，已配 group 不再错显为 chat。
+  runSelects.push(configSelect(
+    t('card.config.p2p.placeholder', undefined, locale),
+    data.p2pMode === 'thread' ? 'thread' : data.p2pMode === 'group' ? 'group' : CONFIG_UNSET,
+    [
+      { text: t('card.config.p2p.chat', undefined, locale), value: CONFIG_UNSET },
+      { text: t('card.config.p2p.thread', undefined, locale), value: 'thread' },
+      { text: t('card.config.p2p.group', undefined, locale), value: 'group' },
+    ],
     { action: 'config_set', field: 'p2pMode', ...locVal }));
   elements.push({ tag: 'action', actions: runSelects });
 
@@ -102,15 +111,32 @@ export function buildConfigCard(data: ConfigCardData, locale?: Locale): string {
     elements.push({ tag: 'hr' });
     elements.push(configSubheader(g.sec, locale));
     elements.push({ tag: 'action', actions: btns });
-    // 安全·授权区附带「消息额度」下拉。
+    // 安全·授权区展示当前额度，自由输入放在独立子卡。
+    // v1 form 不能被卡片 patch 稳定重渲染，否则切换其它开关可能变空卡。
     if (g.sec === 'card.config.sec.security') {
-      const qOpts = [
-        { text: t('card.config.quota_off', undefined, locale), value: 'off' },
-        ...['5', '10', '20', '50', '100'].map(n => ({ text: n, value: n })),
-      ];
+      const legacyQuota = data.quota != null && data.quota > MAX_GRANT_QUOTA;
+      elements.push({
+        tag: 'div',
+        text: {
+          tag: 'lark_md',
+          content: data.quota == null
+            ? t('card.config.quota_off', undefined, locale)
+            : legacyQuota
+              ? t('card.config.quota_legacy_note', {
+                quota: data.quota,
+                cardQuota: MAX_GRANT_QUOTA,
+              }, locale)
+              : t('card.config.quota_value', { quota: data.quota }, locale),
+        },
+      });
       elements.push({
         tag: 'action',
-        actions: [configSelect(t('card.config.quota_label', undefined, locale), data.quota == null ? 'off' : String(data.quota), qOpts, { action: 'config_quota', ...locVal })],
+        actions: [{
+          tag: 'button',
+          text: { tag: 'plain_text', content: t('card.config.quota_edit', undefined, locale) },
+          type: 'default',
+          value: { action: 'config_quota_open', ...locVal },
+        }],
       });
     }
   }
@@ -132,6 +158,58 @@ export function buildConfigCard(data: ConfigCardData, locale?: Locale): string {
   return JSON.stringify({
     config: { wide_screen_mode: true },
     header: { template: 'blue', title: { tag: 'plain_text', content: t('card.config.title', { name: data.botName }, locale) } },
+    elements,
+  });
+}
+
+/**
+ * 消息额度输入子卡：接受 1–1000 的任意整数，留空恢复内置策略。
+ * 使用独立新卡承载 v1 form，避免主配置卡的开关 patch 到含 form 的卡体。
+ */
+export function buildConfigQuotaCard(data: ConfigCardData, locale?: Locale): string {
+  const locVal: Record<string, string> = locale ? { loc: locale } : {};
+  const legacyQuota = data.quota != null && data.quota > MAX_GRANT_QUOTA;
+  const elements: any[] = [
+    { tag: 'div', text: { tag: 'lark_md', content: t('card.config.quota_input_note', undefined, locale) } },
+  ];
+  if (legacyQuota) {
+    elements.push({
+      tag: 'div',
+      text: {
+        tag: 'lark_md',
+        content: t('card.config.quota_legacy_note', {
+          quota: data.quota ?? '',
+          cardQuota: MAX_GRANT_QUOTA,
+        }, locale),
+      },
+    });
+  }
+  elements.push({
+    tag: 'form',
+    name: 'config_quota_form',
+    elements: [
+      {
+        tag: 'input',
+        name: 'messageQuota',
+        default_value: legacyQuota || data.quota == null ? '' : String(data.quota),
+        placeholder: { tag: 'plain_text', content: t('card.config.quota_input_placeholder', undefined, locale) },
+      },
+      {
+        tag: 'button',
+        text: { tag: 'plain_text', content: t('card.config.save', undefined, locale) },
+        type: 'primary',
+        name: 'config_quota_save',
+        action_type: 'form_submit',
+        value: { action: 'config_quota_save', ...locVal },
+      },
+    ],
+  });
+  return JSON.stringify({
+    config: { wide_screen_mode: true },
+    header: {
+      template: 'blue',
+      title: { tag: 'plain_text', content: t('card.config.quota_input_title', { name: data.botName }, locale) },
+    },
     elements,
   });
 }
@@ -197,6 +275,7 @@ const cliDisplayNames: Record<CliId, string> = {
   'gemini': 'Gemini',
   'genius': 'Genius',
   'opencode': 'OpenCode',
+  'opencode2': 'OpenCode 2',
   'antigravity': 'Antigravity',
   'mtr': 'MTR',
   'hermes': 'Hermes',
@@ -210,6 +289,9 @@ const cliDisplayNames: Record<CliId, string> = {
   'grok': 'Grok Build',
   'kiro-cli': 'Kiro',
   'riff': 'Riff',
+  'reasonix': 'Reasonix',
+  'dsh': 'DeepSeek Harness',
+  'mojo': 'Mojo',
 };
 
 export function getCliDisplayName(cliId: CliId): string {
@@ -222,6 +304,23 @@ export function getCliDisplayName(cliId: CliId): string {
  *  `<at id=…></at>` tag and spoof a mention in a `lark_md` body. */
 function escapeMd(s: string): string {
   return s.replace(/[*_~`\[\]\\<>]/g, c => `\\${c}`);
+}
+
+/** Sanitize a user-derived string for a `plain_text` HEADER title. Unlike
+ *  {@link escapeMd} (for `lark_md` bodies), a plain_text field renders literally
+ *  — so markdown-escaping would surface visible backslashes, and a raw
+ *  `<at id=…></at>` carried over from the seeding message shows as the literal
+ *  tag text (both seen leaking in the header). Strip mention markup entirely (a
+ *  title should never carry a mention), collapse the whitespace it leaves, and
+ *  drop stray angle brackets so no tag-like text survives. No backslashes: the
+ *  field is not markdown. */
+function plainTitle(s: string): string {
+  return s
+    .replace(/<at\b[^>]*>.*?<\/at>/gis, '') // drop <at ...>…</at> mention markup
+    .replace(/<at\b[^>]*\/?>/gis, '')       // drop any unbalanced <at ...> too
+    .replace(/[<>]/g, '')                    // no stray angle brackets in plain_text
+    .replace(/\s{2,}/g, ' ')
+    .trim();
 }
 
 function sidebarUrl(url: string): string {
@@ -337,7 +436,13 @@ export function buildSessionCard(
       });
     }
   }
-  if (showManageButtons && !adoptMode) {
+  // No restart button for ANY remote CLI: the riff worker refuses the IPC
+  // (dead button), and the mojo worker EXECUTES it — cancelling the remote
+  // session and cold-booting a context-less replacement. The riff-only literal
+  // rendered a live remote-destruction button on mojo cards (fourth-round
+  // review, gate 1); the click handler also guards, this keeps the surface
+  // honest.
+  if (showManageButtons && !adoptMode && !isRemoteCliId(effectiveCliId)) {
     actions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: t('card.btn.restart_cli', { cliName }, locale) },
@@ -363,7 +468,7 @@ export function buildSessionCard(
   const card = {
     config: { wide_screen_mode: true },
     header: {
-      title: { tag: 'plain_text', content: `🖥️ ${cliName} · ${escapeMd(title)}` },
+      title: { tag: 'plain_text', content: `🖥️ ${cliName} · ${plainTitle(title)}` },
       template: 'blue',
     },
     elements: [
@@ -430,6 +535,66 @@ export function buildSessionClosedCard(
     ],
   };
   return JSON.stringify(card);
+}
+
+/** Parent-topic panel for `/fork <task>`. Links and live/closed state are
+ *  resolved by the command layer; this function only renders the card. */
+export function buildForkPanelCard(
+  children: Array<{ instruction: string; status: 'active' | 'closed'; link: string }>,
+  locale?: Locale,
+): string {
+  if (children.length === 0) {
+    return JSON.stringify({
+      schema: '2.0',
+      config: { update_multi: true },
+      header: {
+        template: 'purple',
+        title: { tag: 'plain_text', content: t('card.fork_panel.title', undefined, locale) },
+      },
+      body: {
+        direction: 'vertical',
+        elements: [{ tag: 'markdown', content: t('card.fork_panel.empty', undefined, locale) }],
+      },
+    });
+  }
+
+  const rows = children.map(child => ({
+    instruction: child.instruction.replace(/\s*\n+\s*/g, ' ').slice(0, 300) || '—',
+    status: child.status === 'active'
+      ? t('card.fork_panel.running', undefined, locale)
+      : t('card.fork_panel.done', undefined, locale),
+    link: `[${t('card.fork_panel.goto', undefined, locale)}](${child.link})`,
+  }));
+  return JSON.stringify({
+    schema: '2.0',
+    config: { update_multi: true },
+    header: {
+      template: 'purple',
+      title: { tag: 'plain_text', content: t('card.fork_panel.title', undefined, locale) },
+    },
+    body: {
+      direction: 'vertical',
+      elements: [{
+        tag: 'table',
+        page_size: 10,
+        row_height: 'low',
+        header_style: {
+          text_align: 'left',
+          text_size: 'normal',
+          background_style: 'grey',
+          text_color: 'default',
+          bold: true,
+          lines: 1,
+        },
+        columns: [
+          { name: 'instruction', display_name: t('card.fork_panel.col_instruction', undefined, locale), data_type: 'text', width: 'auto' },
+          { name: 'status', display_name: t('card.fork_panel.col_status', undefined, locale), data_type: 'text', width: '90px' },
+          { name: 'link', display_name: t('card.fork_panel.col_link', undefined, locale), data_type: 'lark_md', width: '90px' },
+        ],
+        rows,
+      }],
+    },
+  });
 }
 
 /** Collapse whitespace and clip a discovered-command description for a table cell. */
@@ -662,7 +827,7 @@ export function truncateContent(content: string, locale?: Locale, maxBytes: numb
 const PRIVATE_SNAPSHOT_TEXT_MAX = 50_000;
 
 const STREAM_TEMPLATE_MAP = {
-  starting: 'yellow', working: 'blue', idle: 'green', analyzing: 'purple', limited: 'red', retry_ready: 'green',
+  starting: 'yellow', working: 'blue', idle: 'green', analyzing: 'purple', stalled: 'red', limited: 'red', retry_ready: 'green',
 } as const;
 
 /** Header status label for a streaming/snapshot card. Shared by the live card
@@ -673,6 +838,7 @@ function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState 
     case 'working': return t('card.status.working', undefined, locale);
     case 'idle': return t('card.status.idle', undefined, locale);
     case 'analyzing': return t('card.status.analyzing', undefined, locale);
+    case 'stalled': return t('card.status.stalled', undefined, locale);
     case 'limited': return usageLimit?.retryReady
       ? t('card.status.retry_ready', undefined, locale)
       : t('card.status.limited', undefined, locale);
@@ -708,10 +874,22 @@ function pushStreamBody(
   // cardUsageFooterSegment; a fully-empty snapshot renders nothing.
   const usageSeg = usage ? cardUsageFooterSegment(usage, locale, 'streaming') : null;
   if (usageSeg) {
+    // Usage metrics + runtime identity render as ONE single-line text run in a
+    // single markdown element, joined by ` · ` — not a two-column split. This
+    // reads as "one row": when the content is short it's literally one line;
+    // when it's long it wraps as the CONTINUOUS FLOW of one paragraph, never as
+    // two mis-aligned columns (the column_set variants left the runtime floating
+    // on a second line / left-anchored on mobile, which the user found jarring).
+    // The trade-off the user accepted: on a long line the runtime is not pinned
+    // to the right edge — it simply follows the metrics in reading order. The
+    // runtime self-truncates (model ≤20 chars) so the tail stays compact. No
+    // runtime → the metrics render alone, unchanged.
+    const runtimeSeg = usage ? cardUsageRuntimeSegment(usage, true) : null;
+    const line = runtimeSeg ? `${usageSeg} · ${runtimeSeg}` : usageSeg;
     elements.push({
       tag: 'markdown',
       text_size: 'notation_small_v2',
-      content: `<font color='grey'>${usageSeg}</font>`,
+      content: `<font color='grey'>${line}</font>`,
     });
   }
 }
@@ -847,9 +1025,12 @@ export function buildStreamingCard(
 
   // ── Quick-action keys (only when the screenshot is visible — in text mode
   //    there's no visible cursor/input, so these keys would fire blindly) ──
-  // riff：远端任务后端没有可驱动的终端，PTY 快捷键只会变成内容为控制字符的
-  // follow-up 任务（worker 侧也有同款拒绝守卫），整排隐藏。
-  if (displayMode === 'screenshot' && cliId !== 'riff') {
+  // 远端任务后端（riff / mojo）没有可驱动的终端，PTY 快捷键只会变成内容为控制
+  // 字符的 follow-up 任务（worker 侧也有同款拒绝守卫），整排隐藏。
+  // 用 isRemoteCliId 而非硬编码单个 id：这一处原本只排除了 riff，于是新增 mojo
+  // 后卡片照旧渲染 11 个按钮、点击全部静默无效；改走 REMOTE_CLI_IDS 单一事实源，
+  // 以后再加远端 CLI 不会重复漏改。
+  if (displayMode === 'screenshot' && !isRemoteCliId(cliId)) {
     const mkKey = (label: string, key: string) => ({
       tag: 'button',
       text: { tag: 'plain_text', content: label },
@@ -882,7 +1063,7 @@ export function buildStreamingCard(
   const card = {
     config: { wide_screen_mode: true },
     header: {
-      title: { tag: 'plain_text', content: `🖥️ ${cliName}${serviceTierBadge ? ` ${serviceTierBadge}` : ''} · ${escapeMd(title)} — ${streamStatusLabel(status, usageLimit, locale)}` },
+      title: { tag: 'plain_text', content: `🖥️ ${cliName}${serviceTierBadge ? ` ${serviceTierBadge}` : ''} · ${plainTitle(title)} — ${streamStatusLabel(status, usageLimit, locale)}` },
       template: STREAM_TEMPLATE_MAP[displayStatus],
     },
     elements,
@@ -987,7 +1168,7 @@ export function buildPrivateSnapshotCard(
   const card = {
     config: { wide_screen_mode: true },
     header: {
-      title: { tag: 'plain_text', content: `🔒 ${cliName} · ${escapeMd(title)} — ${streamStatusLabel(status, usageLimit, locale)}` },
+      title: { tag: 'plain_text', content: `🔒 ${cliName} · ${plainTitle(title)} — ${streamStatusLabel(status, usageLimit, locale)}` },
       template: STREAM_TEMPLATE_MAP[displayStatus],
     },
     elements,

@@ -8,17 +8,19 @@
  * OAuth login via /login command writes to botmux's own token file.
  * Auto-refreshes expired access_token using refresh_token.
  */
-import { readFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, mkdirSync, existsSync, unlinkSync, readdirSync } from 'node:fs';
 import { atomicWriteFileSync } from './atomic-write.js';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { logger } from './logger.js';
 import { type Brand, larkHosts } from '../im/lark/lark-hosts.js';
+import { readGlobalConfig } from '../global-config.js';
 
 // ─── Token paths ──────────────────────────────────────────────────────────────
 
 const TOKEN_DIR = join(homedir(), '.botmux', 'data');
+const PENDING_DIR = join(TOKEN_DIR, 'oauth-pending');
 /** 旧版单文件（升级前都是单 feishu bot）。仅作向后兼容读取，不再写入。 */
 const LEGACY_TOKEN_PATH = join(TOKEN_DIR, 'user-token.json');
 const BUFFER_MS = 60_000; // 60s safety margin before expiry
@@ -72,6 +74,48 @@ interface PendingLogin {
 }
 
 const pendingLogins = new Map<string, PendingLogin>(); // keyed by state
+
+function pendingPath(state: string): string | null {
+  return /^[a-f0-9]{64}$/.test(state) ? join(PENDING_DIR, `${state}.json`) : null;
+}
+
+/** Persist pending OAuth state so Dashboard and daemon processes can finish
+ * each other's authorization flow. Files contain app credentials and are
+ * therefore always mode 0600 and removed immediately after consumption. */
+function savePendingLogin(pending: PendingLogin): void {
+  const path = pendingPath(pending.state);
+  if (!path) return;
+  mkdirSync(PENDING_DIR, { recursive: true, mode: 0o700 });
+  atomicWriteFileSync(path, JSON.stringify(pending), { mode: 0o600 });
+}
+
+function loadPendingLogin(state: string): PendingLogin | null {
+  const path = pendingPath(state);
+  if (!path) return null;
+  try {
+    const pending = JSON.parse(readFileSync(path, 'utf8')) as PendingLogin;
+    if (pending.state !== state || Date.now() - pending.createdAt > 5 * 60_000) return null;
+    return pending;
+  } catch {
+    return null;
+  }
+}
+
+function removePendingLogin(state: string): void {
+  const path = pendingPath(state);
+  if (!path) return;
+  try { unlinkSync(path); } catch { /* already absent */ }
+}
+
+function cleanupPendingLogins(): void {
+  try {
+    for (const name of readdirSync(PENDING_DIR)) {
+      const state = name.endsWith('.json') ? name.slice(0, -5) : '';
+      const pending = loadPendingLogin(state);
+      if (!pending) removePendingLogin(state);
+    }
+  } catch { /* directory absent */ }
+}
 
 // ─── Token I/O ────────────────────────────────────────────────────────────────
 
@@ -223,12 +267,38 @@ export const DOC_COMMENT_OAUTH_SCOPES = [
 ];
 
 /**
+ * 会话群标签（p2pMode=group + feedGroup）专用的额外 OAuth scope。飞书「消息分组」
+ * 是用户个人侧边栏数据，只认 user_access_token —— 与 DOC_COMMENT_OAUTH_SCOPES
+ * 同理**不进**通用 /login 的 DEFAULT_SCOPES。使用前需在开发者后台为该 app 启用
+ * 这两个用户 scope（见 setup/lark-scopes.json）。
+ */
+export const FEED_GROUP_OAUTH_SCOPES = [
+  'im:feed_group_v1:write',  // 创建/改名标签、把会话群挂进标签
+  'im:feed_group_v1:read',   // 查询标签与成员（校验/去重）
+];
+
+/**
+ * Resolve the OAuth redirect_uri. With global-config `oauthRedirectBase` set
+ * (typically the host's dashboard origin), auth flows redirect to the
+ * dashboard's `/oauth/callback` receiver and complete automatically; without
+ * it, the legacy localhost paste-back address is used. The chosen URI must be
+ * registered in the app's console redirect-URL whitelist either way.
+ */
+export function resolveOAuthRedirectUri(): string {
+  try {
+    const base = readGlobalConfig().oauthRedirectBase?.trim().replace(/\/+$/, '');
+    if (base && /^https?:\/\//.test(base)) return `${base}/oauth/callback`;
+  } catch { /* fall through to legacy */ }
+  return `http://127.0.0.1:${DEFAULT_PORT}/callback`;
+}
+
+/**
  * Generate an OAuth authorization URL. Returns the URL and stores pending state.
  * Called by /login command handler.
  */
 export function generateAuthUrl(appId: string, appSecret: string, brand: Brand = 'feishu', extraScopes: string[] = []): { authUrl: string; state: string } {
   const state = randomBytes(32).toString('hex');
-  const redirectUri = `http://127.0.0.1:${DEFAULT_PORT}/callback`;
+  const redirectUri = resolveOAuthRedirectUri();
 
   // 基础 scope + 调用方按需追加（去重）。文档订阅入口会带 DOC_COMMENT_OAUTH_SCOPES。
   const scope = [...new Set([...DEFAULT_SCOPES.split(' '), ...extraScopes])].join(' ');
@@ -252,13 +322,68 @@ export function generateAuthUrl(appId: string, appSecret: string, brand: Brand =
     brand,
     createdAt: Date.now(),
   });
+  savePendingLogin(pendingLogins.get(state)!);
 
   // Clean up stale pending logins
   for (const [s, p] of pendingLogins) {
     if (Date.now() - p.createdAt > 5 * 60_000) pendingLogins.delete(s);
   }
+  cleanupPendingLogins();
 
   return { authUrl, state };
+}
+
+/** Structured callback outcome for programmatic receivers (dashboard IPC).
+ *  `matched=false` means the state belongs to another daemon process — the
+ *  caller should try the next one rather than reporting failure. */
+export interface CallbackHandleResult {
+  matched: boolean;
+  ok: boolean;
+  message: string;
+}
+
+/**
+ * Structured variant of handleCallbackUrl. Returns null when the URL is not a
+ * callback at all; `{matched:false}` when the state is not pending in THIS
+ * process (another daemon may own it).
+ */
+export async function tryHandleCallbackUrl(url: string): Promise<CallbackHandleResult | null> {
+  const hasCode = /[?&]code=([^&]+)/.test(url);
+  const hasState = /[?&]state=([^&]+)/.test(url);
+  if (!hasCode || !hasState) return null;
+  const state = decodeURIComponent(/[?&]state=([^&]+)/.exec(url)![1]);
+  // Match-check from the SAME sources handleCallbackUrl consumes: in-memory
+  // pending map OR the persisted pending-login file. The auth link may have
+  // been generated by another process / module instance (dashboard broadcast
+  // fans the callback out to every daemon), so a memory-only precheck would
+  // reject perfectly valid disk-backed states (PR review).
+  if (!(pendingLogins.get(state) ?? loadPendingLogin(state))) {
+    return { matched: false, ok: false, message: 'state not pending for this app' };
+  }
+  const message = await handleCallbackUrl(url);
+  if (message === null) return null;
+  return { matched: true, ok: message.startsWith('✅'), message };
+}
+
+/**
+ * Feed-group authorization status for the dashboard's session-group tag UI:
+ * authorized = a stored token for this app carries the feed-group write scope
+ * and is still usable (valid or refreshable).
+ */
+export function getFeedGroupAuthStatus(appId: string, brand: Brand = 'feishu'): { authorized: boolean; expiresAt?: string } {
+  try {
+    const loaded = loadTokenForApp(appId, brand);
+    if (!loaded) return { authorized: false };
+    const token = loaded.token;
+    const scopes = (token.scope ?? '').split(/\s+/);
+    if (!scopes.includes('im:feed_group_v1:write')) return { authorized: false };
+    const refreshable = token.refresh_expires_at && new Date(token.refresh_expires_at) > new Date();
+    const valid = token.expires_at && new Date(token.expires_at) > new Date();
+    if (!valid && !refreshable) return { authorized: false };
+    return { authorized: true, expiresAt: token.refresh_expires_at || token.expires_at };
+  } catch {
+    return { authorized: false };
+  }
 }
 
 /**
@@ -274,12 +399,13 @@ export async function handleCallbackUrl(url: string): Promise<string | null> {
   const code = decodeURIComponent(match[1]);
   const state = decodeURIComponent(stateMatch[1]);
 
-  const pending = pendingLogins.get(state);
+  const pending = pendingLogins.get(state) ?? loadPendingLogin(state);
   if (!pending) {
     return '❌ 授权失败：state 不匹配或已过期，请重新执行 /login';
   }
 
   pendingLogins.delete(state);
+  removePendingLogin(state);
 
   // Exchange code for token
   try {

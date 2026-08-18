@@ -7,7 +7,7 @@ import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { readFileSync, readdirSync, mkdirSync, existsSync, realpathSync, unlinkSync } from 'node:fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { ensureSkills, ensureAskSkill, ensurePluginSkills, ensureWhiteboardSkill, removeGlobalBotmuxSkills } from '../skills/installer.js';
 import { shouldInstallGlobalSkills } from '../skills/injection-mode.js';
 import { whiteboardEnabled } from '../services/whiteboard-store.js';
@@ -15,6 +15,7 @@ import { cliSupportsNativeUsage } from '../services/transcript-resolver.js';
 import { cleanupTraexAskHooks, installHook } from '../adapters/hook-installer.js';
 import { hookCommandFor } from '../adapters/hook-command.js';
 import { randomBytes, randomUUID } from 'node:crypto';
+import { mayRestoreWriteAdmission } from '../adapters/backend/destroy-result.js';
 import { config } from '../config.js';
 import { readGlobalConfig } from '../global-config.js';
 import * as sessionStore from '../services/session-store.js';
@@ -25,12 +26,30 @@ import {
   markMessageListenerRunPreviewRunning,
 } from '../services/message-listener-run-preview-store.js';
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
-import { fallbackTurnId, isSubstituteTurn } from './reply-target.js';
+import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn } from './reply-target.js';
 import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, MessageWithdrawnError } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { codexServiceTierBadge } from '../services/codex-service-tier.js';
+import { codexModelSupportsReasoningEffort, isCodexReasoningCliId } from '../services/codex-reasoning-effort.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
-import { hashUrlForLog, cancelRiffTaskById } from '../adapters/backend/riff-backend.js';
+import { hashUrlForLog } from '../adapters/backend/riff-backend.js';
+import { cancelMojoSessionById } from '../adapters/backend/mojo-backend.js';
+import { hasUnprovenContainment } from './mojo-containment.js';
+import { MOJO_EXPLICIT_CLOSE_RESULT_TIMEOUT_MS } from '../adapters/backend/mojo-budgets.js';
+import {
+  buildEffectiveMojoConfig,
+  diffMojoSessionIdentity,
+  MOJO_IDENTITY_KEYS,
+  pickMojoLivePatch,
+  isMojoRemoteGone,
+  mojoUnprovableEnvKeys,
+  pickMojoSessionIdentity,
+  type EffectiveMojoConfig,
+  type MojoConfig,
+  type MojoLivePatch,
+} from '../adapters/backend/mojo-types.js';
+import { sanitizePerBotEnv } from './per-bot-env.js';
+import { closeResidualClause } from './close-residual.js';
 import { logger } from '../utils/logger.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import {
@@ -47,6 +66,7 @@ import { claudeJsonlPathForSession } from '../adapters/cli/claude-code.js';
 import { findUniqueClaudeSessionByCwd } from './session-discovery.js';
 import {
   buildMarkdownCard,
+  buildCanonicalFinalReplyCard,
   buildContextualReplyCard,
   type CardUsageSnapshot,
   type LocalHomeLinkMode,
@@ -64,10 +84,15 @@ import {
   isStrongManagedHerdrAgentName,
   managedHerdrAgentName,
 } from '../adapters/backend/session-backend-selector.js';
-import { isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, persistentSessionName, killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, resolvePairedSpawnBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
-import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, resolveUsageDisplay } from '../bot-registry.js';
+import { isRemoteBackendSession, isRemoteBackendType, isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, persistentSessionName, killPersistentBackendTarget, killPersistentSession, managedTargetsForCliChange, probePersistentBackendTarget, resolvePairedSpawnBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
+import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
+import { recordQuarantinedLauncherEnvKeys } from './mojo-launcher-env-quarantine.js';
+import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
+import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay } from '../bot-registry.js';
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
+import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
+import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from '../services/feedback-policy-resolver.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
  *  isolated persistent panes so a suspend→resume reattach (same id) is
@@ -77,6 +102,19 @@ const restartCoordinator = new RestartCoordinator();
 const lifecycleRetiringWorkers = new WeakMap<DaemonSession, Set<ChildProcess>>();
 const transferRetiringWorkers = new WeakSet<ChildProcess>();
 
+/** 在完整 Worker 模块加载前接住首条 IPC，避免冷启动耗时被误判为投递失败。 */
+function workerForkExecArgv(): string[] {
+  const preloadPath = join(__dirname, '..', 'worker-ipc-preload.js');
+  return [...process.execArgv, '--import', pathToFileURL(preloadPath).href];
+}
+
+/** Secondary index of the same retirements by session id: the WeakMap above is
+ *  keyed by ds OBJECT and not iterable, but the VC fence's producer-liveness
+ *  gate must find a dying process after the registry entry (and possibly the
+ *  ds reference itself) is gone. Entries release on worker exit, so the map
+ *  stays bounded by in-flight retirements. */
+const lifecycleRetiringBySessionId = new Map<string, Set<ChildProcess>>();
+
 function trackLifecycleRetirement(ds: DaemonSession, worker: ChildProcess): void {
   let workers = lifecycleRetiringWorkers.get(ds);
   if (!workers) {
@@ -85,18 +123,87 @@ function trackLifecycleRetirement(ds: DaemonSession, worker: ChildProcess): void
   }
   if (workers.has(worker)) return;
   workers.add(worker);
+  const sessionId = ds.session.sessionId;
+  let byId = lifecycleRetiringBySessionId.get(sessionId);
+  if (!byId) {
+    byId = new Set();
+    lifecycleRetiringBySessionId.set(sessionId, byId);
+  }
+  byId.add(worker);
   const release = (): void => {
     const current = lifecycleRetiringWorkers.get(ds);
     current?.delete(worker);
     if (current?.size === 0) lifecycleRetiringWorkers.delete(ds);
+    const currentById = lifecycleRetiringBySessionId.get(sessionId);
+    currentById?.delete(worker);
+    if (currentById?.size === 0) lifecycleRetiringBySessionId.delete(sessionId);
   };
   worker.once('exit', release);
+}
+
+/**
+ * Retiring worker processes for a session id — for liveness gates that outlive
+ * the registry entry. A collision loser (or any process-only retirement) is
+ * deleted from the registry while its process is still dying; a VC fence armed
+ * in that window would otherwise find no ds, skip its producer-liveness gate,
+ * and clear on pane probes alone (fifth-round review, A1 residual).
+ */
+export function retiringWorkersForSession(sessionId: string): ChildProcess[] {
+  return [...(lifecycleRetiringBySessionId.get(sessionId) ?? [])];
 }
 
 function clearLifecycleRetirement(ds: DaemonSession, worker: ChildProcess): void {
   const workers = lifecycleRetiringWorkers.get(ds);
   workers?.delete(worker);
   if (workers?.size === 0) lifecycleRetiringWorkers.delete(ds);
+  const byId = lifecycleRetiringBySessionId.get(ds.session.sessionId);
+  byId?.delete(worker);
+  if (byId?.size === 0) lifecycleRetiringBySessionId.delete(ds.session.sessionId);
+}
+
+/**
+ * Start a new worker generation's launcher-env ledger.
+ *
+ * The previous generation's keys are PARKED, never dropped — and deliberately
+ * WITHOUT consulting whether that worker has exited.
+ *
+ * A worker exit does not prove the dangerous process is gone, and the dangerous
+ * env acts on the mojo CLI *child*, not on the worker that parents it:
+ *   - `MojoBackend.kill()` sends a bare `SIGTERM`, nulls its handle and reports
+ *     `exitCb(0)` immediately — no SIGKILL escalation, no wait. A child that
+ *     traps/ignores TERM, or is slow, survives it.
+ *   - the worker's close path then runs `killCli()` and `process.exit(0)` without
+ *     awaiting the child, so worker exit can precede child death.
+ *   - a mojo child may also have detached descendants, so even a per-PID exit
+ *     proof would not cover the process tree.
+ * `PATH`-substituted launchers and `LD_PRELOAD` hooks live in exactly that child,
+ * which is what holds the activated device credential.
+ *
+ * So the ledger is monotonic for the life of this DaemonSession: it disappears
+ * only when the session ends or the daemon restarts (it is in-memory), never on
+ * an exit signal we cannot verify. A stricter alternative — escalating to SIGKILL
+ * and waiting for process-GROUP quiescence before releasing — is the only way to
+ * make release sound, and is deliberately out of scope here: it needs new
+ * teardown machinery and would still have to cover descendants, whereas monotonic
+ * retention is fail-closed by construction.
+ *
+ * Cost: a session that was ever handed a dangerous launcher env stays
+ * unprovable until it ends. That is an availability trade, not a credential leak.
+ *
+ * Exported so the behavioural guards can assert this directly — deleting the
+ * three call sites used to leave every test green.
+ */
+export function startNewGenerationEnvLedger(
+  ds: DaemonSession,
+  initEnv: Record<string, string> | undefined,
+): void {
+  const parked = new Set([
+    ...(ds.mojoRetiringUnprovableEnvKeys ?? []),
+    ...(ds.mojoAppliedUnprovableEnvKeys ?? []),
+  ]);
+  ds.mojoRetiringUnprovableEnvKeys = parked.size > 0 ? [...parked] : undefined;
+  ds.mojoAppliedUnprovableEnvKeys = undefined;
+  rememberAppliedUnprovableEnvKeys(ds, initEnv);
 }
 
 /** Symmetric lifecycle fence: relay must not start while another operation is
@@ -118,7 +225,7 @@ function daemonCardLocalHomeLinkMode(ds: DaemonSession): LocalHomeLinkMode {
   // worker after riff reconciliation; fall back to persisted session metadata
   // while restoring sessions that do not yet have an initConfig.
   const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
-  return backendType === 'riff'
+  return (backendType !== undefined && isRemoteBackendType(backendType))
     || ds.session.sandbox === true
     || ds.initConfig?.readIsolation === true
     || sandboxEnabled()
@@ -204,14 +311,40 @@ export function getDaemonStreamingCardUsageSnapshot(
   effectiveCliId?: CliId,
   opts?: { fresh?: boolean },
 ): CardUsageSnapshot {
+  // Runtime identity is derived from in-memory fields only, so it is available
+  // without reading the transcript. The disk read (getDaemonSessionUsageSnapshot)
+  // is deferred until we know usage will actually render — a footer/off bot must
+  // not pay a per-tick transcript parse just to throw the tokens away.
+  const runtimeModel = ds.activeModel?.trim() || ds.session.model?.trim();
+  const reasoningEffort = ds.activeReasoningEffort?.trim()
+    || ds.session.reasoningEffort?.trim();
   try {
     if (resolveUsageDisplay(ds.larkAppId) !== 'streaming') {
-      return { context: null, tokens: null };
+      return {
+        context: null,
+        tokens: null,
+        ...(runtimeModel ? { model: runtimeModel } : {}),
+        ...(reasoningEffort ? { reasoningEffort } : {}),
+      };
     }
   } catch {
     // Missing runtime config → default 'streaming' → show usage (best-effort).
   }
-  return getDaemonSessionUsageSnapshot(ds, effectiveCliId, { fresh: opts?.fresh ?? false });
+  const snapshot = getDaemonSessionUsageSnapshot(
+    ds,
+    effectiveCliId,
+    { fresh: opts?.fresh ?? false },
+  );
+  // Model comes only from an explicitly-wired executor runtime (TRAE/Codex set
+  // ds.activeModel from their rollout settings) or the user-configured launch
+  // model — never snapshot.tokens.model. That field is the RAW transcript model
+  // and for relay-style CLIs is an internal routing code (e.g. `ark/relay-code`)
+  // that must not surface on a user card.
+  return {
+    ...snapshot,
+    ...(runtimeModel ? { model: runtimeModel } : {}),
+    ...(reasoningEffort ? { reasoningEffort } : {}),
+  };
 }
 
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
@@ -225,8 +358,41 @@ import type { CliId } from '../adapters/cli/types.js';
 import { isStructuredBridgeAdoptCli } from '../services/structured-bridge-clis.js';
 import { resolveEffectivePluginIds } from './plugins/effective.js';
 import { ensureGatewayEntry } from './plugins/mcp/gateway-installer.js';
-import type { CliTurnPayload, CodexAppTurnInput, DaemonToWorker, WorkerToDaemon, Session, DisplayMode } from '../types.js';
-import { activeSessionKey, sessionKey, sessionAnchorId, storedSessionAnchorId, isDocNativeSession, larkTransportEnabled, type DaemonSession } from './types.js';
+import { readPeerCrossRef } from '../services/peer-cross-ref-store.js';
+import type {
+  CliTurnPayload,
+  CodexAppDeliverySink,
+  CodexAppDispatchLedgerEntry,
+  CodexAppGenerationCommit,
+  CodexAppTurnInput,
+  FrozenSessionReplyTarget,
+  DaemonToWorker,
+  WorkerToDaemon,
+  Session,
+  DisplayMode,
+  QueuedActivationTailEntry,
+} from '../types.js';
+import {
+  appendAcceptedCodexAppDispatch,
+  cancelCodexAppDispatch,
+  committedCodexAppSequence,
+  hasUnsettledCodexAppDispatch,
+  prepareCodexAppDispatch,
+  retryPreparedCodexAppDispatch,
+  retainFreshCodexAppGeneration,
+  settleCodexAppDispatch,
+} from '../utils/codex-app-dispatch-ledger.js';
+import {
+  activeSessionKey,
+  sessionKey,
+  sessionAnchorId,
+  storedSessionAnchorId,
+  isDocNativeSession,
+  larkTransportEnabled,
+  remoteRetirementAdmissionPhase,
+  type DaemonSession,
+} from './types.js';
+import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { DONE_REACTION_EMOJI_TYPE } from './pending-response.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { prependBotmuxBin, resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
@@ -264,6 +430,12 @@ import {
 import { acknowledgeSessionReady } from './session-ready-handshake.js';
 import { recordDispatchInputCommit } from './dispatch.js';
 import { sendWorkerIpc } from './worker-ipc.js';
+import { cleanupExplicitSessionBacking } from './explicit-session-backing-cleanup.js';
+import { REMOTE_ADMISSION_RESTORE_TIMEOUT_MS } from './shutdown-budgets.js';
+import {
+  managedOriginCapabilityPath,
+  replaceManagedOriginCapabilityFile,
+} from './managed-origin-capability.js';
 
 type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
 
@@ -286,13 +458,47 @@ const WORKER_SIGKILL_BACKSTOP_MS = 7_000;
 const CLOSE_FENCE_WARN_MS = 8_000;
 // Peer relay waits 5s for the whole transfer request. Tmux observer detach has
 // its own 3s command timeout, so this fence leaves headroom for routing/fork.
+// This tight default is load-bearing ONLY for the cross-daemon `/relay --create`
+// peer path (dashboard-ipc-server migrate-to-chat), whose transfer must finish
+// inside the leader's 5s HTTP abort — otherwise the peer commits the move after
+// the leader already reported failure (split-brain; see the busy-refuse comment
+// in transferSession). In-process callers have no such ceiling.
 const TRANSFER_DETACH_FENCE_MS = 3_500;
+// In-process picker relay (card-handler relay_confirm) runs with no HTTP abort
+// above it — its card ACK already degrades to a background "处理中" toast at 2.5s
+// and the real result is delivered as a visible message. So it can afford a
+// larger fence as a last-resort safety net. The COMMON hang, however, is not a
+// slow teardown — it's the worker ACKing the detach in ~9ms but then wedging in
+// node-pty's native process-exit teardown (a still-open web-terminal client PTY
+// blocks `process.exit()` in the reader-thread join; the JS event loop is
+// already stopped so the worker cannot self-rescue). We handle that below by
+// force-killing the worker once its ACK proves the observer already detached, so
+// this fence only bounds the pathological "no ACK at all" case.
+export const TRANSFER_DETACH_FENCE_PICKER_MS = 8_000;
+// Grace after the worker's transfer_detached ACK before the daemon force-kills
+// it. The ACK proves killCli({preserveSandbox:true}) already ran — backend
+// detached, CLI/tmux/sandbox left intact for the replacement — so the ACKed
+// worker process is disposable. Give it a brief window to exit cleanly on its
+// own; if node-pty's exit teardown wedges it (the real bug), SIGKILL it rather
+// than stranding the transfer behind the full fence. Short because a healthy
+// worker exits within a few ms of the ACK.
+const TRANSFER_DETACH_POST_ACK_KILL_MS = 300;
 const TRANSFER_FORCE_EXIT_MS = 500;
-const WORKER_REDACTED_ENV_KEYS = ['GITHUB_TOKEN', 'GH_TOKEN'] as const;
+// Keys the daemon must NOT propagate into a forked worker. GH tokens are the
+// bot's, not the agent's. BOTMUX_PM2_GRACEFUL_EXIT_CODE is pm2's private
+// graceful-exit sentinel for the daemon/dashboard cores only (see
+// pm2-graceful-exit.ts): a worker (or the CLI child it forks — redactChildEnv
+// strips it there too) that inherited it would exit 90 instead of 0 on a
+// clean foreground stop, which a supervisor reads as a crash.
+const WORKER_REDACTED_ENV_KEYS = ['GITHUB_TOKEN', 'GH_TOKEN', 'BOTMUX_PM2_GRACEFUL_EXIT_CODE'] as const;
 
 function workerForkEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
   for (const key of WORKER_REDACTED_ENV_KEYS) delete env[key];
+  // Defense in depth for a daemon started from a contaminated PM2 snapshot.
+  // Genuine workflow workers bypass this pool and receive their markers from
+  // workflows/v3/ephemeral-pool.ts.
+  scrubWorkflowWorkerEnv(env);
   return env;
 }
 
@@ -315,6 +521,8 @@ export interface WorkerSessionReplyOptions {
    * share a visible chat anchor with ordinary sessions, so the anchor alone
    * cannot identify the transcript/lifecycle owner. */
   sourceSessionId?: string;
+  /** Exact daemon-frozen destination for a durable turn. */
+  replyTarget?: FrozenSessionReplyTarget;
   /** Automatic VC delivery presentation. Explicit human IM replies omit this
    * and continue to follow their quote/thread context. */
   placement?: 'auto' | 'chat' | 'topic';
@@ -332,8 +540,11 @@ export interface WorkerPoolCallbacks {
   ) => Promise<string>;
   getSessionWorkingDir: (ds?: DaemonSession) => string;
   getActiveCount: () => number;
-  /** Close a stale session (message withdrawn, etc.) */
-  closeSession: (ds: DaemonSession) => void;
+  /** Close a stale session (message withdrawn, etc.). `false` means the
+   * authoritative close failed and the active owner must remain retryable.
+   * `void` is retained for older embedders/tests that implement a synchronous
+   * best-effort close; the production daemon always returns an exact boolean. */
+  closeSession: (ds: DaemonSession) => boolean | void | Promise<boolean | void>;
   /** Re-check the per-bot resident-session cap after a process starts or an
    * over-cap busy session becomes idle. Optional for unit-test callers. */
   enforceLiveSessionCap?: () => void;
@@ -382,6 +593,19 @@ export interface WorkerPoolCallbacks {
       disposition: 'queued_removed' | 'cli_fenced';
     },
   ) => void;
+  /** Called only after a durable ledger mutation was persisted and its worker
+   * ACK was attempted. Runtime CLI-mismatch cleanup may now close the old
+   * generation without abandoning a FIFO entry. */
+  onCodexAppLedgerDrained?: (ds: DaemonSession) => void | Promise<void>;
+  /** The exact queued opening crossed the adapter submission boundary. The
+   * daemon may now release its runtime route reservation and flush follow-ups. */
+  /** Return false only when a buffered follow-up was not accepted and should
+   * be retried. Once accepted, later presentation persistence is best-effort
+   * and must not request a delivery retry. */
+  onQueuedActivationSubmitted?: (
+    ds: DaemonSession,
+    activationToken: string,
+  ) => boolean | void | Promise<boolean | void>;
 }
 
 let callbacks: WorkerPoolCallbacks | undefined;
@@ -404,6 +628,25 @@ function requireCallbacks(): WorkerPoolCallbacks {
 // daemon registers its Map here at boot. Helpers below return a snapshot or
 // linear-scan by sessionId.
 let activeSessionsRegistry: Map<string, DaemonSession> | undefined;
+
+type RemoteWorkerCloseResult = {
+  ok: boolean;
+  taskId?: string;
+  error?: string;
+  /** Absent means `retryable`, the historical behaviour. See SessionDestroyResult. */
+  recovery?: 'retryable' | 'uncertain' | 'irreversible';
+  /** Absent means: derive from `recovery`. See mayRestoreWriteAdmission. */
+  admission?: 'restorable' | 'fenced';
+  /** Local subtree left unproven by an otherwise successful close. Never
+   *  re-derivable here: only the backend saw the evidence grade. */
+  residual?: 'local_subtree_unprovable_on_platform' | 'local_subtree_boundary_unproven';
+};
+
+const pendingRemoteWorkerCloses = new Map<string, {
+  sessionId: string;
+  worker: ChildProcess;
+  resolve: (result: RemoteWorkerCloseResult) => void;
+}>();
 
 export function setActiveSessionsRegistry(m: Map<string, DaemonSession>): void {
   activeSessionsRegistry = m;
@@ -589,6 +832,59 @@ function flushPendingLocalCliOpenReadinessPatch(ds: DaemonSession): void {
   if (!ds.pendingLocalCliButtonRefresh) return;
   ds.pendingLocalCliButtonRefresh = undefined;
   scheduleLocalCliOpenReadinessPatch(ds);
+}
+
+/** PATCH the live card when the executor reports a different active runtime.
+ * Runtime identity stays attached to the streaming usage line. */
+function scheduleActiveRuntimePatch(ds: DaemonSession): void {
+  if (ds.session.vcMeetingReceiver || streamingCardDisabled(ds) || ds.suppressRecoveryCard) {
+    ds.pendingActiveRuntimeCardRefresh = undefined;
+    return;
+  }
+  if (ds.streamCardNonce && ds.parkedStreamCardNonce === ds.streamCardNonce) {
+    ds.pendingActiveRuntimeCardRefresh = undefined;
+    return;
+  }
+  if (ds.streamCardId === CARD_POSTING_SENTINEL) {
+    ds.pendingActiveRuntimeCardRefresh = true;
+    return;
+  }
+  if (!ds.streamCardId || !workerHasInitialized(ds)) {
+    ds.pendingActiveRuntimeCardRefresh = undefined;
+    return;
+  }
+  ds.pendingActiveRuntimeCardRefresh = undefined;
+  const botCfg = getBot(ds.larkAppId).config;
+  const effectiveCliId = sessionCliId(ds, botCfg);
+  const status = ds.usageLimit ? 'limited' : (ds.lastScreenStatus ?? 'starting');
+  const cardJson = buildStreamingCard(
+    ds.session.sessionId,
+    sessionAnchorId(ds),
+    readableTerminalUrlFor(ds),
+    ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
+    ds.lastScreenContent ?? '',
+    status,
+    effectiveCliId,
+    ds.displayMode ?? 'hidden',
+    ds.streamCardNonce,
+    ds.currentImageKey,
+    !!ds.adoptedFrom,
+    false,
+    localeForBot(ds.larkAppId),
+    status === 'limited' ? ds.usageLimit : undefined,
+    writableTerminalLinkFor(ds),
+    isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+    getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
+    sessionRuntimeDisplayName(ds, botCfg),
+    codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+  );
+  scheduleCardPatch(ds, cardJson);
+}
+
+function flushPendingActiveRuntimePatch(ds: DaemonSession): void {
+  if (!ds.pendingActiveRuntimeCardRefresh) return;
+  ds.pendingActiveRuntimeCardRefresh = undefined;
+  scheduleActiveRuntimePatch(ds);
 }
 
 /** PATCH a live card when rollout settings change, even if the PTY is static. */
@@ -845,8 +1141,8 @@ function storedSessionCliDisplayName(ds: DaemonSession): string {
 
 function sessionAgentConfig(
   ds: DaemonSession,
-  botCfg: { cliId: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; wrapperCli?: string; model?: string },
-): { cliId: CliId; cliRuntime?: CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' } {
+  botCfg: { cliId: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' },
+): { cliId: CliId; cliRuntime?: CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' } {
   // Freeze the agent launch config (cli / runtime / cliPath / wrapper / model) onto the
   // session the first time a worker forks, so later bot-level edits never
   // retroactively change a live session — same discipline as `sandbox`.
@@ -879,6 +1175,9 @@ function sessionAgentConfig(
       ?? botCfg.cliPathOverride;
     ds.session.wrapperCli = ds.session.wrapperCli ?? botCfg.wrapperCli;
     ds.session.model = ds.session.model ?? botCfg.model;
+    ds.session.reasoningEffort = isCodexReasoningCliId(ds.session.cliId)
+      ? ds.session.reasoningEffort ?? botCfg.reasoningEffort
+      : undefined;
     ds.session.agentFrozen = true;
     sessionStore.updateSession(ds.session);
   } else {
@@ -909,6 +1208,11 @@ function sessionAgentConfig(
     }
     if (repaired) sessionStore.updateSession(ds.session);
   }
+  if (ds.session.reasoningEffort
+      && !codexModelSupportsReasoningEffort(ds.session.model, ds.session.reasoningEffort)) {
+    ds.session.reasoningEffort = undefined;
+    sessionStore.updateSession(ds.session);
+  }
   return {
     cliId: ds.session.cliId ?? botCfg.cliId,
     cliRuntime: ds.session.cliRuntime,
@@ -919,16 +1223,184 @@ function sessionAgentConfig(
   };
 }
 
+
+export { freezeMojoIdentityForSession } from './mojo-session-identity.js';
+
+/**
+ * Freeze the control-plane identity of every restored mojo session at daemon
+ * startup, instead of waiting for each one's next worker fork.
+ *
+ * The lazy path left a window: after a restart but before a session was next
+ * woken, an operator could change the bot's endpoint/workspace, and the session
+ * would then adopt THAT as its "original" identity — pairing a remote lineage
+ * created on tenant A with tenant B. Migrating during restore closes it, because
+ * restore runs before the dispatcher can deliver a message.
+ *
+ * A legacy row that already holds a remote lineage cannot be migrated safely (no
+ * record of its original control plane), so sessionMojoConfig drops that lineage;
+ * this pass reuses the same helper so both entry points behave identically.
+ */
+export function migrateMojoSessionIdentities(activeSessions: Map<string, DaemonSession>): void {
+  let migrated = 0;
+  for (const ds of activeSessions.values()) {
+    const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
+    if (backendType !== 'mojo') continue;
+    if (ds.session.mojoIdentity) continue;
+    let botCfg;
+    try {
+      botCfg = getBot(ds.larkAppId).config;
+    } catch {
+      // Bot deregistered — no config to freeze from. Leave the row untouched so a
+      // later re-registration can migrate it.
+      continue;
+    }
+    void botCfg;
+    freezeMojoIdentityForSession(ds.session, ds.larkAppId);
+    migrated += 1;
+  }
+  if (migrated > 0) {
+    logger.info(`[mojo] froze the control-plane identity of ${migrated} restored session(s)`);
+  }
+}
+
+/**
+ * READ-ONLY frozen launch identity, for teardown paths that must not mutate the
+ * session (sessionAgentConfig freezes and writes to the session store).
+ *
+ * Reads the values frozen at session creation, exactly like a live spawn would.
+ * Only a legacy session that was never frozen (`agentFrozen` unset) falls back to
+ * the live bot config, mirroring sessionAgentConfig's back-fill.
+ *
+ * This matters for cancelling an orphaned remote session: the remote session was
+ * created through THIS session's wrapper/binary, so cancelling it through a
+ * wrapper the bot gained later can hit the wrong gateway or tenant. And because
+ * `agentFrozen=true` with `wrapperCli=undefined` explicitly means "frozen as
+ * no-wrapper", inheriting a later-added wrapper would break that contract.
+ */
+function frozenSessionLaunchIdentity(
+  ds: DaemonSession,
+  botCfg: { cliPathOverride?: string; wrapperCli?: string },
+): { cliPathOverride?: string; wrapperCli?: string } {
+  if (ds.session.agentFrozen) {
+    return {
+      cliPathOverride: ds.session.cliPathOverride,
+      wrapperCli: ds.session.wrapperCli,
+    };
+  }
+  // Legacy, never frozen: it was launching off the live bot config, so that is
+  // the faithful reconstruction.
+  return {
+    cliPathOverride: ds.session.cliPathOverride ?? botCfg.cliPathOverride,
+    wrapperCli: ds.session.wrapperCli ?? botCfg.wrapperCli,
+  };
+}
+
+/**
+ * Resolve the mojo config a session must run on, freezing its control-plane
+ * identity the first time and honouring that snapshot forever after.
+ *
+ * Split by purpose:
+ *   - identity (cloud / localDaemon / baseUrl / ppeEnv / workspaceId / agentId)
+ *     comes from the FROZEN snapshot. A live edit must not move an existing
+ *     session between execution modes or tenants — a cold resume would continue,
+ *     and `/close` would cancel, against an endpoint that never created it.
+ *   - credentials (jwt / jwtEnv / env) and behaviour knobs (stream /
+ *     systemPrompt / idleTimeoutSec) stay LIVE, so a rotated token takes effect
+ *     and no plaintext JWT is persisted into session state.
+ *
+ * `freeze` is false on read-only paths (workerless cancel) so teardown never
+ * mutates session state; a session that predates this field then simply runs on
+ * live config, exactly as it did before.
+ */
+/**
+ * Resolve the mojo config a session must run on, plus whether its remote lineage
+ * may still be used.
+ *
+ * Returns an explicit state rather than a bare config, because "we have a config"
+ * and "this lineage is safe to resume/cancel" are different questions and
+ * conflating them is what let a cancel reach the wrong tenant:
+ *   - `usable`      — identity is frozen (or freshly frozen); lineage is trusted
+ *   - `quarantined` — legacy row with a remote lineage but no frozen identity.
+ *                     Nothing records which control plane holds it, so it must not
+ *                     be resumed or cancelled automatically.
+ *   - `none`        — legacy row with no lineage at all; nothing at risk.
+ *
+ * Identity (cloud / localDaemon / baseUrl / ppeEnv / workspaceId / agentId) comes
+ * from the FROZEN snapshot; credentials (jwt / jwtEnv / env) and behaviour knobs
+ * stay LIVE so a rotated token takes effect and no plaintext JWT is persisted.
+ *
+ * `freeze` is false on read-only paths (workerless cancel) so teardown never
+ * mutates session state.
+ */
+export function sessionMojoConfig(
+  ds: DaemonSession,
+  botCfg: { mojo?: MojoConfig },
+  opts: { freeze: boolean },
+): { config: MojoConfig; lineage: 'usable' | 'quarantined' | 'none' } {
+  const live = botCfg.mojo ?? {};
+  const liveIdentity = pickMojoSessionIdentity(live);
+
+  if (!ds.session.mojoIdentity) {
+    // Legacy row, never frozen. Delegate to the shared helper rather than
+    // duplicating the freeze/quarantine rules — two copies of this had already
+    // started to drift. `undefined` means "predates this field"; an empty object
+    // means "frozen with nothing configured", which is why the helper persists
+    // `{}` instead of skipping it.
+    if (opts.freeze) {
+      freezeMojoIdentityForSession(ds.session, ds.larkAppId);
+    } else if (ds.session.riffParentTaskId) {
+      // Read-only path (teardown): the row still has an unverifiable lineage and
+      // we must not write, so report it without mutating.
+      return { config: live, lineage: 'quarantined' };
+    }
+    // Fall through: the helper may have frozen an identity just now, so re-derive
+    // the answer from the (possibly updated) row below.
+  }
+
+  if (!ds.session.mojoIdentity) {
+    // Still unfrozen — the bot was deregistered, so there is nothing to freeze
+    // from. Behave as before: usable only if there is no lineage at risk.
+    return {
+      config: live,
+      lineage: ds.session.riffParentTaskId ? 'quarantined' : 'none',
+    };
+  }
+
+  const frozen = ds.session.mojoIdentity;
+  const drift = diffMojoSessionIdentity(frozen, liveIdentity);
+  if (drift.length > 0) {
+    // Loud on purpose: the operator changed the control plane and this session is
+    // deliberately NOT following, which is otherwise invisible.
+    logger.warn(
+      `[${tag(ds)}] mojo control-plane config changed after session creation; `
+      + `keeping the frozen identity (${drift.join(', ')}). `
+      + 'Start a new session to use the new configuration.',
+    );
+  }
+  // Live credentials/behaviour, frozen identity.
+  const merged: Record<string, unknown> = { ...live };
+  for (const key of MOJO_IDENTITY_KEYS) {
+    const value = (frozen as Record<string, unknown>)[key];
+    if (value === undefined) delete merged[key];
+    else merged[key] = value;
+  }
+  // Quarantine is bound to a specific ID, not to the session.
+  //
+  // Once an identity is frozen, any lineage created AFTERWARDS was created on that
+  // known control plane and is therefore trustworthy. Treating the session as
+  // permanently quarantined meant a new session could never be cancelled after its
+  // worker died — it kept consuming cloud sandbox time and holding credentials.
+  // The parked id remains as an audit record only.
+  const active = ds.session.riffParentTaskId;
+  const lineage = active === undefined
+    ? 'none'
+    : (active === ds.session.mojoQuarantinedLineage ? 'quarantined' : 'usable');
+  return { config: merged as MojoConfig, lineage };
+}
+
 function loadKnownBotOpenIdsForApp(larkAppId: string): Set<string> {
   const dataDir = config.session.dataDir;
-  let crossRef: Record<string, string> = {};
-  const crossRefPath = join(dataDir, `bot-openids-${larkAppId}.json`);
-  if (existsSync(crossRefPath)) {
-    const parsed = JSON.parse(readFileSync(crossRefPath, 'utf-8'));
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      crossRef = parsed as Record<string, string>;
-    }
-  }
+  const crossRef = readPeerCrossRef(dataDir, larkAppId);
 
   let botEntries: BotMentionEntry[] = [];
   const botInfoPath = join(dataDir, 'bots-info.json');
@@ -945,7 +1417,7 @@ function loadKnownBotOpenIdsForApp(larkAppId: string): Set<string> {
  *  mircli runner). They can't @-trigger a peer bot themselves, so for bot-to-bot
  *  handoffs the fallback card must carry the real <at> back to the dispatcher. */
 function isRunnerDeliveryCli(cliId?: string): boolean {
-  return cliId === 'mira' || cliId === 'mir';
+  return cliId === 'mira' || cliId === 'mir' || cliId === 'dsh';
 }
 
 function daemonCardFooterRecipientOpenId(ds: DaemonSession, effectiveCliId?: string): string | undefined {
@@ -1164,6 +1636,131 @@ export function recallFrozenCards(ds: DaemonSession): void {
 }
 
 /**
+ * Post the current turn's starting card as soon as the daemon accepts the
+ * inbound message. Terminal redraw is deliberately not part of this trigger:
+ * some CLIs consume a turn without emitting another screen_update, which used
+ * to leave streamCardPending stuck and suppress cards for every later turn.
+ *
+ * Only one POST may be in flight per session. If another turn arrives during
+ * the request, the generation check preserves that newer pending state and
+ * immediately follows with its card after the first POST settles.
+ */
+export async function postTurnStartingCard(
+  ds: DaemonSession,
+  sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string, turnId?: string) => Promise<string>,
+  turnId: string,
+): Promise<boolean> {
+  if (!ds.streamCardPending || ds.streamCardPendingTurnId !== turnId) return false;
+  if (remoteRetirementAdmissionPhase(ds)) return false;
+  if (ds.streamCardId === CARD_POSTING_SENTINEL) return false;
+  if (ds.session.vcMeetingReceiver || streamingCardDisabled(ds, turnId)) return false;
+  if (!workerHasInitialized(ds)) return false;
+  if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) return false;
+
+  const generation = ds.streamCardTurnGeneration ?? 0;
+  const sessionAtPost = ds.session;
+  const larkAppIdAtPost = ds.larkAppId;
+  const anchorAtPost = sessionAnchorId(ds);
+  const registryKeyAtPost = sessionKey(anchorAtPost, larkAppIdAtPost);
+  const botCfg = getBot(ds.larkAppId).config;
+  const effectiveCliId = sessionCliId(ds, botCfg);
+  const previousCardId = ds.streamCardId;
+  const previousNonce = ds.streamCardNonce;
+  // A newer turn may have arrived while the previous turn's POST was still in
+  // flight, so beginNewTurn could not park that sentinel. Park the now-live
+  // predecessor here before replacing its identity.
+  parkStreamCard(ds);
+  const nonce = randomBytes(4).toString('hex');
+  const status = ds.usageLimit ? 'limited' : 'starting';
+  const cardJson = buildStreamingCard(
+    ds.session.sessionId,
+    sessionAnchorId(ds),
+    readableTerminalUrlFor(ds),
+    ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
+    '',
+    status,
+    effectiveCliId,
+    ds.displayMode ?? 'hidden',
+    nonce,
+    undefined,
+    !!ds.adoptedFrom,
+    false,
+    localeForBot(ds.larkAppId),
+    ds.usageLimit,
+    writableTerminalLinkFor(ds),
+    isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+    getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
+    sessionRuntimeDisplayName(ds, botCfg),
+    codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+  );
+
+  ds.streamCardNonce = nonce;
+  ds.streamCardId = CARD_POSTING_SENTINEL;
+  const ownsPostIdentity = (): boolean =>
+    ds.session === sessionAtPost
+    && ds.session.status === 'active'
+    && ds.larkAppId === larkAppIdAtPost
+    && sessionAnchorId(ds) === anchorAtPost
+    && !isSessionTransferring(ds)
+    && ds.streamCardId === CARD_POSTING_SENTINEL
+    && ds.streamCardNonce === nonce
+    && (!activeSessionsRegistry || activeSessionsRegistry.get(registryKeyAtPost) === ds);
+  const stillOwnsPost = (): boolean =>
+    ownsPostIdentity() && remoteRetirementAdmissionPhase(ds) === null;
+  const restorePrePostIdentityForRetirement = (): boolean => {
+    if (remoteRetirementAdmissionPhase(ds) === null || !ownsPostIdentity()) return false;
+    ds.streamCardId = previousCardId;
+    ds.streamCardNonce = previousNonce;
+    persistStreamCardState(ds);
+    return true;
+  };
+  try {
+    const messageId = await sessionReply(
+      anchorAtPost, cardJson, 'interactive', larkAppIdAtPost, turnId,
+    );
+    if (!stillOwnsPost()) {
+      void deleteMessage(larkAppIdAtPost, messageId).catch(() => { /* best-effort stale-card cleanup */ });
+      restorePrePostIdentityForRetirement();
+      logger.info(`[${tag(ds)}] Discarded stale starting card for turn ${turnId.substring(0, 12)}`);
+      return false;
+    }
+    ds.streamCardId = messageId;
+    ds.parkedStreamCardNonce = undefined;
+    const superseded = (ds.streamCardTurnGeneration ?? 0) !== generation;
+    if (!superseded) {
+      ds.streamCardPending = false;
+      ds.streamCardPendingTurnId = undefined;
+    }
+    persistStreamCardState(ds);
+    recallFrozenCards(ds);
+    flushPendingLocalCliOpenReadinessPatch(ds);
+    flushPendingRiffUrlPatch(ds);
+    flushPendingActiveRuntimePatch(ds);
+    flushPendingCodexServiceTierPatch(ds);
+    syncUsageRefreshTimer(ds);
+    logger.info(`[${tag(ds)}] Posted starting card for turn ${turnId.substring(0, 12)}`);
+    if (superseded && ds.streamCardPendingTurnId) {
+      void postTurnStartingCard(ds, sessionReply, ds.streamCardPendingTurnId);
+    }
+    return true;
+  } catch (err) {
+    if (!stillOwnsPost()) {
+      restorePrePostIdentityForRetirement();
+      logger.info(`[${tag(ds)}] Ignored stale starting-card failure for turn ${turnId.substring(0, 12)}`);
+      return false;
+    }
+    ds.streamCardId = previousCardId;
+    ds.streamCardNonce = previousNonce;
+    persistStreamCardState(ds);
+    logger.warn(`[${tag(ds)}] Failed to post starting card for turn ${turnId.substring(0, 12)}: ${err}`);
+    if ((ds.streamCardTurnGeneration ?? 0) !== generation && ds.streamCardPendingTurnId) {
+      void postTurnStartingCard(ds, sessionReply, ds.streamCardPendingTurnId);
+    }
+    return false;
+  }
+}
+
+/**
  * Force-post a fresh streaming card for `ds`, bypassing the per-bot
  * `disableStreamingCard` opt-out. Backs the `/card` command: a user can
  * manually summon a live card in an otherwise-quiet session. Parks the current
@@ -1235,6 +1832,7 @@ export async function postFreshStreamingCard(
     recallFrozenCards(ds);
     flushPendingLocalCliOpenReadinessPatch(ds);
     flushPendingRiffUrlPatch(ds);
+    flushPendingActiveRuntimePatch(ds);
     flushPendingCodexServiceTierPatch(ds);
     // Manual /card during a working turn lands a live card whose subsequent
     // screen_updates are working→working (no status edge) — arm the periodic
@@ -1248,6 +1846,7 @@ export async function postFreshStreamingCard(
     ds.streamCardPending = prevPending;
     flushPendingLocalCliOpenReadinessPatch(ds);
     flushPendingRiffUrlPatch(ds);
+    flushPendingActiveRuntimePatch(ds);
     flushPendingCodexServiceTierPatch(ds);
     // Rolled back to the prior card identity — re-sync so a restored still-live
     // working card keeps (or resumes) its refresh rather than losing the timer.
@@ -1552,14 +2151,13 @@ export async function deliverSubstituteControlCard(ds: DaemonSession): Promise<S
  * reply (`reply`). `content` is the card JSON when msgType==='interactive',
  * otherwise the plain text. Topic-group / p2p behavior is unchanged.
  *
- * IMPORTANT: ephemeral is only attempted for flat **chat-scope** sessions. The
+ * IMPORTANT: ephemeral is only attempted for a flat **chat-scope** destination. The
  * ephemeral API (`ephemeral/v1/send`) takes a `chat_id` only — it has no
  * thread/root anchoring — so for a **thread-scope** session (a 话题 inside a
  * 普通群, or a 话题群 topic) an ephemeral card would escape the topic and land at
- * the group top-level. 话题群 happened to reject ephemeral with 18053 and fall
- * back to the in-thread reply, but a 话题 inside a 普通群 succeeds and leaks the
- * card out of the thread. So thread-scope sessions always take the visible
- * `reply()` path, which routes back into the thread (`reply_in_thread`).
+ * the group top-level. The same applies when a chat-scope session is invoked
+ * from a folded thread: callers pass its frozen reply target, and any explicit
+ * thread/quote destination takes the visible `reply()` path.
  */
 export async function deliverEphemeralOrReply(
   ds: DaemonSession,
@@ -1567,8 +2165,16 @@ export async function deliverEphemeralOrReply(
   content: string,
   msgType: 'text' | 'interactive',
   reply: () => Promise<unknown>,
+  replyTarget?: FrozenSessionReplyTarget,
 ): Promise<void> {
-  if (operatorOpenId && ds.chatType !== 'p2p' && ds.scope === 'chat') {
+  // A chat-scope session can still be invoked from a folded thread. The
+  // ephemeral API has no root/thread field, so an explicitly frozen thread or
+  // quote target must take the visible reply path even though the session
+  // itself remains chat-scoped.
+  const allowsEphemeral = replyTarget
+    ? replyTarget.mode === 'plain'
+    : ds.scope === 'chat';
+  if (operatorOpenId && ds.chatType !== 'p2p' && allowsEphemeral) {
     try {
       // The ephemeral API is card-only (msg_type=text → 10003), so wrap a plain
       // confirmation line into a minimal markdown card.
@@ -1628,7 +2234,11 @@ function flushCardPatch(ds: DaemonSession): void {
   ds.pendingCardJson = undefined;
   ds.pendingCardId = undefined;
   ds.cardPatchInFlight = true;
+  let patchSucceeded = false;
   updateMessage(ds.larkAppId, cardId, json)
+    .then(() => {
+      patchSucceeded = true;
+    })
     .catch(err => {
       if (err instanceof MessageWithdrawnError) {
         // Only clear streamCardId when the withdrawn message is still the
@@ -1651,10 +2261,51 @@ function flushCardPatch(ds: DaemonSession): void {
     })
     .finally(() => {
       ds.cardPatchInFlight = false;
+      // A re-render can queue the exact same state while this PATCH is in
+      // flight. Drop only that adjacent duplicate after confirmed delivery.
+      // Failed PATCHes deliberately retain the queued item so it retries, and
+      // cardId participates in the comparison so a new turn's card is never
+      // mistaken for the card that just completed.
+      if (patchSucceeded
+        && ds.pendingCardId === cardId
+        && ds.pendingCardJson === json) {
+        ds.pendingCardJson = undefined;
+        ds.pendingCardId = undefined;
+      }
       if (ds.pendingCardJson) {
         flushCardPatch(ds);
       }
     });
+}
+
+/** Root withdrawal is not an explicit abandon boundary. Preserve a Codex App
+ * owner (including its live worker) while any durable FIFO entry is unsettled;
+ * only ledger-empty sessions retain the historical stale-root auto-close. */
+async function closeWithdrawnSessionIfLedgerEmpty(
+  ds: DaemonSession,
+  context: string,
+): Promise<boolean> {
+  if (hasProtectedSessionMutationOwnership(ds)) {
+    logger.warn(`[${tag(ds)}] ${context}; preserving session because Codex App dispatch is unsettled`);
+    return false;
+  }
+  logger.warn(`[${tag(ds)}] ${context}; closing ledger-empty stale session`);
+  // The callback routes through the authoritative async closeSession helper;
+  // never pre-kill a worker before that helper settles its backend boundary.
+  try {
+    const closed = await requireCallbacks().closeSession(ds);
+    if (closed === false) {
+      logger.warn(`[${tag(ds)}] ${context}; authoritative close failed, session retained for retry`);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    logger.warn(
+      `[${tag(ds)}] ${context}; authoritative close threw, session retained for retry: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return false;
+  }
 }
 
 // ─── Restart rate-limiting ──────────────────────────────────────────────────
@@ -1823,7 +2474,52 @@ export function ensureClaudeFolderTrust(workingDir: string, stateJsonPath: strin
 
 // ─── Kill worker ────────────────────────────────────────────────────────────
 
-export function killWorker(ds: DaemonSession): void {
+/**
+ * Retire a session's worker (and, worker-less, its orphaned backing session).
+ *
+ * CONTRACT FOR REMOTE BACKENDS (riff / mojo): a LIVE remote worker is refused
+ * unless the call carries the prepare/commit `remoteCloseCommitRequestId` —
+ * the function RETURNS WITHOUT RETIRING and the worker keeps running. Callers
+ * must not assume success. Today that refusal is absorbed differently per
+ * call site:
+ *   - /cd (IM + dashboard) rejects remote sessions BEFORE repinning, so this
+ *     refusal is never reached from there;
+ *   - the explicit-close path always carries the commit requestId;
+ *   - crash-loop, collision-loser, VC restore/upgrade and device-isolation
+ *     sweeps still call this best-effort and, for a live remote worker, keep
+ *     the generation alive with its lineage intact (fail-safe: never a silent
+ *     remote cancel). A caller that needs the worker GONE must go through
+ *     prepare/commit or the shutdown-detach flow — not this function.
+ */
+export function killWorker(
+  ds: DaemonSession,
+  opts: {
+    remoteCloseCommitRequestId?: string;
+    /** Set by the authoritative mojo close once its cancel is PROVEN, so the
+     *  best-effort orphan teardown below does not cancel the same session again. */
+    mojoCancelAlreadyProven?: boolean;
+  } = {},
+): void {
+  const closeFrozenType = ds.initConfig?.backendType ?? ds.session.backendType;
+  if (ds.worker && !ds.worker.killed
+      && closeFrozenType !== undefined
+      && isRemoteBackendType(closeFrozenType)
+      && !opts.remoteCloseCommitRequestId) {
+    // A generic synchronous retirement cannot safely detach ANY remote backend,
+    // not just Riff. An accepted create/follow-up may still be waiting for the
+    // task id that becomes the only durable lineage anchor — and for Mojo the
+    // worker's legacy close path used to answer a request-less `close` with
+    // `mojo session cancel`, so every generic retirement (/cd cold restart,
+    // crash-loop, collision loser, restore/upgrade) silently and irreversibly
+    // cancelled the remote session with no close_result to carry the outcome.
+    // Only the prepare/commit flow (remoteCloseCommitRequestId) may retire a
+    // live remote worker.
+    logger.error(
+      `[${tag(ds)}] Refused unprepared live ${closeFrozenType} worker retirement; `
+      + 'preserving worker and remote-task lineage',
+    );
+    return;
+  }
   restartCoordinator.cancelSession(ds.session.sessionId);
   clearUsageLimitState(ds);
   ds.workerReady = false;
@@ -1846,12 +2542,29 @@ export function killWorker(ds: DaemonSession): void {
     // lazy-restore keep the CLI alive for later resume), so /close on such a
     // session would leave an orphaned CLI running in tmux that still replies.
     // Destroy the backing session directly here so /close always terminates it.
-    destroyOrphanedBackingSession(ds);
+    destroyOrphanedBackingSession(ds, {
+      ...(opts.mojoCancelAlreadyProven ? { skipRemoteCancel: true } : {}),
+    });
+    if (opts.remoteCloseCommitRequestId
+        && ds.remoteCloseState?.requestId === opts.remoteCloseCommitRequestId) {
+      ds.remoteCloseState = undefined;
+    }
     return;
   }
   try {
-    ds.worker.send({ type: 'close' } as DaemonToWorker);
+    if (opts.remoteCloseCommitRequestId) {
+      ds.worker.send({
+        type: 'close_commit',
+        requestId: opts.remoteCloseCommitRequestId,
+      } as DaemonToWorker);
+    } else {
+      ds.worker.send({ type: 'close' } as DaemonToWorker);
+    }
   } catch { /* IPC already closed */ }
+  if (opts.remoteCloseCommitRequestId
+      && ds.remoteCloseState?.requestId === opts.remoteCloseCommitRequestId) {
+    ds.remoteCloseState = undefined;
+  }
   const w = ds.worker;
   trackLifecycleRetirement(ds, w);
   armCloseFence(ds, w);
@@ -1859,8 +2572,49 @@ export function killWorker(ds: DaemonSession): void {
   // 外层 race 8s）。默认 2s SIGTERM backstop 会在取消发出前掐死进程，已关闭话题
   // 的远端任务照跑——冻结为 riff 的会话放宽到 24s（层级：destroy 20s < worker 22s
   // < SIGTERM 24s < SIGKILL 29s；正常路径 worker 自行 exit，不会等满）。
-  const closeFrozenType = ds.initConfig?.backendType ?? ds.session.backendType;
-  armWorkerKillBackstop(w, tag(ds), closeFrozenType === 'riff' ? 24_000 : WORKER_SIGTERM_BACKSTOP_MS);
+  // mojo needs the same grace: destroySession() shells out to
+  // `mojo session cancel` (CLI timeout up to 60s) and waits for an in-flight
+  // turn to publish its lineage first, so 2s kills it before the cancel lands.
+  const closeNeedsRemoteGrace = closeFrozenType !== undefined
+    && isRemoteBackendType(closeFrozenType);
+  armWorkerKillBackstop(w, tag(ds), closeNeedsRemoteGrace ? 24_000 : WORKER_SIGTERM_BACKSTOP_MS);
+  ds.worker = null;
+  ds.workerPort = null;
+  ds.workerToken = null;
+  ds.workerViewToken = null;
+}
+
+/**
+ * Retire the worker PROCESS only — no close semantics of any kind.
+ *
+ * No `close` IPC (a request-less remote close is refused by the worker, and a
+ * local one would destroy the backing session), no remote cancel, lineage and
+ * containment handles intact. SIGTERM is sent immediately (the worker's
+ * handler runs killCli() — for mojo that is backend.kill(), which by contract
+ * never cancels the remote session) and armWorkerKillBackstop guarantees
+ * SIGKILL if it wedges.
+ *
+ * For callers that must make a worker generation DIE while its logical/remote
+ * state lives on: the collision loser (its registry entry is deleted right
+ * after, so a refused killWorker left a live credential-carrying worker
+ * unreachable — the P0-new orphan shape) and the VC runtime-lease fence
+ * (which must prove the local producer process dead before admitting replay).
+ */
+export function retireWorkerProcessOnly(ds: DaemonSession, reason: string): void {
+  restartCoordinator.cancelSession(ds.session.sessionId);
+  clearUsageLimitState(ds);
+  ds.workerReady = false;
+  clearUsageRefreshTimer(ds);
+  ds.localProcessAttestation = undefined;
+  ds.managedTurnOrigin = undefined;
+  invalidateStuckWarning(ds, reason);
+  invalidateTuiPrompt(ds, reason);
+  const w = ds.worker;
+  if (w && !w.killed) {
+    trackLifecycleRetirement(ds, w);
+    try { w.kill('SIGTERM'); } catch { /* already gone */ }
+    armWorkerKillBackstop(w, tag(ds));
+  }
   ds.worker = null;
   ds.workerPort = null;
   ds.workerToken = null;
@@ -1920,14 +2674,32 @@ export async function detachWorkerForTransfer(
   const maybeFinish = (): void => {
     if (acked && exited) finish(true);
   };
+  // Once the worker ACKs, its observer is already detached (killCli ran); the
+  // process itself is disposable. A healthy worker exits within a few ms, but a
+  // web-terminal client PTY makes node-pty's process.exit() teardown wedge the
+  // process for the whole fence (JS loop already stopped → it can't self-kill).
+  // So on ACK, arm a short grace timer, then SIGKILL — turning an 8s stall into
+  // a ~300ms one. Cleared if the worker exits on its own first.
+  let postAckKillTimer: ReturnType<typeof setTimeout> | undefined;
+  const armPostAckKill = (): void => {
+    if (postAckKillTimer || exited) return;
+    postAckKillTimer = setTimeout(() => {
+      if (exited) return;
+      logger.info(`[${tag(ds)}] Detach ACK received but worker still alive after ${TRANSFER_DETACH_POST_ACK_KILL_MS}ms (node-pty exit wedge); SIGKILL`);
+      try { w.kill('SIGKILL'); } catch { /* already gone */ }
+    }, TRANSFER_DETACH_POST_ACK_KILL_MS);
+    postAckKillTimer.unref?.();
+  };
   const onMessage = (raw: unknown): void => {
     const msg = raw as Partial<WorkerToDaemon>;
     if (msg.type !== 'transfer_detached' || msg.requestId !== requestId) return;
     acked = true;
+    armPostAckKill();
     maybeFinish();
   };
   const onExit = (): void => {
     exited = true;
+    if (postAckKillTimer) { clearTimeout(postAckKillTimer); postAckKillTimer = undefined; }
     maybeFinish();
   };
   w.on('message', onMessage);
@@ -1940,6 +2712,7 @@ export async function detachWorkerForTransfer(
   void sendWorkerIpc(w, { type: 'detach_for_transfer', requestId })
     .catch(() => finish(false));
   const completed = await completion;
+  if (postAckKillTimer) { clearTimeout(postAckKillTimer); postAckKillTimer = undefined; }
 
   // A timed-out detach request may still be queued in Node's IPC channel and
   // arrive later. Never hand new input back to that uncertain worker. SIGKILL
@@ -2083,10 +2856,98 @@ function destroyLivePaneBeforeRestart(ds: DaemonSession): void {
  * forkWorker init 注释），cliId 换 CLI 会踩 resume transcript 对齐，均不带。
  */
 export function latestPerBotEnvForRestart(ds: DaemonSession): Record<string, string> | null | undefined {
+  // Two failure modes that must NOT be conflated. The old single try/catch
+  // swallowed both, so a quarantine write failure silently returned `undefined`
+  // (restart proceeds, risk unrecorded) — the exact fail-open this ledger exists
+  // to prevent.
+  let env: Record<string, string> | null;
   try {
-    return getBot(ds.larkAppId).config.env ?? null;
+    env = getBot(ds.larkAppId).config.env ?? null;
   } catch {
+    // Bot deregistered: nothing to hot-update. Keep the worker's snapshot (legacy
+    // behaviour) — this is a benign, expected state.
     return undefined;
+  }
+  // Record what this generation is being handed BEFORE the restart is sent.
+  //
+  // This is the single choke point all four restart senders share (dashboard-ipc
+  // operator + working-dir, requestSessionRestart, cli_crash auto-restart), so
+  // recording here cannot be missed by adding a fifth caller — which is exactly
+  // how the device-isolation proof lost track of the env the running child had
+  // actually been given.
+  //
+  // Accumulate, never replace: the restart may fail or be coalesced, so a later
+  // clean env is not evidence that the dangerous child is gone.
+  //
+  // Any throw here propagates on purpose: the caller must not send a restart while
+  // believing a risk was recorded when it was not.
+  rememberAppliedUnprovableEnvKeys(ds, env ?? undefined);
+  return env;
+}
+
+/**
+ * Fold the unprovable keys of an env payload into the generation's ledger.
+ *
+ * Names only — the values can be credentials, and the proof only inspects names.
+ * Exported for the restart-timeline tests, which must be able to assert the
+ * ledger itself rather than infer it from a classifier result.
+ */
+export function rememberAppliedUnprovableEnvKeys(
+  ds: DaemonSession,
+  env: Record<string, string> | undefined,
+): void {
+  // MOJO ONLY. This choke point is shared by every backend's restart, so an
+  // ungated call quarantined codex/tmux sessions as "mojo" forever: a bot with
+  // LD_PRELOAD in bots.json env poisoned unrelated backends (cross-backend
+  // contamination + permanent unprovability). The ledger exists solely to answer
+  // "could a hooked MOJO client still be running", so only mojo may write to it.
+  if (!isMojoSession(ds)) return;
+
+  // BOTH env layers. `mojoUnprovableEnvKeys` is fed the top-level per-bot env AND
+  // the mojo block's own env: they are peers (see the `init` message), the mojo
+  // block wins the merge, and a dangerous key living only in `mojo.env` used to be
+  // recorded nowhere — so it survived a daemon restart as "clean".
+  const mojoBlockEnv = sessionMojoBlockEnv(ds);
+  const keys = mojoUnprovableEnvKeys({ env: { ...(env ?? {}), ...mojoBlockEnv } });
+  if (keys.length === 0) return;
+  const merged = new Set([...(ds.mojoAppliedUnprovableEnvKeys ?? []), ...keys]);
+  ds.mojoAppliedUnprovableEnvKeys = [...merged];
+  // Also persist, because the in-memory ledger cannot answer the question after
+  // a daemon restart or an explicit /close: the SIGTERM-ed mojo child (and any
+  // detached descendants) can outlive both, while still holding an activated
+  // credential. The durable record is keyed by session id and never retracted.
+  const sessionId = ds.session?.sessionId;
+  if (!sessionId) {
+    // Cannot key the durable record without a session id. Never swallow this:
+    // keeping the risk in memory only is the fail-open direction, and this branch
+    // should be unreachable for a real DaemonSession.
+    throw new Error(
+      '[mojo-quarantine] refusing to lose an unprovable launcher env: session id missing'
+      + ` (keys: ${keys.join(', ')})`,
+    );
+  }
+  // Deliberately NOT wrapped in try/catch: a failed persist means the daemon
+  // cannot prove this host is clean, and swallowing it would hand back a false
+  // "recorded" to every restart sender.
+  recordQuarantinedLauncherEnvKeys(sessionId, keys);
+}
+
+/** Is this session frozen onto the mojo backend? Prefers the live worker stamp. */
+function isMojoSession(ds: DaemonSession): boolean {
+  return (ds.initConfig?.backendType ?? ds.session?.backendType) === 'mojo';
+}
+
+/**
+ * The mojo block's own `env`, from whichever layer the next turn will actually
+ * use: the config frozen onto the live worker, else the live bot config.
+ */
+function sessionMojoBlockEnv(ds: DaemonSession): Record<string, string> {
+  const fromInit = (ds.initConfig?.backendConfig as MojoConfig | undefined)?.env;
+  if (fromInit) return fromInit;
+  try {
+    return getBot(ds.larkAppId).config.mojo?.env ?? {};
+  } catch {
+    return {};
   }
 }
 
@@ -2131,26 +2992,149 @@ export function __testOnly_resetRestartCoordinator(): void {
  * false worker-side too), so killing it would violate the bridge invariant of
  * leaving the user's own CLI untouched.
  */
-function destroyOrphanedBackingSession(ds: DaemonSession): void {
+/**
+ * Build the launch config for cancelling a mojo session's remote lineage, or say
+ * why it must not be attempted.
+ *
+ * Shared by the best-effort killWorker teardown and the awaited explicit-close
+ * path so the two cannot cancel through DIFFERENT configs — the launch identity
+ * and control plane decide which tenant the cancel reaches, so a second copy of
+ * these rules drifting would silently cancel against the wrong endpoint.
+ */
+function resolveMojoCancelLaunch(
+  ds: DaemonSession,
+  remoteId: string,
+  label: string,
+): { ok: true; launchCfg: EffectiveMojoConfig } | { ok: false; reason: 'quarantined' | 'bot_gone' } {
+  let botCfg;
+  try {
+    botCfg = getBot(ds.larkAppId).config;
+  } catch {
+    // Bot deregistered — nothing to cancel WITH. The caller decides what that
+    // means; the explicit-close path treats it as a RETRYABLE refusal, because
+    // re-registering the bot restores exactly the config this needs.
+    logger.warn(
+      `[${tag(ds)}] ${label}: cannot cancel mojo session ${remoteId} — bot `
+      + `${ds.larkAppId} is deregistered. Lineage retained for manual cleanup.`,
+    );
+    return { ok: false, reason: 'bot_gone' };
+  }
+  // mojo needs no baseUrl gate — the CLI resolves its own endpoint, and an absent
+  // `mojo` config block is a valid setup.
+  //
+  // Build the SAME effective config the worker would (shared helper): a bare
+  // `botCfg.mojo` carries neither the pinned binary (cliPathOverride) nor the
+  // per-bot env holding the JWT, so a bot that ran fine on a custom path/identity
+  // would fail to cancel here — the remote session then keeps burning cloud
+  // sandbox time while still holding injected credentials.
+  //
+  // The launch IDENTITY (binary + wrapper) must come from the values FROZEN on the
+  // session, not from live bot config: the remote session was created through
+  // those, so cancelling through a wrapper the bot gained afterwards can reach the
+  // wrong gateway/tenant. Session cwd is not persisted for a dead worker, so that
+  // one falls back to the bot's configured working dir.
+  const frozenLaunch = frozenSessionLaunchIdentity(ds, botCfg);
+  // freeze:false — teardown must not mutate session state. Cancel has to reach the
+  // endpoint/tenant that CREATED the remote session, so the frozen control plane
+  // matters here as much as the frozen binary.
+  const frozenMojo = sessionMojoConfig(ds, botCfg, { freeze: false });
+  // A quarantined lineage must NOT be cancelled: nothing records which control
+  // plane holds it, so cancelling through the current config could reach a
+  // different tenant. Callers capture `remoteId` BEFORE this call, so clearing the
+  // field would not have stopped it — the explicit state is what makes the refusal
+  // reliable.
+  if (frozenMojo.lineage === 'quarantined') {
+    logger.warn(
+      `[${tag(ds)}] ${label}: NOT cancelling mojo session ${remoteId} — `
+      + 'its control plane is unverifiable (quarantined). It is preserved on the '
+      + 'session for manual cleanup.',
+    );
+    return { ok: false, reason: 'quarantined' };
+  }
+  return {
+    ok: true,
+    launchCfg: buildEffectiveMojoConfig(frozenMojo.config, {
+      cliPathOverride: frozenLaunch.cliPathOverride,
+      workingDir: ds.session.workingDir ?? botCfg.defaultWorkingDir ?? botCfg.workingDir,
+      env: botCfg.env ? sanitizePerBotEnv(botCfg.env) : undefined,
+      wrapperCli: frozenLaunch.wrapperCli,
+    }),
+  };
+}
+
+function destroyOrphanedBackingSession(
+  ds: DaemonSession,
+  opts: {
+    /** The authoritative close already PROVED the remote cancel; firing the
+     *  best-effort one again would cancel a second time (and, for an already-gone
+     *  session, report a spurious failure). */
+    skipRemoteCancel?: boolean;
+  } = {},
+): void {
   if (ds.initConfig?.adoptMode || ds.adoptedFrom) return;
   reclaimParkedCrashDiagnostic(ds);
-  // riff：worker 已死时 /close 仍要取消持久化血缘指向的远端任务——否则已关闭
-  // 话题的远端 agent 继续拿着注入凭证发消息。fire-and-forget（内部有界+重试）。
+  // Riff cancellation is asynchronous and cannot be made safe from this
+  // synchronous best-effort helper. The authoritative closeSession path awaits
+  // cancellation before publishing the closed row and retains lineage on
+  // failure.
   const frozenType = ds.initConfig?.backendType ?? ds.session.backendType;
   if (frozenType === 'riff') {
-    const taskId = ds.session.riffParentTaskId;
-    if (taskId) {
-      try {
-        const riffCfg = getBot(ds.larkAppId).config.riff;
-        if (riffCfg?.baseUrl) {
-          void cancelRiffTaskById(riffCfg, taskId).then((ok) => {
-            if (ok) logger.info(`[${tag(ds)}] killWorker: orphan riff task ${taskId} cancelled`);
-          });
-        }
-      } catch { /* bot deregistered — nothing to cancel with */ }
+    if (ds.session.riffParentTaskId) {
+      logger.warn(
+        `[${tag(ds)}] worker-less Riff teardown requires awaited explicit close; `
+        + `retaining task ${ds.session.riffParentTaskId} for retry`,
+      );
+    }
+    return;
+  }
+  if (frozenType === 'mojo') {
+    // Remote backends persist their lineage in the same field riff uses.
+    const remoteId = ds.session.riffParentTaskId;
+    if (!remoteId || opts.skipRemoteCancel) return;
+    const resolved = resolveMojoCancelLaunch(ds, remoteId, 'killWorker');
+    if (!resolved.ok) return;
+    // Best-effort ONLY. The authoritative /close path (prepareMojoExplicitClose)
+    // awaits the same cancellation before publishing the closed row; this branch
+    // exists for the killWorker callers that are not an explicit close (crash
+    // retirement, transfer teardown), where there is no result to report to.
+    //
+    // Clear the lineage ONLY once the remote session is really gone. This used to
+    // clear unconditionally right after firing, so a failed cancel erased the only
+    // id — the exact leak master's riff change above calls out.
+    void cancelMojoSessionById(resolved.launchCfg, remoteId).then((outcome) => {
+      // Structured outcome, not a boolean — `if (!outcome)` would be always-false
+      // and silently treat every failure as a success (an object is truthy).
+      if (!isMojoRemoteGone(outcome)) {
+        logger.warn(
+          `[${tag(ds)}] killWorker: orphan mojo session ${remoteId} NOT cancelled; `
+          + 'retaining the lineage — note nothing retries this automatically, so an '
+          + 'explicit /close (which DOES await the cancel) or manual cleanup is required',
+        );
+        return;
+      }
+      logger.info(`[${tag(ds)}] killWorker: orphan mojo session ${remoteId} cancelled`);
       ds.session.riffParentTaskId = undefined;
       sessionStore.updateSession(ds.session);
-    }
+    }).catch((err: unknown) => {
+      // Defence in depth for a FIRE-AND-FORGET promise. This helper is
+      // synchronous, so there is no caller to reject to: an escaping rejection
+      // becomes an unhandledRejection, and the daemon installs no handler for
+      // those (only worker.ts does), so Node v22 terminates the process --
+      // taking down every OTHER session this daemon serves. The awaited call
+      // site already guards itself the same way; tmux-pipe-backend.ts documents
+      // a real incident of exactly this shape.
+      //
+      // Reachable, not theoretical: cancelMojoSessionById constructs a backend
+      // before its own try block, so an unreadable containment store throws out
+      // of it rather than returning the structured failure its type promises.
+      // sessionStore.updateSession above can throw for the same reason (a failed
+      // save). Both must degrade to a retained lineage, never to a crash.
+      logger.error(
+        `[${tag(ds)}] killWorker: orphan mojo cancel for ${remoteId} threw; `
+        + `retaining the lineage for explicit /close or manual cleanup: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
     return;
   }
   const backendType = getSessionPersistentBackendType(ds);
@@ -2161,6 +3145,1267 @@ function destroyOrphanedBackingSession(ds: DaemonSession): void {
   } catch (err) {
     logger.warn(`[${tag(ds)}] killWorker: failed to destroy orphaned ${backendType} backing session: ${err}`);
   }
+}
+
+type RemoteClosePreparation =
+  | {
+      ok: true;
+      taskId?: string;
+      residual?: CloseResidual;
+      /** Move this still-uncancellable lineage into the PARKED slot as part of the
+       *  durable close, so the residual decision survives and replays. */
+      parkMojoLineage?: string;
+    }
+  | {
+      ok: false;
+      error:
+        | 'riff_cancel_failed'
+        | 'riff_config_missing'
+        | 'riff_task_changed'
+        | 'riff_worker_close_failed'
+        | 'riff_row_inconsistent'
+        | 'riff_durable_close_failed'
+        | 'riff_close_reconciliation_required'
+        | 'remote_shutdown_fence_in_progress'
+        // mojo reuses this preparation contract: same problem (a remote,
+        // credential-bearing session that must be proven gone before the row is
+        // published as closed), same retryable-failure shape.
+        | 'mojo_cancel_failed'
+        | 'mojo_durable_close_failed'
+        | 'mojo_close_reconciliation_required'
+        /** Bot deregistered — retryable once it is registered again. */
+        | 'mojo_config_missing'
+        /** Durable lineage with no active owner to cancel through. */
+        | 'mojo_close_identity_missing'
+        /**
+         * The remote teardown already happened irreversibly, but the local close
+         * did not finish. ONLY the local commit may be retried.
+         */
+        | 'mojo_close_commit_required';
+      /**
+       * May the caller simply try the SAME close again?
+       *
+       * This was hardcoded `true`, which contradicted the tri-state it was
+       * reporting: an `uncertain` prepare needs explicit reconciliation (a blind
+       * retry cannot cancel a session nobody can name), and an `irreversible`
+       * one must never re-run the remote cancel. `false` means "do not loop on
+       * this; a human/reconciler decides".
+       */
+      retryable: boolean;
+      /**
+       * The exact worker verdict, when this refusal came from one. `retryable`
+       * appears here too: a close whose WRITES stay fenced may still itself be
+       * retryable, and flattening that into `uncertain` would demand manual
+       * reconciliation for a failure the retry can clear.
+       */
+      recovery?: 'retryable' | 'uncertain' | 'irreversible';
+      taskId?: string;
+    };
+
+async function abortLiveRemoteWorkerClose(
+  ds: DaemonSession,
+  requestId: string,
+  opts: { allowAbsentAfterProvenRestore?: boolean } = {},
+): Promise<boolean> {
+  if (ds.remoteCloseState?.requestId !== requestId) return false;
+  const worker = ds.worker;
+  if (!worker || worker.killed) {
+    if (opts.allowAbsentAfterProvenRestore) {
+      ds.remoteCloseState = undefined;
+      return true;
+    }
+    ds.remoteCloseState = { ...ds.remoteCloseState, phase: 'uncertain' };
+    return false;
+  }
+
+  const restored = await new Promise<{
+    ok: boolean;
+    admissionRestored?: boolean;
+    fenceReason?: string;
+    error?: string;
+  }>(resolve => {
+    let settled = false;
+    const finish = (result: {
+      ok: boolean;
+      admissionRestored?: boolean;
+      fenceReason?: string;
+      error?: string;
+    }): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      worker.removeListener?.('message', onMessage);
+      worker.removeListener?.('exit', onExit);
+      resolve(result);
+    };
+    const onMessage = (raw: unknown): void => {
+      const msg = raw as WorkerToDaemon;
+      if (msg?.type !== 'close_abort_result' || msg.requestId !== requestId) return;
+      if (ds.worker !== worker) {
+        finish({ ok: false, error: 'stale_worker_generation' });
+        return;
+      }
+      // `ok` says the abort was HANDLED; `admissionRestored` says whether writes
+      // actually came back. A backend holding a latched fence answers ok:true /
+      // admissionRestored:false, and inferring restoration from `ok` journalled a
+      // cleared fence while write() kept returning false. Absent means `ok`
+      // (legacy backends, riff).
+      finish({
+        ok: msg.ok,
+        admissionRestored: msg.admissionRestored ?? msg.ok,
+        ...(msg.fenceReason ? { fenceReason: msg.fenceReason } : {}),
+        ...(msg.error ? { error: msg.error } : {}),
+      });
+    };
+    const onExit = (): void => finish({
+      ok: false,
+      error: 'worker_exited_before_close_abort_result',
+    });
+    const timer = setTimeout(
+      () => finish({ ok: false, error: 'close_abort_result_timeout' }),
+      REMOTE_ADMISSION_RESTORE_TIMEOUT_MS,
+    );
+    timer.unref?.();
+    worker.on?.('message', onMessage);
+    worker.once?.('exit', onExit);
+    try {
+      worker.send({ type: 'close_abort', requestId } as DaemonToWorker);
+    } catch (err) {
+      finish({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // A handled-but-REFUSED abort must not clear the fence. `ok` alone did, which
+  // is the same laundering as before, one path over.
+  const admissionRestored = restored.ok && restored.admissionRestored !== false;
+  if (admissionRestored && ds.remoteCloseState?.requestId === requestId) {
+    ds.remoteCloseState = undefined;
+    return true;
+  }
+  // A proven earlier restore excuses a MISSING ack, never a refused one: the
+  // backend just told us writes are still fenced.
+  if (opts.allowAbsentAfterProvenRestore
+      && restored.admissionRestored !== false
+      && ds.remoteCloseState?.requestId === requestId) {
+    ds.remoteCloseState = undefined;
+    return true;
+  }
+  if (ds.remoteCloseState?.requestId === requestId) {
+    ds.remoteCloseState = { ...ds.remoteCloseState, phase: 'uncertain' };
+  }
+  logger.warn(
+    `[${tag(ds)}] Remote close abort did not restore write admission `
+    + `(${restored.fenceReason ?? restored.error ?? 'unknown'}); `
+    + 'retaining admission fence pending explicit lineage reconciliation',
+  );
+  return false;
+}
+
+async function prepareLiveRemoteWorkerClose(
+  ds: DaemonSession,
+  backendType: 'riff' | 'mojo',
+): Promise<RemoteClosePreparation> {
+  const worker = ds.worker;
+  if (!worker || worker.killed) {
+    return {
+      ok: false,
+      error: backendType === 'riff' ? 'riff_worker_close_failed' : 'mojo_cancel_failed',
+      retryable: true,
+    };
+  }
+  if (backendType === 'mojo' && ds.remoteCloseState?.phase === 'abort_restored') {
+    const restoredState = ds.remoteCloseState;
+    try {
+      const committed = sessionStore.finishMojoCloseAbort(
+        ds.session.sessionId,
+        restoredState.requestId,
+        {
+          admissionRestored: true,
+          ...(restoredState.taskId ? { taskId: restoredState.taskId } : {}),
+        },
+      );
+      ds.session.mojoCloseJournal = committed.mojoCloseJournal;
+      ds.session.riffParentTaskId = committed.riffParentTaskId;
+      ds.remoteCloseState = undefined;
+    } catch (err) {
+      logger.error(
+        `[${tag(ds)}] Mojo admission restore proof could not clear the durable close journal: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return {
+        ok: false,
+        error: 'mojo_durable_close_failed',
+        retryable: true,
+        ...(restoredState.taskId ? { taskId: restoredState.taskId } : {}),
+      };
+    }
+  }
+  if (backendType === 'mojo' && ds.remoteCloseState?.phase === 'prepared') {
+    try {
+      const committed = sessionStore.markMojoClosePrepared(
+        ds.session.sessionId,
+        ds.remoteCloseState.requestId,
+        ds.remoteCloseState.taskId,
+        // The retry must republish the SAME proof, residual included — the
+        // original prepare saw the local evidence grade; this replay did not.
+        ds.remoteCloseState.localResidual,
+      );
+      ds.session.mojoCloseJournal = committed.mojoCloseJournal;
+      ds.session.riffParentTaskId = committed.riffParentTaskId;
+    } catch (err) {
+      logger.error(
+        `[${tag(ds)}] Mojo close proof could not be persisted for durable commit: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return {
+        ok: false,
+        error: 'mojo_durable_close_failed',
+        retryable: true,
+        ...(ds.remoteCloseState.taskId ? { taskId: ds.remoteCloseState.taskId } : {}),
+      };
+    }
+    return {
+      ok: true,
+      ...(ds.remoteCloseState.taskId ? { taskId: ds.remoteCloseState.taskId } : {}),
+      // Stored residual → derived at read time (see liveLocalResidual): the
+      // journal write above still republishes the original proof verbatim.
+      ...(residualField(liveLocalResidual(ds.session.sessionId, ds.remoteCloseState.localResidual))),
+    };
+  }
+  if (ds.remoteShutdownState) {
+    return {
+      ok: false,
+      error: 'remote_shutdown_fence_in_progress',
+      retryable: true,
+      ...(typeof ds.remoteShutdownState.taskId === 'string' && ds.remoteShutdownState.taskId
+        ? { taskId: ds.remoteShutdownState.taskId }
+        : {}),
+    };
+  }
+  let takenOverRuntimeState: DaemonSession['remoteCloseState'];
+  if (ds.remoteCloseState) {
+    const runtimeUncertain = backendType === 'mojo'
+      && ds.remoteCloseState.phase === 'uncertain';
+    // A runtime `uncertain` fence used to be a dead end: "a blind retry proves
+    // nothing" was true when the journal refused every restart, so /close
+    // failed with retryable:false for the daemon's whole lifetime and the only
+    // exit was a daemon restart — a process-level soft deadlock (third-round
+    // review, gate 1). The retry is no longer blind: an explicit close with a
+    // LIVE worker re-runs the full destroySession, which can produce fresh
+    // evidence. When the runtime fence and the DURABLE journal describe the
+    // same failed attempt — same phase, same requestId, same lineage — the
+    // fence is cleared and the close re-enters prepare under a new requestId
+    // (beginMojoCloseJournal accepts the uncertain takeover). Anything less
+    // than an exact match keeps the refusal: a mismatched pair means runtime
+    // and disk disagree about which attempt happened, and clearing on that
+    // would launder an unknown state.
+    const durableForTakeover = ds.session.mojoCloseJournal;
+    // Three legs, each covering a REAL production writer of this pair
+    // (fourth-round review named the two the exact-match version missed):
+    //   phase   — the runtime fence is `uncertain` for every non-irreversible
+    //             failed prepare, while the DURABLE phase differs by verdict:
+    //             `uncertain` for an uncertain one, `preparing` (with
+    //             recovery 'retryable') for a retryable-but-fenced one. Both
+    //             pairs describe the same failed attempt; matching only
+    //             uncertain/uncertain left retryable+fenced soft-deadlocked
+    //             with a durable row that itself promises a retry (gap A).
+    //   requestId — exact, always: both sides were written by that attempt.
+    //   lineage — equal, or the durable side is a superset (the worker may
+    //             have reported the pre-init lineage into the journal while
+    //             the runtime fence kept none, gap B). A CONFLICTING pair
+    //             still refuses: runtime and disk disagreeing about which
+    //             remote session was touched must never be laundered.
+    const durablePhaseMatches = durableForTakeover?.phase === 'uncertain'
+      || (durableForTakeover?.phase === 'preparing'
+        && durableForTakeover.recovery === 'retryable');
+    const runtimeTaskId = ds.remoteCloseState.taskId ?? undefined;
+    const durableTaskId = durableForTakeover?.taskId ?? undefined;
+    const takeoverEligible = runtimeUncertain
+      && durableForTakeover !== undefined
+      && durablePhaseMatches
+      && durableForTakeover.requestId === ds.remoteCloseState.requestId
+      && (durableTaskId === runtimeTaskId || runtimeTaskId === undefined);
+    if (takeoverEligible) {
+      logger.warn(
+        `[${tag(ds)}] explicit close takes over ${durableForTakeover.phase} Mojo journal `
+        + `(${ds.remoteCloseState.requestId}); re-running the cancel through the live worker`,
+      );
+      // Cleared only in memory here; restored if the fresh attempt's durable
+      // write below fails, so the runtime fence (and everything keyed on it,
+      // e.g. the shutdown-detach explicit-close guard) never vanishes without
+      // a successor journal actually on disk.
+      takenOverRuntimeState = ds.remoteCloseState;
+      ds.remoteCloseState = undefined;
+    } else if (runtimeUncertain) {
+      return {
+        ok: false,
+        error: 'mojo_close_reconciliation_required',
+        retryable: false,
+        recovery: 'uncertain',
+        ...(ds.remoteCloseState.taskId ? { taskId: ds.remoteCloseState.taskId } : {}),
+      };
+    } else {
+      return {
+        ok: false,
+        error: backendType === 'riff' ? 'riff_worker_close_failed' : 'mojo_cancel_failed',
+        retryable: true,
+        ...(ds.remoteCloseState.taskId ? { taskId: ds.remoteCloseState.taskId } : {}),
+      };
+    }
+  }
+  const requestId = randomUUID();
+  if (backendType === 'mojo') {
+    try {
+      const committed = sessionStore.beginMojoCloseJournal(
+        ds.session.sessionId,
+        requestId,
+        ds.session.riffParentTaskId,
+      );
+      ds.session.mojoCloseJournal = committed.mojoCloseJournal;
+    } catch (err) {
+      // Reinstate a runtime fence the takeover cleared: without this, a failed
+      // durable write left the ds fence-less while disk still said uncertain,
+      // and guards keyed on ds.remoteCloseState (shutdown-detach's
+      // explicit-close check) silently lost their signal.
+      if (takenOverRuntimeState) ds.remoteCloseState = takenOverRuntimeState;
+      logger.error(
+        `[${tag(ds)}] Mojo close journal could not be persisted before cancellation: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return {
+        ok: false,
+        error: 'mojo_durable_close_failed',
+        retryable: true,
+        ...(ds.session.riffParentTaskId ? { taskId: ds.session.riffParentTaskId } : {}),
+      };
+    }
+  }
+  ds.remoteCloseState = {
+    phase: 'preparing',
+    requestId,
+    ...(ds.session.riffParentTaskId ? { taskId: ds.session.riffParentTaskId } : {}),
+  };
+  let matchedCloseResult = false;
+  const result = await new Promise<RemoteWorkerCloseResult>((resolve) => {
+    let settled = false;
+    const finish = (value: RemoteWorkerCloseResult): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      worker.removeListener?.('exit', onExit);
+      pendingRemoteWorkerCloses.delete(requestId);
+      resolve(value);
+    };
+    // The worker died mid-prepare, so whatever destroySession() had already done
+    // is unknown -- including a completed irreversible cancel. Fence.
+    const onExit = (): void => finish({
+      ok: false,
+      error: 'worker_exited_before_close_result',
+      recovery: 'uncertain',
+    });
+    // Riff's adapter has its own 20s destroy deadline. Mojo may first spend 8s
+    // waiting for system/init, then up to 60s in `mojo session cancel`; aborting
+    // at the old 23s Riff budget re-opened admission while that irreversible
+    // cancellation was still in flight. Stay above both bounded Mojo phases.
+    const closeResultTimeoutMs = backendType === 'mojo'
+      ? MOJO_EXPLICIT_CLOSE_RESULT_TIMEOUT_MS
+      : 23_000;
+    const timer = setTimeout(
+      // A timed-out prepare may still be running remotely; the outcome is unknown.
+      () => finish({ ok: false, error: 'worker_close_result_timeout', recovery: 'uncertain' }),
+      closeResultTimeoutMs,
+    );
+    timer.unref?.();
+    worker.once?.('exit', onExit);
+    pendingRemoteWorkerCloses.set(requestId, {
+      sessionId: ds.session.sessionId,
+      worker,
+      resolve: value => {
+        matchedCloseResult = true;
+        finish(value);
+      },
+    });
+    try {
+      worker.send({ type: 'close', requestId } as DaemonToWorker);
+    } catch (err) {
+      finish({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  const taskId = result.taskId ?? ds.session.riffParentTaskId;
+  if (backendType === 'mojo') {
+    if (result.ok) {
+      try {
+        const committed = sessionStore.markMojoClosePrepared(
+          ds.session.sessionId,
+          requestId,
+          taskId,
+          // Durable ON PURPOSE: the residual is part of the close outcome, and a
+          // daemon restart replaying this prepared journal must still publish
+          // `closed_with_residual` (only the worker saw the evidence grade).
+          result.residual,
+        );
+        ds.session.mojoCloseJournal = committed.mojoCloseJournal;
+        ds.session.riffParentTaskId = committed.riffParentTaskId;
+      } catch (err) {
+        // Cancellation is irreversible. The runtime proof stays prepared and
+        // admission remains fenced; a retry republishes that same proof without
+        // asking the worker to cancel twice — residual included, or the retry
+        // would silently downgrade a residual close to a plain one. The durable
+        // `preparing` journal makes a daemon crash fail closed rather than
+        // resume this generation.
+        ds.remoteCloseState = {
+          phase: 'prepared',
+          requestId,
+          ...(taskId ? { taskId } : {}),
+          ...(result.residual ? { localResidual: result.residual } : {}),
+        };
+        logger.error(
+          `[${tag(ds)}] Mojo close proof persistence failed after cancellation; `
+          + `retaining prepared commit: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return {
+          ok: false,
+          error: 'mojo_durable_close_failed',
+          retryable: true,
+          ...(taskId ? { taskId } : {}),
+        };
+      }
+
+      ds.remoteCloseState = {
+        phase: 'prepared',
+        requestId,
+        ...(taskId ? { taskId } : {}),
+        ...(result.residual ? { localResidual: result.residual } : {}),
+      };
+      logger.info(`[${tag(ds)}] mojo worker close prepared and remote cancellation confirmed`);
+      // The remote lineage is confirmed cancelled, but that says nothing about the
+      // LOCAL process tree. When the backend could not prove its subtree gone it
+      // kept the containment handle, so this row must NOT be published as an
+      // ordinary closed one: the device-isolation blocker is still live and an
+      // operator reading "closed" would believe a credentialed process was gone.
+      //
+      // Kept distinct from the remote lineage residual on purpose. That one names a
+      // surviving remote task id and asks for remote cleanup; this one names a host
+      // subtree and asks for local cleanup, and collapsing them would send the
+      // operator after the wrong thing. Hence no taskId here even when one exists —
+      // the remote side really was cancelled.
+      if (result.residual) {
+        logger.warn(
+          `[${tag(ds)}] mojo remote cancellation confirmed, but the LOCAL subtree was not `
+          + `proven gone (${result.residual}); publishing a residual close so the `
+          + 'device-isolation blocker stays visible',
+        );
+        return {
+          ok: true,
+          ...(taskId ? { taskId } : {}),
+          residual: { reason: result.residual },
+        };
+      }
+      return { ok: true, ...(taskId ? { taskId } : {}) };
+    }
+
+    // Only a REVERSIBLE failure may be rolled back. Sending close_abort for every
+    // ok:false re-opened write admission after an `uncertain` verdict (an unnamed
+    // remote session may exist) and after an `irreversible` one (the remote side is
+    // already gone), which laundered both back into `retryable` end to end.
+    const recovery = result.recovery ?? 'retryable';
+    // Whether writes may be admitted is a DIFFERENT question from whether the
+    // close may be retried. Keying the rollback on `recovery` re-opened admission
+    // for an unproven local child termination (retryable, yet a credentialed
+    // process may still be alive); absent `admission` keeps the historical
+    // derivation so riff and older workers are unaffected.
+    // Delegated to the shared helper rather than re-implementing the derivation:
+    // two copies of this rule is how the daemon drifted back to reading
+    // `recovery` and re-opened admission on a latched fence.
+    const mayRestore = mayRestoreWriteAdmission({
+      ok: false,
+      ...(result.recovery ? { recovery: result.recovery } : {}),
+      ...(result.admission ? { admission: result.admission } : {}),
+    });
+    if (!mayRestore) {
+      // No abort: the runtime fence stays up, so the session remains active and
+      // keeps its device-isolation blocker. But the DURABLE row must also stop
+      // saying `preparing` with the pre-prepare task id -- a crash here left a
+      // journal that could not be told apart from an interrupted cancel, and
+      // silently discarded the exact lineage the worker just reported.
+      const irreversible = recovery === 'irreversible';
+      let journalled = false;
+      try {
+        const committed = sessionStore.markMojoCloseUnresolved(
+          ds.session.sessionId,
+          requestId,
+          {
+            recovery,
+            // The EXACT id from close_result (the pre-init window means the worker
+            // may be the first to know it), not the pre-prepare guess.
+            ...(taskId ? { taskId } : {}),
+            // Persisted verbatim and separately from `recovery`: no close_abort
+            // was sent, so writes are still fenced even when the close itself is
+            // retryable. Re-deriving this on restore is what re-opened admission.
+            admission: 'fenced',
+          },
+        );
+        ds.session.mojoCloseJournal = committed.mojoCloseJournal;
+        ds.session.riffParentTaskId = committed.riffParentTaskId;
+        journalled = true;
+      } catch (err) {
+        // Fail closed: keep the runtime fence exactly as strict as the disk state
+        // is ambiguous. Never fall back to a rollback.
+        logger.error(
+          `[${tag(ds)}] Mojo ${recovery} close verdict could not be journalled: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      // An irreversible teardown leaves ONLY the local commit outstanding, so the
+      // runtime state must be `prepared` -- parking it at `uncertain` made every
+      // retry bounce off the fence and the row could never be closed at all.
+      // NOTE: the runtime phase deliberately stays `uncertain` for everything
+      // that is not a journalled irreversible teardown. A retryable-but-fenced
+      // close is recorded as `preparing` in the DURABLE journal (a restart may
+      // retry the cancel), but within this process the reconciliation gate
+      // refuses a retry either way, so distinguishing the runtime phase here
+      // would be an untestable claim.
+      ds.remoteCloseState = {
+        phase: irreversible && journalled ? 'prepared' : 'uncertain',
+        requestId,
+        ...(taskId ? { taskId } : {}),
+      };
+      logger.error(
+        `[${tag(ds)}] mojo worker close prepare failed as ${recovery} `
+        + `(${result.error ?? 'unknown'}); admission stays fenced, `
+        + `journal=${journalled ? ds.session.mojoCloseJournal?.phase ?? 'unknown' : 'unwritten'}`,
+      );
+      if (!journalled) {
+        return {
+          ok: false,
+          error: 'mojo_durable_close_failed',
+          retryable: true,
+          recovery,
+          ...(taskId ? { taskId } : {}),
+        };
+      }
+      // Fenced but still retryable (an unproven LOCAL termination; the
+      // irreversible remote cancel never ran). The close may be retried as a
+      // close -- reporting it as `mojo_close_reconciliation_required` would
+      // strand a session a plain retry can still finish.
+      if (recovery === 'retryable') {
+        return {
+          ok: false,
+          error: 'mojo_cancel_failed',
+          retryable: true,
+          recovery,
+          ...(taskId ? { taskId } : {}),
+        };
+      }
+      return irreversible
+        // Retryable, but only as a LOCAL commit: the durable journal is now
+        // commit-only, so a retry can never issue a second cancel.
+        ? {
+            ok: false,
+            error: 'mojo_close_commit_required',
+            retryable: true,
+            recovery,
+            ...(taskId ? { taskId } : {}),
+          }
+        // Unknown outcome: a blind retry proves nothing. Demand reconciliation
+        // instead of advertising a retry that cannot succeed.
+        : {
+            ok: false,
+            error: 'mojo_close_reconciliation_required',
+            retryable: false,
+            recovery,
+            ...(taskId ? { taskId } : {}),
+          };
+    }
+    const admissionRestored = await abortLiveRemoteWorkerClose(ds, requestId, {
+      allowAbsentAfterProvenRestore: matchedCloseResult,
+    });
+    // NOTE: no separate "refused" branch here. finishMojoCloseAbort already keeps
+    // a durable fenced row when admissionRestored is false; the bug was never its
+    // behaviour but the CALLER inventing that flag from `close_abort_result.ok`.
+    // An extra branch differing only in which non-clearing row it writes was not
+    // distinguishable by any test, so it is not claimed as a fix.
+    try {
+      const committed = sessionStore.finishMojoCloseAbort(
+        ds.session.sessionId,
+        requestId,
+        { admissionRestored, ...(taskId ? { taskId } : {}) },
+      );
+      ds.session.mojoCloseJournal = committed.mojoCloseJournal;
+      ds.session.riffParentTaskId = committed.riffParentTaskId;
+    } catch (err) {
+      // The worker may have restored admission, but without a durable journal
+      // clear a crash would still be ambiguous. Keep the daemon fence aligned
+      // with the disk-side uncertainty instead of accepting new input.
+      ds.remoteCloseState = {
+        phase: admissionRestored ? 'abort_restored' : 'uncertain',
+        requestId,
+        ...(taskId ? { taskId } : {}),
+      };
+      logger.error(
+        `[${tag(ds)}] Mojo close abort could not be committed durably: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return {
+        ok: false,
+        error: 'mojo_durable_close_failed',
+        retryable: true,
+        ...(taskId ? { taskId } : {}),
+      };
+    }
+    logger.warn(
+      `[${tag(ds)}] mojo worker close prepare failed: ${result.error ?? 'unknown'}; `
+      + `session remains active${taskId ? ` (task ${taskId})` : ''}`,
+    );
+    return {
+      ok: false,
+      error: 'mojo_cancel_failed',
+      retryable: true,
+      ...(taskId ? { taskId } : {}),
+    };
+  }
+
+  if (result.taskId) {
+    ds.session.riffParentTaskId = result.taskId;
+    try {
+      sessionStore.updateSession(ds.session);
+    } catch (err) {
+      await abortLiveRemoteWorkerClose(ds, requestId);
+      logger.error(
+        `[${tag(ds)}] ${backendType} close lineage persistence failed; close aborted: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return {
+        ok: false,
+        error: 'riff_durable_close_failed',
+        retryable: true,
+        taskId: result.taskId,
+      };
+    }
+  }
+
+  if (!result.ok) {
+    await abortLiveRemoteWorkerClose(ds, requestId, {
+      allowAbsentAfterProvenRestore: matchedCloseResult,
+    });
+    logger.warn(
+      `[${tag(ds)}] ${backendType} worker close prepare failed: ${result.error ?? 'unknown'}; `
+      + `session remains active${taskId ? ` (task ${taskId})` : ''}`,
+    );
+    return {
+      ok: false,
+      error: 'riff_worker_close_failed',
+      retryable: true,
+      ...(taskId ? { taskId } : {}),
+    };
+  }
+
+  ds.remoteCloseState = {
+    phase: 'prepared',
+    requestId,
+    ...(taskId ? { taskId } : {}),
+  };
+  logger.info(`[${tag(ds)}] ${backendType} worker close prepared and remote cancellation confirmed`);
+  return { ok: true, ...(taskId ? { taskId } : {}) };
+}
+
+/** Await remote cancellation for any Riff owner before its durable row is
+ * closed. Live workers use prepare/commit; worker-less rows cancel their exact
+ * persisted task through current authoritative bot config. */
+async function prepareRiffExplicitClose(
+  ds: DaemonSession | undefined,
+  stored: Session | undefined,
+): Promise<RemoteClosePreparation> {
+  const session = ds?.session ?? stored;
+  if (!session) return { ok: true };
+  const backendType = ds?.initConfig?.backendType ?? session.backendType;
+  const taskId = session.riffParentTaskId;
+  if (ds?.remoteShutdownState) {
+    const fencedTaskId = Object.prototype.hasOwnProperty.call(ds.remoteShutdownState, 'taskId')
+      ? ds.remoteShutdownState.taskId
+      : taskId;
+    return {
+      ok: false,
+      error: 'remote_shutdown_fence_in_progress',
+      retryable: true,
+      ...(typeof fencedTaskId === 'string' && fencedTaskId ? { taskId: fencedTaskId } : {}),
+    };
+  }
+  if (ds?.remoteCloseState) {
+    return {
+      ok: false,
+      error: 'riff_close_reconciliation_required',
+      retryable: true,
+      ...(ds.remoteCloseState.taskId ? { taskId: ds.remoteCloseState.taskId } : {}),
+    };
+  }
+  if (backendType !== 'riff') return { ok: true };
+  if (ds?.initConfig?.adoptMode || ds?.adoptedFrom || session.adoptedFrom) return { ok: true };
+
+  if (ds?.worker && !ds.worker.killed) {
+    if (!stored || stored.status !== 'active') {
+      return {
+        ok: false,
+        error: 'riff_row_inconsistent',
+        retryable: true,
+        ...(taskId ? { taskId } : {}),
+      };
+    }
+    return prepareLiveRemoteWorkerClose(ds, 'riff');
+  }
+
+  const durableBefore = sessionStore.getSession(session.sessionId);
+  if (ds && durableBefore
+      && ds.session.riffParentTaskId !== durableBefore.riffParentTaskId) {
+    const authoritativeTaskId = durableBefore.riffParentTaskId ?? ds.session.riffParentTaskId;
+    logger.warn(
+      `[${tag(ds)}] explicit close refused before cancellation: runtime/durable Riff lineage differs `
+      + `(${ds.session.riffParentTaskId ?? 'none'}/${durableBefore.riffParentTaskId ?? 'none'})`,
+    );
+    return {
+      ok: false,
+      error: 'riff_task_changed',
+      retryable: true,
+      ...(authoritativeTaskId ? { taskId: authoritativeTaskId } : {}),
+    };
+  }
+  if (!taskId) return { ok: true };
+
+  let riffConfig;
+  const larkAppId = ds?.larkAppId ?? session.larkAppId;
+  try { if (larkAppId) riffConfig = getBot(larkAppId).config.riff; } catch { /* bot removed */ }
+  const cleanup = await cleanupExplicitSessionBacking({
+    sessionId: session.sessionId,
+    backendType,
+    riffParentTaskId: taskId,
+    riffConfig,
+  });
+  const closeLabel = ds ? tag(ds) : session.sessionId.slice(0, 8);
+  if (!cleanup.ok) {
+    logger.warn(
+      `[${closeLabel}] explicit close refused: ${cleanup.kind}; `
+      + `Riff task ${taskId} remains active and retryable`,
+    );
+    return {
+      ok: false,
+      error: cleanup.kind === 'riff_config_missing' ? 'riff_config_missing' : 'riff_cancel_failed',
+      retryable: true,
+      taskId,
+    };
+  }
+  if (cleanup.kind !== 'cancelled_riff') return { ok: true };
+
+  const latest = sessionStore.getSession(session.sessionId);
+  const latestTaskId = latest?.riffParentTaskId;
+  const runtimeTaskId = ds?.session.riffParentTaskId;
+  if (!latest || latest.status !== 'active' || latestTaskId !== cleanup.taskId
+      || (ds && runtimeTaskId !== cleanup.taskId)) {
+    logger.warn(
+      `[${closeLabel}] explicit close cancelled stale Riff task ${cleanup.taskId}, `
+      + `but runtime/durable lineage or status changed to `
+      + `${runtimeTaskId ?? 'none'}/${latestTaskId ?? 'none'}/${latest?.status ?? 'missing'}; retry required`,
+    );
+    return {
+      ok: false,
+      error: 'riff_task_changed',
+      retryable: true,
+      taskId: latestTaskId ?? runtimeTaskId ?? cleanup.taskId,
+    };
+  }
+
+  logger.info(`[${closeLabel}] Riff task ${cleanup.taskId} cancellation prepared for explicit close`);
+  return { ok: true, taskId: cleanup.taskId };
+}
+
+/**
+ * Prove a mojo session's remote lineage is cancelled BEFORE its row is published
+ * as closed — the mojo half of what prepareRiffExplicitClose does.
+ *
+ * Without this, `/close` on a workerless mojo session marked the row closed and
+ * returned success while the cancel was still in flight, so a failed cancel left
+ * the operator believing the session was gone while the remote one kept running
+ * and holding the injected credential. The retained lineage was not a recovery
+ * path either: cancelMojoSessionById has exactly one call site (the best-effort
+ * killWorker teardown), which a second `/close` can no longer reach because the
+ * first close removed the session from the active registry.
+ *
+ * A live worker uses prepare/commit: MojoBackend.destroySession() awaits the
+ * cancel (including the pre-init window), then the daemon durably closes the row
+ * before committing worker retirement. A failed durable write keeps the exact
+ * generation prepared so retry commits without cancelling twice.
+ *
+ * An open durable row with no entry in the active registry cannot be cancelled
+ * from here at all (every helper the cancel needs is keyed on DaemonSession), so
+ * it is refused as retryable rather than published as closed — restoring the owner
+ * makes the retry work.
+ */
+async function prepareMojoExplicitClose(
+  ds: DaemonSession | undefined,
+  stored: Session | undefined,
+): Promise<RemoteClosePreparation> {
+  const session = ds?.session ?? stored;
+  if (!session) return { ok: true };
+  if (ds?.initConfig?.adoptMode || ds?.adoptedFrom || session.adoptedFrom) return { ok: true };
+  // A row whose lineage was PARKED (restore-time quarantine moves the id here and
+  // clears the active slot) still has a remote session running. It is reported as
+  // a residual on every close of this row, including replays of an already-closed
+  // one — which is what makes the outcome idempotent instead of degrading to a
+  // failure once the owner is gone.
+  const parked = mojoCloseResidualForRow(stored ?? session);
+  const remoteId = stored ? stored.riffParentTaskId : session.riffParentTaskId;
+  const runtimeClose = ds?.session.mojoCloseJournal;
+  const storedClose = stored?.mojoCloseJournal;
+  if (ds && stored && ds.session !== stored && runtimeClose) {
+    const runtimeMatchesDurable = !!storedClose
+      && runtimeClose.phase === storedClose.phase
+      && runtimeClose.requestId === storedClose.requestId
+      && runtimeClose.taskId === storedClose.taskId
+      && runtimeClose.updatedAt === storedClose.updatedAt;
+    if (!runtimeMatchesDurable) {
+      // A runtime copy is not durable authority. In particular, a stale/forged
+      // in-memory `prepared` value must never bypass cancellation, while a real
+      // prepared store row must not be re-cancelled because a detached runtime
+      // copy missed the last sync.
+      logger.error(
+        `[${session.sessionId.slice(0, 8)}] explicit close refused: runtime/durable Mojo journal mismatch`,
+      );
+      return {
+        ok: false,
+        error: 'mojo_close_reconciliation_required',
+        retryable: true,
+        ...((storedClose?.taskId ?? runtimeClose.taskId ?? remoteId)
+          ? { taskId: (storedClose?.taskId ?? runtimeClose.taskId ?? remoteId)! }
+          : {}),
+      };
+    }
+  }
+  let durableClose = storedClose ?? runtimeClose;
+  if (durableClose && !sessionStore.isValidMojoCloseJournal(durableClose)) {
+    logger.error(
+      `[${session.sessionId.slice(0, 8)}] explicit close refused: malformed Mojo close journal`,
+    );
+    return {
+      ok: false,
+      error: 'mojo_close_reconciliation_required',
+      retryable: true,
+      ...(remoteId ? { taskId: remoteId } : {}),
+    };
+  }
+  // Already closed is normally an idempotent replay. A journal on a closed row
+  // is NOT normal (the status transition clears it atomically), so do not flatten
+  // that contradictory disk state into an ordinary success.
+  if (stored && stored.status === 'closed') {
+    if (durableClose) {
+      return {
+        ok: false,
+        error: 'mojo_close_reconciliation_required',
+        retryable: true,
+        ...((durableClose.taskId ?? remoteId)
+          ? { taskId: (durableClose.taskId ?? remoteId)! }
+          : {}),
+      };
+    }
+    return parked ? { ok: true, residual: parked } : { ok: true };
+  }
+  if (durableClose?.phase === 'prepared') {
+    // A prior daemon already received and durably recorded the irreversible
+    // worker cancellation proof. Finish only the local status/lineage commit;
+    // repeating the CLI cancel would turn an idempotent recovery into failure.
+    // A parked remote lineage outranks the journal's LOCAL residual in the one
+    // slot the response has (it names a live remote session); the local marker
+    // still surfaces whenever nothing is parked.
+    return {
+      ok: true,
+      ...((durableClose.taskId ?? remoteId)
+        ? { taskId: (durableClose.taskId ?? remoteId)! }
+        : {}),
+      // The journal's residual is a stored copy of the original proof; whether
+      // it still describes reality is the ledger's call (a reboot between the
+      // prepare and this replay may have discharged the handle).
+      ...(parked
+        ? { residual: parked }
+        : residualField(liveLocalResidual(session.sessionId, durableClose.localResidual))),
+    };
+  }
+  const matchingRuntimePreparedProof = durableClose?.phase === 'preparing'
+    && ds?.remoteCloseState?.phase === 'prepared'
+    && ds.remoteCloseState.requestId === durableClose.requestId;
+  const matchingRuntimeAbortRestoreProof = durableClose?.phase === 'preparing'
+    && ds?.remoteCloseState?.phase === 'abort_restored'
+    && ds.remoteCloseState.requestId === durableClose.requestId;
+  const hasLiveWorker = !!ds?.worker && !ds.worker.killed;
+  if (ds && matchingRuntimePreparedProof && !hasLiveWorker) {
+    // Workerless cancellation is irreversible too. If publishing `prepared`
+    // failed after the CLI proved cancellation, retain the in-memory proof and
+    // let a retry publish that SAME proof before committing the row. Never issue
+    // a second cancel merely because the first durable write failed.
+    try {
+      const committed = sessionStore.markMojoClosePrepared(
+        session.sessionId,
+        ds.remoteCloseState!.requestId,
+        ds.remoteCloseState!.taskId,
+        ds.remoteCloseState!.localResidual,
+      );
+      session.mojoCloseJournal = committed.mojoCloseJournal;
+      session.riffParentTaskId = committed.riffParentTaskId;
+      return {
+        ok: true,
+        ...(ds.remoteCloseState!.taskId ? { taskId: ds.remoteCloseState!.taskId } : {}),
+        ...(parked
+          ? { residual: parked }
+          : residualField(liveLocalResidual(session.sessionId, ds.remoteCloseState!.localResidual))),
+      };
+    } catch (err) {
+      logger.error(
+        `[${tag(ds)}] Workerless Mojo close proof could not be persisted for durable commit: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return {
+        ok: false,
+        error: 'mojo_durable_close_failed',
+        retryable: true,
+        ...(ds.remoteCloseState!.taskId ? { taskId: ds.remoteCloseState!.taskId } : {}),
+      };
+    }
+  }
+  if (ds && matchingRuntimeAbortRestoreProof && !hasLiveWorker) {
+    // No worker admission changed on this path, but the durable intent must be
+    // cleared before another cancel attempt is allowed. A failed clear keeps the
+    // central admission fence aligned with disk.
+    try {
+      const restoredState = ds.remoteCloseState!;
+      const committed = sessionStore.finishMojoCloseAbort(
+        session.sessionId,
+        restoredState.requestId,
+        {
+          admissionRestored: true,
+          ...(restoredState.taskId ? { taskId: restoredState.taskId } : {}),
+        },
+      );
+      session.mojoCloseJournal = committed.mojoCloseJournal;
+      session.riffParentTaskId = committed.riffParentTaskId;
+      ds.remoteCloseState = undefined;
+      durableClose = undefined;
+    } catch (err) {
+      logger.error(
+        `[${tag(ds)}] Workerless Mojo abort proof could not clear the durable close journal: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return {
+        ok: false,
+        error: 'mojo_durable_close_failed',
+        retryable: true,
+        ...(ds.remoteCloseState!.taskId ? { taskId: ds.remoteCloseState!.taskId } : {}),
+      };
+    }
+  }
+  const livePreparedProof = matchingRuntimePreparedProof
+    && !!ds.worker
+    && !ds.worker.killed;
+  const liveAbortRestoreProof = matchingRuntimeAbortRestoreProof
+    && !!ds.worker
+    && !ds.worker.killed;
+  if (durableClose && !livePreparedProof && !liveAbortRestoreProof) {
+    const journalLineage = durableClose.taskId ?? remoteId;
+    // The RECONCILIATION EXIT this journal has always promised (types.ts:
+    // "pending explicit reconciliation"). Before it existed, every journal
+    // without a matching runtime proof was refused here forever: restore
+    // downgraded crashed closes to `uncertain` and quarantined the row
+    // unregistered, this branch then refused each /close as
+    // reconciliation_required, and CLI-mismatch cleanup re-quarantined it —
+    // a permanent brick whose remote session kept credentials, fixable only
+    // by hand-editing JSON state (P1-1). Two journal shapes are reconcilable
+    // by an EXPLICIT close:
+    //   * `uncertain` — no retry can classify the crashed cancel without a
+    //     remote status oracle, so the row DRAINS: it closes with the lineage
+    //     parked as an explicit residual (same isolation-over-deletion shape
+    //     as a quarantined lineage — cleanup is remote, the id is preserved,
+    //     and replays keep reporting it).
+    //   * `preparing` + recovery 'retryable' — the failed prepare durably
+    //     recorded that retrying the cancel is legitimate (P1-2). With a
+    //     registered owner the close falls through and re-runs the cancel
+    //     under a fresh requestId (beginMojoCloseJournal accepts the restart);
+    //     without one there is nothing to cancel through, so it drains like
+    //     `uncertain`.
+    const retryableJournal = durableClose.phase === 'preparing'
+      && durableClose.recovery === 'retryable';
+    // NEVER drain past a live worker (P0-new). Draining set the row closed and
+    // deleted the registry entry while killWorker's remote guard (P0-2) refused
+    // the request-less retirement — the still-running, credential-carrying mojo
+    // worker became unreachable by every entry point. A live worker is also the
+    // one owner that can produce FRESH evidence, so it falls through to
+    // prepare/commit below instead: beginMojoCloseJournal accepts the takeover
+    // of an uncertain/retryable journal under the new requestId, the worker
+    // re-runs destroySession, and killWorker retires it legally with the commit
+    // requestId. (An in-process runtime `uncertain` fence still refuses inside
+    // prepareLiveRemoteWorkerClose — deliberately; refusal keeps the worker
+    // reachable, which is exactly what the drain violated.)
+    const drainable = !hasLiveWorker
+      && (durableClose.phase === 'uncertain' || (retryableJournal && !ds));
+    if (drainable) {
+      logger.warn(
+        `[${session.sessionId.slice(0, 8)}] explicit close drains ${durableClose.phase} Mojo `
+        + `journal (${durableClose.requestId}): the row closes`
+        + (journalLineage
+          ? ` and lineage ${journalLineage} is parked as a residual for manual cleanup`
+          : ' with no lineage to park'),
+      );
+      if (!journalLineage) return parked ? { ok: true, residual: parked } : { ok: true };
+      return {
+        ok: true,
+        residual: parked ?? { reason: 'mojo_lineage_quarantined', taskId: journalLineage },
+        parkMojoLineage: journalLineage,
+      };
+    }
+    const liveWorkerReconciles = hasLiveWorker
+      && (durableClose.phase === 'uncertain' || retryableJournal);
+    if (!retryableJournal && !liveWorkerReconciles) {
+      logger.warn(
+        `[${session.sessionId.slice(0, 8)}] explicit close requires Mojo reconciliation: `
+        + `durable journal is ${durableClose.phase} (${durableClose.requestId})`,
+      );
+      return {
+        ok: false,
+        error: 'mojo_close_reconciliation_required',
+        retryable: true,
+        ...(journalLineage ? { taskId: journalLineage } : {}),
+      };
+    }
+    // Fall through: a retryable journal with a registered owner re-runs the
+    // cancel (live worker → prepare/commit; workerless → the cancel below),
+    // and an uncertain journal with a LIVE worker goes to prepare/commit.
+  }
+  // A live worker is the only authority that can cover the pre-init window:
+  // destroySession waits for system/init, then returns the exact lineage in its
+  // close_result. This must run even when the durable row has no id yet.
+  if (ds?.worker && !ds.worker.killed) {
+    if (!stored || stored.status !== 'active') {
+      return {
+        ok: false,
+        error: 'mojo_close_identity_missing',
+        retryable: true,
+        ...(remoteId ? { taskId: remoteId } : {}),
+      };
+    }
+    return prepareLiveRemoteWorkerClose(ds, 'mojo');
+  }
+  // Nothing ACTIVE to cancel: either a clean row, or a parked-only one.
+  if (!remoteId) return parked ? { ok: true, residual: parked } : { ok: true };
+  if (!ds) {
+    // An open durable row carrying a lineage, with no owner in the active
+    // registry. Everything the cancel needs (frozen identity, launch identity)
+    // hangs off DaemonSession, so this cannot be cancelled from here — and
+    // silently publishing it as closed would be the same lie as before, just
+    // through a different door. Fail closed; a restore/adopt puts the owner back
+    // and makes the retry work.
+    logger.warn(
+      `[${session.sessionId.slice(0, 8)}] explicit close refused: mojo lineage ${remoteId} `
+      + 'has no active owner to cancel through; row stays open',
+    );
+    return { ok: false, error: 'mojo_close_identity_missing', retryable: true, taskId: remoteId };
+  }
+  const resolved = resolveMojoCancelLaunch(ds, remoteId, 'explicit close');
+  if (!resolved.ok) {
+    if (resolved.reason === 'bot_gone') {
+      // NOT permanent: re-registering the bot restores the config this needs, so
+      // this is retryable and must not close the row behind the operator's back.
+      return { ok: false, error: 'mojo_config_missing', retryable: true, taskId: remoteId };
+    }
+    // Quarantined: cancelling could reach a different tenant, and no retry can
+    // ever make an unverifiable control plane verifiable. Refusing forever would
+    // strand the row, so the close proceeds — but as an EXPLICIT residual, never
+    // as an ordinary success, and the lineage stays on the row for manual cleanup.
+    //
+    // The id is PARKED as part of the durable close (see parkMojoLineage), which is
+    // what makes the decision replayable: a second close reads it back out of the
+    // parked slot instead of tripping over an active lineage with no owner.
+    return {
+      ok: true,
+      residual: parked ?? { reason: 'mojo_lineage_quarantined', taskId: remoteId },
+      parkMojoLineage: remoteId,
+    };
+  }
+
+  const requestId = randomUUID();
+  try {
+    const committed = sessionStore.beginMojoCloseJournal(
+      session.sessionId,
+      requestId,
+      remoteId,
+    );
+    session.mojoCloseJournal = committed.mojoCloseJournal;
+    session.riffParentTaskId = committed.riffParentTaskId;
+  } catch (err) {
+    logger.error(
+      `[${tag(ds)}] Workerless Mojo close journal could not be persisted before cancellation: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return {
+      ok: false,
+      error: 'mojo_durable_close_failed',
+      retryable: true,
+      taskId: remoteId,
+    };
+  }
+  ds.remoteCloseState = { phase: 'preparing', requestId, taskId: remoteId };
+  const outcome = await cancelMojoSessionById(resolved.launchCfg, remoteId).catch((err: unknown) => ({
+    kind: 'failed' as const,
+    message: err instanceof Error ? err.message : String(err),
+    retryable: true,
+  }));
+  // Structured, NOT a boolean: `if (!outcome)` on an object is always false and
+  // would turn every failure into a silent success. `already_terminal` counts as
+  // gone, but only when the classifier could PROVE it (see MojoCancelOutcome).
+  if (!isMojoRemoteGone(outcome)) {
+    try {
+      const committed = sessionStore.finishMojoCloseAbort(
+        session.sessionId,
+        requestId,
+        { admissionRestored: true, taskId: remoteId },
+      );
+      session.mojoCloseJournal = committed.mojoCloseJournal;
+      session.riffParentTaskId = committed.riffParentTaskId;
+      ds.remoteCloseState = undefined;
+    } catch (err) {
+      // There was no live worker admission to restore, but accepting input while
+      // disk still says `preparing` would recreate the same split-brain. Retain
+      // an abort-restored runtime proof so a retry clears the journal first.
+      ds.remoteCloseState = { phase: 'abort_restored', requestId, taskId: remoteId };
+      logger.error(
+        `[${tag(ds)}] Workerless Mojo close abort could not be committed durably: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return {
+        ok: false,
+        error: 'mojo_durable_close_failed',
+        retryable: true,
+        taskId: remoteId,
+      };
+    }
+    logger.warn(
+      `[${tag(ds)}] explicit close refused: mojo session ${remoteId} could not be `
+      + 'cancelled; the row stays open and the lineage is retained so the close is retryable'
+      + (outcome.kind === 'failed' ? ` (${outcome.message})` : ''),
+    );
+    return { ok: false, error: 'mojo_cancel_failed', retryable: true, taskId: remoteId };
+  }
+  // The workerless local-subtree proof travels ON the outcome (see
+  // cancelMojoSessionById): a weak-only proof keeps its containment handle, and
+  // this close must say so — durably, so retries and restarts republish it.
+  const localResidual = outcome.kind !== 'failed' ? outcome.localResidual : undefined;
+  try {
+    const committed = sessionStore.markMojoClosePrepared(
+      session.sessionId,
+      requestId,
+      remoteId,
+      localResidual,
+    );
+    session.mojoCloseJournal = committed.mojoCloseJournal;
+    session.riffParentTaskId = committed.riffParentTaskId;
+  } catch (err) {
+    // Cancellation is proven and cannot be rolled back. Keep the runtime proof
+    // prepared so the same daemon can publish it on retry; after a crash the
+    // durable `preparing` journal remains fenced for explicit reconciliation.
+    ds.remoteCloseState = {
+      phase: 'prepared',
+      requestId,
+      taskId: remoteId,
+      ...(localResidual ? { localResidual } : {}),
+    };
+    logger.error(
+      `[${tag(ds)}] Workerless Mojo close proof persistence failed after cancellation: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return {
+      ok: false,
+      error: 'mojo_durable_close_failed',
+      retryable: true,
+      taskId: remoteId,
+    };
+  }
+  ds.remoteCloseState = {
+    phase: 'prepared',
+    requestId,
+    taskId: remoteId,
+    ...(localResidual ? { localResidual } : {}),
+  };
+  // Deliberately does NOT clear the runtime lineage here. sessionStore commonly
+  // holds the very same Session object, so an early clear is visible to the durable
+  // save — and if that save then fails, the rollback has already lost the id it
+  // would restore while the on-disk row may still carry it. The lineage is cleared
+  // atomically with the status change instead (clearRiffParentTaskId), and the
+  // repeat-cancel is suppressed with an explicit flag rather than by mutating
+  // shared state early.
+  logger.info(`[${tag(ds)}] mojo session ${remoteId} cancelled for explicit close`);
+  // Cancelling the ACTIVE lineage says nothing about a previously parked one: a row
+  // can carry both (restore parked the old id, the session then created a new one).
+  // Reporting a plain success here would hide the parked remote session entirely.
+  // With nothing parked, the LOCAL residual takes the slot for the same reason.
+  return {
+    ok: true,
+    taskId: remoteId,
+    ...(parked
+      ? { residual: parked }
+      : localResidual
+        ? { residual: { reason: localResidual } }
+        : {}),
+  };
+}
+
+/**
+ * The residual a row carries because a lineage was PARKED as unverifiable.
+ *
+ * Read from the parked slot, never from the active one: restore-time quarantine
+ * moves the id into `mojoQuarantinedLineage` and clears `riffParentTaskId`, so a
+ * check against the active slot misses the production shape completely — the row
+ * would close as an ordinary success while its remote session kept running.
+ *
+ * May hold more than one id (comma-joined) when two unverifiable lineages were
+ * parked together; it is passed through verbatim so manual cleanup sees both.
+ */
+export function mojoCloseResidualForRow(session: Session | undefined): CloseResidual | undefined {
+  // A parked REMOTE lineage outranks a local residual: it names a live remote
+  // session burning cloud time, the more urgent cleanup, and the response has a
+  // single residual slot. The local residual surfaces whenever nothing is parked.
+  const parked = session?.mojoQuarantinedLineage;
+  if (parked) return { reason: 'mojo_lineage_quarantined', taskId: parked };
+  if (session?.mojoLocalResidual) return liveLocalResidual(session.sessionId, session.mojoLocalResidual);
+  return undefined;
+}
+
+/**
+ * Surface a stored LOCAL residual only while its containment handle is still
+ * outstanding.
+ *
+ * The containment-handle ledger is the SOURCE OF TRUTH for the device-isolation
+ * blocker; `Session.mojoLocalResidual` (and a journal's `localResidual`) are
+ * DERIVED display state with deliberately no clear path of their own: the two
+ * paths that discharge a handle — boot reconciliation and operator revoke —
+ * operate on the one global ledger, and having them also rewrite session rows
+ * would tie a global cleanup to whichever bots' per-bot row files happen to be
+ * loaded at the time. Deriving at read time keeps the two stores fork-free: the
+ * handle is gone → the "credentialed process may remain on this host" claim is
+ * no longer true, report nothing; the ledger cannot be read → we cannot rule the
+ * claim out, keep reporting it (fail-closed, matching hasUnprovenContainment's
+ * own contract of throwing rather than answering false).
+ */
+/** Spread helper: `{ residual }` when present, `{}` otherwise. */
+function residualField(residual: CloseResidual | undefined): { residual?: CloseResidual } {
+  return residual ? { residual } : {};
+}
+
+function liveLocalResidual(
+  sessionId: string,
+  residual: NonNullable<Session['mojoLocalResidual']> | undefined,
+): CloseResidual | undefined {
+  if (!residual) return undefined;
+  try {
+    if (!hasUnprovenContainment(sessionId)) return undefined;
+  } catch {
+    // Unreadable ledger: a handle may exist, so the residual stays reported.
+  }
+  return { reason: residual };
 }
 
 /**
@@ -2177,7 +4422,35 @@ function reclaimParkedCrashDiagnostic(ds: DaemonSession): void {
   try { unlinkSync(join(config.session.dataDir, 'crash-diagnostics', `${ds.session.sessionId}.ansi`)); } catch { /* absent — benign */ }
 }
 
+/**
+ * Consume a queued suspend claim once its goal state is reached.
+ *
+ * A claim only ever means "suspend the generation that is producing right now".
+ * It is therefore consumed the moment that generation stops running, by ANY
+ * route — the deferred checkpoint itself, a `/cd` or read-isolation switch that
+ * suspended first, or an outright crash. Leaving it set is not a harmless
+ * no-op: `runPendingSuspendIfSettled` fires on the NEXT generation's first
+ * screen checkpoint, and its `ownsGeneration` predicate passes there (that
+ * worker legitimately owns the session), so the replacement gets suspended for
+ * a request that was never about it.
+ *
+ * The old code did have a "worker already gone → drop the flag" branch, but it
+ * lived inside the checkpoint — which by definition stops running once the
+ * session goes quiet. The clear needs to hang off the lifecycle events instead.
+ */
+function clearPendingSuspendClaim(ds: DaemonSession, why: string): void {
+  if (ds.pendingSuspendReason === undefined && ds.pendingSuspendGeneration === undefined) return;
+  const reason = ds.pendingSuspendReason;
+  ds.pendingSuspendReason = undefined;
+  ds.pendingSuspendGeneration = undefined;
+  logger.debug(`[${tag(ds)}] Cleared queued suspend claim (${reason ?? 'none'}): ${why}`);
+}
+
 export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boolean {
+  if (hasProtectedSessionMutationOwnership(ds)) {
+    logger.warn(`[${tag(ds)}] Refused worker suspend (${reason}) while Codex App dispatch ownership is non-empty`);
+    return false;
+  }
   if (isSessionTransferring(ds)) {
     logger.warn(`[${tag(ds)}] Suspend refused while routing transfer is in progress`);
     return false;
@@ -2246,9 +4519,100 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
       },
     });
   }
+  // Goal state reached. Whoever queued a suspend for this generation got what
+  // they asked for — including the paths that never touch the deferred
+  // checkpoint (`/cd`, read-isolation switch, sweepIdleWorkers).
+  clearPendingSuspendClaim(ds, `suspended (${reason})`);
   logger.info(`[${tag(ds)}] Worker + CLI suspended (${reason}); session stays active, cold-resumes from transcript on next message`);
   return true;
 }
+
+/**
+ * Cash in a queued suspend. Called once the session leaves the producing states
+ * it was queued for; a no-op during working/analyzing — that IS why it queued.
+ *
+ * Callers MUST defer this out of the status handler's synchronous body
+ * (queueMicrotask) — suspendWorker clears `ds.worker` and `ds.lastScreenStatus`,
+ * and the rest of that handler still reads both to record the usage delta, flip
+ * the turn reaction ✋→✅, emit the state-transition hook, and render the final
+ * card. Running it inline would skip exactly the turn-completion bookkeeping
+ * this whole feature exists to protect.
+ *
+ * `ownsGeneration` is the calling handler's generation check (`ownsWorkerSession`),
+ * and it is **defense-in-depth** — not a guard against a race anyone has shown to
+ * be reachable today. Two earlier drafts of this comment each claimed a concrete
+ * race; both were wrong, so the reasoning is spelled out here to stop a third:
+ *
+ *   - It is NOT "a stale worker's late `idle` reaches `screenshot_uploaded`":
+ *     the message handler's fence (`if (ds.worker !== worker) return`) sits
+ *     BEFORE the switch and already drops every message from a replaced worker.
+ *   - It is NOT "two microtasks in one tick, the first suspends + re-forks and
+ *     the second meets the replacement": `suspendWorker` only nulls `ds.worker`,
+ *     it never re-forks (a re-fork is driven by external input, i.e. a later
+ *     MACROtask), and the microtask queue drains without letting one in. The
+ *     second microtask therefore sees `ds.worker === null` and this predicate
+ *     early-returns on that — a replacement is not what it meets.
+ *
+ * What it does buy: a queued callback can only ever act while its own generation
+ * still owns the session. That keeps this deferral safe against future callers,
+ * new synchronous side effects between enqueue and drain, and any path that
+ * starts re-forking earlier than today. Consuming the claim is a destructive act
+ * on a live worker, so it is worth gating even without a demonstrated race.
+ * A checkpoint from a generation that no longer owns the session keeps the flag
+ * pending; only the owning generation may consume it.
+ *
+ * Deliberately the generation check ALONE, not `ownsLifecycleMutation` (which
+ * also folds in "not transferring"): a routing transfer is a temporary refusal,
+ * not a lost claim, and it is suspendWorker's own guard to make. Screen updates
+ * stop once a session sits quiet, so treating transfer as "not ours" would park
+ * the flag with no later checkpoint to revive it — hence the explicit
+ * transfer-settled retry below.
+ */
+function runPendingSuspendIfSettled(ds: DaemonSession, ownsGeneration?: () => boolean): void {
+  const reason = ds.pendingSuspendReason;
+  if (!reason) return;
+  if (ownsGeneration && !ownsGeneration()) return;
+  // A claim belongs to the generation that was producing when it was queued.
+  // Reaching a LATER generation means its own fulfilment checkpoint never ran
+  // (crash, or another path suspended first) — consume it rather than suspend a
+  // worker the request never asked about. clearPendingSuspendClaim covers the
+  // normal exits; this is the backstop for a claim that slipped past them.
+  if (
+    ds.pendingSuspendGeneration !== undefined
+    && ds.workerGeneration !== undefined
+    && ds.pendingSuspendGeneration !== ds.workerGeneration
+  ) {
+    clearPendingSuspendClaim(ds, 'generation changed');
+    return;
+  }
+  const st = ds.lastScreenStatus;
+  if (st !== 'idle' && st !== 'limited') return;
+  // Worker already gone (crash / suspended by another path): the goal state is
+  // reached, so drop the flag. Falling through to suspendWorker would take its
+  // no-worker branch and clear managedTurnOrigin/workerReady for a generation
+  // this queued request never owned.
+  if (!ds.worker || ds.worker.killed) {
+    clearPendingSuspendClaim(ds, 'worker already gone');
+    return;
+  }
+  // Clear only on success. suspendWorker refuses mid-routing-transfer (and for a
+  // backend that stopped being suspendable), and that refusal is temporary —
+  // eating the flag would silently drop the request until the next `suspend all`.
+  if (suspendWorker(ds, reason)) {
+    // suspendWorker already consumed the claim (goal state reached); logging
+    // here keeps the "fulfilled by the deferred path" signal distinguishable
+    // from a suspend that came from anywhere else.
+    logger.info(`[${tag(ds)}] Deferred suspend fulfilled (${reason}) after turn completed`);
+    return;
+  }
+  // Refused by an in-flight transfer: keeping the flag is not enough on its own.
+  // A settled session emits no further screen updates, so there may be no next
+  // checkpoint — re-run when the relay gate releases. Returns false when no
+  // transfer is active (a non-transfer refusal, e.g. pty), which needs no retry.
+  deferUntilSessionTransferSettled(ds, () => runPendingSuspendIfSettled(ds, ownsGeneration));
+}
+
+export const __testOnly_runPendingSuspendIfSettled = runPendingSuspendIfSettled;
 
 function armWorkerKillBackstop(w: ChildProcess, label: string, sigtermMs: number = WORKER_SIGTERM_BACKSTOP_MS): void {
   const sigterm = setTimeout(() => {
@@ -2484,11 +4848,124 @@ export function teardownAuthoritativePersistentBackingBeforeClose(
  * Calling this on an unknown sessionId, an already-closed session, or a session
  * whose worker died asynchronously must still resolve with `{ ok: true }`.
  */
+/**
+ * Why a close left something behind even though the local row closed.
+ *
+ * Two causes qualify, and they are deliberately NOT merged, because they send the
+ * operator to different places:
+ *
+ *  - `mojo_lineage_quarantined` — REMOTE residual. Nothing records which control
+ *    plane holds the remote session, so cancelling could reach a different tenant.
+ *    Carries the surviving remote `taskId`; cleanup is remote.
+ *  - `local_subtree_*` — LOCAL residual. The remote lineage really was cancelled,
+ *    but the backend could not prove its own process subtree on THIS host was gone,
+ *    so it kept the containment handle and the device-isolation blocker with it.
+ *    No `taskId`: there is no surviving remote id to chase, and offering one would
+ *    point cleanup at the wrong system.
+ *
+ * In both cases refusing forever would strand the row (no retry can make an
+ * unverifiable control plane verifiable, nor make an unenumerable host
+ * enumerable), so the row closes — but the caller must SAY so rather than showing
+ * the ordinary "closed" confirmation.
+ */
+export interface CloseResidual {
+  reason:
+    | 'mojo_lineage_quarantined'
+    | 'local_subtree_unprovable_on_platform'
+    | 'local_subtree_boundary_unproven';
+  /** Present only for a REMOTE residual; a local one has no remote id to name. */
+  taskId?: string;
+}
+
+/**
+ * `outcome` is a REQUIRED discriminant on success, not an optional warning field.
+ *
+ * An optional flag on an otherwise ordinary success is exactly what every call site
+ * forgets to read, so making it mandatory does help — but ONLY across a typed call.
+ * It is not a completeness guarantee: a consumer that reads just `.ok` compiles
+ * fine, and every JSON boundary (the dashboard IPC route, the CLI's daemon POST,
+ * the sessions card) erases the type entirely. Reviewing this change found exactly
+ * such consumers silently flattening a residual into a plain success.
+ *
+ * So the invariant is held by the consumer TESTS, not by this type. Any new close
+ * consumer needs one.
+ */
+export type CloseSessionResult =
+  | { ok: true; outcome: 'closed'; alreadyClosed: boolean; known: boolean }
+  | {
+      ok: true;
+      outcome: 'closed_with_residual';
+      residual: CloseResidual;
+      alreadyClosed: boolean;
+      known: boolean;
+    }
+  | ({
+      ok: false;
+      alreadyClosed: false;
+    } & Exclude<RemoteClosePreparation, { ok: true }>);
+
+/**
+ * Close from a BACKGROUND path — one with no user surface to report to
+ * (trigger-session cleanup, deferred-schedule settlement, sweeps).
+ *
+ * These callers cannot show a card or a toast, so the only honest thing they can
+ * do with a residual or a refusal is make it OBSERVABLE: an uncancelled remote
+ * session is still burning cloud time and holding an injected credential, and
+ * silently discarding the result is how that became invisible everywhere else.
+ *
+ * Returns the untouched result so a caller that DOES care can still branch.
+ */
+export async function closeSessionForBackgroundCleanup(
+  sessionId: string,
+  context: string,
+): Promise<CloseSessionResult> {
+  const result = await closeSession(sessionId);
+  const tagId = sessionId.slice(0, 8);
+  if (!result.ok) {
+    logger.error(
+      `[${tagId}] ${context}: close REFUSED (${result.error}); the row stays active `
+      + 'and its remote session may still be running'
+      + (result.taskId ? ` (remote ${result.taskId})` : ''),
+    );
+    return result;
+  }
+  if (result.outcome === 'closed_with_residual') {
+    // Kind-aware: a LOCAL-subtree residual has no taskId, so the old wording
+    // logged "remote session undefined was NOT cancelled" and pointed cleanup at
+    // a nonexistent remote session instead of the host process (round-11 P1-2).
+    logger.warn(
+      `[${tagId}] ${context}: closed locally — ${closeResidualClause(result.residual)} `
+      + `(${result.residual.reason})`,
+    );
+  }
+  return result;
+}
+
 export async function closeSession(
   sessionId: string,
-): Promise<{ ok: true; alreadyClosed: boolean; known: boolean }> {
+): Promise<CloseSessionResult> {
   const ds = findActiveBySessionId(sessionId);
   const stored = sessionStore.getOwnedSession(sessionId);
+  const closeFrozenBackendType = ds?.initConfig?.backendType
+    ?? ds?.session.backendType ?? stored?.backendType;
+  const isOwnedClose = !ds?.initConfig?.adoptMode
+    && !ds?.adoptedFrom
+    && !stored?.adoptedFrom;
+  const isOwnedRiffClose = isOwnedClose && closeFrozenBackendType === 'riff';
+  const isOwnedMojoClose = isOwnedClose && closeFrozenBackendType === 'mojo';
+  const closeJournal = ds?.session.mojoCloseJournal ?? stored?.mojoCloseJournal;
+  if (closeJournal && !isOwnedMojoClose) {
+    // Never let a Mojo cancellation journal silently disappear through another
+    // backend's ordinary close path. It may be corrupt metadata, but only an
+    // explicit reconciliation/repair may remove that fence.
+    return {
+      ok: false,
+      alreadyClosed: false,
+      error: 'mojo_close_reconciliation_required',
+      retryable: true,
+      ...(closeJournal.taskId ? { taskId: closeJournal.taskId } : {}),
+    };
+  }
   // Prove fail-closed ZMX teardown before any registry/store mutation. Repo
   // replacement paths reuse the same helper before their own state transition.
   const teardownTarget = ds ?? stored;
@@ -2496,9 +4973,6 @@ export async function closeSession(
     teardownAuthoritativePersistentBackingBeforeCloseImpl(teardownTarget, true);
   }
   let killedLive = false;
-  // 会话关闭即可回收其崩溃重启计数；否则每个曾崩溃过的 session 会在 daemon
-  // 生命周期内永久占位（restartCounts 此前无任何 delete）。
-  restartCounts.delete(sessionId);
   const hadLiveWorker = !!ds?.worker && !ds.worker.killed;
   const closeWorkerGeneration = ds ? closeFenceGeneration(ds) : undefined;
   // Snapshot ownership + transition state before mutating the live object:
@@ -2507,6 +4981,39 @@ export async function closeSession(
   const wasOpen = !!stored && stored.status !== 'closed';
   const storedHadDocCommentTargets = Object.keys(stored?.docCommentTargets ?? {}).length > 0;
   const docReactionTargets = collectDocCommentReactionTargets(ds, stored);
+
+  if (ds) {
+    // Usage ledger: flush the final delta before the worker goes away (a
+    // crash/limited turn may never have reached an idle edge).
+    recordUsageForDaemonSession(ds);
+  }
+
+  // Riff and mojo both own a remote, credential-bearing session. Prove
+  // cancellation before mutating routing, transient capabilities, or the durable
+  // row — publishing "closed" while the cancel is still in flight is how a failed
+  // cancel became a silent leak. Other backends retain master's synchronous
+  // state-transition path.
+  const prepared: RemoteClosePreparation = isOwnedRiffClose
+    ? await prepareRiffExplicitClose(ds, stored)
+    : isOwnedMojoClose
+      ? await prepareMojoExplicitClose(ds, stored)
+      : { ok: true };
+  if (!prepared.ok) {
+    return { ...prepared, alreadyClosed: false };
+  }
+  // Only when the cancel actually happened: a quarantined / bot-gone mojo session
+  // keeps its lineage on the row for manual cleanup.
+  const clearMojoLineage = isOwnedMojoClose && !!prepared.taskId;
+  // NOTE: the residual is derived from the COMMITTED row at the end of this
+  // function, not captured here — the store merges parked ids, so a value computed
+  // before the transaction can disagree with what was actually persisted.
+  const preparedRemoteRequestId = ds?.remoteCloseState?.phase === 'prepared'
+    ? ds.remoteCloseState.requestId
+    : undefined;
+
+  // 会话关闭即可回收其崩溃重启计数；否则每个曾崩溃过的 session 会在 daemon
+  // 生命周期内永久占位（restartCounts 此前无任何 delete）。
+  restartCounts.delete(sessionId);
   // Per-turn comment routes are transient capabilities. Clear them from both
   // live and owner-scoped persisted objects inside the synchronous close
   // critical section, before any best-effort Lark cleanup can yield.
@@ -2516,14 +5023,94 @@ export async function closeSession(
   if (stored && !wasOpen && storedHadDocCommentTargets) {
     sessionStore.updateSession(stored);
   }
+
+  // Mutations are bot-owner scoped. getSession() has a read-only cross-file
+  // fallback for agent CLI discovery, so it must not authorize close.
+  if (wasOpen) {
+    if (!ds && stored && !isOwnedRiffClose) destroyUnregisteredPersistentBacking(stored);
+    try {
+      // Parking is handed to the store as part of ITS transaction rather than
+      // pre-written here: the runtime object is not always the authoritative row,
+      // and a pre-write survives a failed save (the store's rollback cannot restore
+      // a field it never set). Same mistake as the early lineage clear fixed
+      // earlier — one layer up.
+      sessionStore.closeSession(sessionId, {
+        cleanupBridgeMarkers: !hadLiveWorker,
+        ...(prepared.parkMojoLineage ? { parkMojoLineage: prepared.parkMojoLineage } : {}),
+        // Park a LOCAL residual so an idempotent re-close still reports it — the
+        // journal (its runtime home) is wiped by this same transaction.
+        ...(prepared.residual
+          && prepared.residual.reason !== 'mojo_lineage_quarantined'
+          ? { parkLocalResidual: prepared.residual.reason }
+          : {}),
+        ...(isOwnedRiffClose || clearMojoLineage || prepared.parkMojoLineage
+          ? { clearRiffParentTaskId: true }
+          : {}),
+      });
+    } catch (err) {
+      if (isOwnedMojoClose
+          && (preparedRemoteRequestId || stored?.mojoCloseJournal?.phase === 'prepared')) {
+        logger.error(
+          `[${sessionId.slice(0, 8)}] Durable session close failed after Mojo cancel; `
+          + `retaining prepared commit: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return {
+          ok: false,
+          alreadyClosed: false,
+          error: 'mojo_durable_close_failed',
+          retryable: true,
+          ...(prepared.taskId ? { taskId: prepared.taskId } : {}),
+        };
+      }
+      if (!isOwnedRiffClose) throw err;
+      if (ds && preparedRemoteRequestId) {
+        await abortLiveRemoteWorkerClose(ds, preparedRemoteRequestId);
+      }
+      logger.error(
+        `[${sessionId.slice(0, 8)}] Durable session close failed after Riff prepare; `
+        + `worker admission restored: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return {
+        ok: false,
+        alreadyClosed: false,
+        error: 'riff_durable_close_failed',
+        retryable: true,
+        ...(prepared.taskId ? { taskId: prepared.taskId } : {}),
+      };
+    }
+    const after = sessionStore.getOwnedSession(sessionId);
+    if (ds) {
+      ds.session.status = 'closed';
+      ds.session.closedAt = after?.closedAt ?? ds.session.closedAt;
+      // Sync the parking back from the store's committed row. Only reached after a
+      // SUCCESSFUL save, and skipped when the two are the same object anyway, so
+      // the runtime view cannot end up carrying a park the disk does not have.
+      if (after && after !== ds.session) {
+        ds.session.mojoCloseJournal = after.mojoCloseJournal;
+        if (clearMojoLineage || prepared.parkMojoLineage) {
+          ds.session.riffParentTaskId = after.riffParentTaskId;
+        }
+      }
+      if (prepared.parkMojoLineage && after && after !== ds.session) {
+        ds.session.mojoQuarantinedLineage = after.mojoQuarantinedLineage;
+        ds.session.mojoQuarantineNoticePending = after.mojoQuarantineNoticePending;
+      }
+    }
+  }
+
   if (ds) {
-    // Usage ledger: flush the final delta before the worker goes away (a
-    // crash/limited turn may never have reached an idle edge).
-    recordUsageForDaemonSession(ds);
-    killWorker(ds);
-    const activeKey = activeSessionKey(ds);
-    if (activeSessionsRegistry?.get(activeKey) === ds) {
-      activeSessionsRegistry.delete(activeKey);
+    killWorker(ds, {
+      ...(preparedRemoteRequestId ? { remoteCloseCommitRequestId: preparedRemoteRequestId } : {}),
+      // The prepare above already proved this cancel; the durable row cleared the
+      // lineage in the same transaction. Suppress the best-effort repeat.
+      ...(clearMojoLineage ? { mojoCancelAlreadyProven: true } : {}),
+    });
+    // A transferred/restored exact object may remain under more than one alias.
+    // Remove only identity matches, never a same-key successor.
+    if (activeSessionsRegistry) {
+      for (const [registeredKey, candidate] of activeSessionsRegistry) {
+        if (candidate === ds) activeSessionsRegistry.delete(registeredKey);
+      }
     }
     // Mark the captured object too. Async message/card paths may already hold a
     // reference to `ds`; deleting only the registry entry would not stop one of
@@ -2531,23 +5118,6 @@ export async function closeSession(
     ds.session.status = 'closed';
     ds.session.closedAt ??= new Date().toISOString();
     killedLive = true;
-  }
-
-  // Mutations are bot-owner scoped. getSession() has a read-only cross-file
-  // fallback for agent CLI discovery, so it must not authorize close.
-  if (wasOpen) {
-    if (!ds && stored) destroyUnregisteredPersistentBacking(stored);
-    sessionStore.closeSession(sessionId, {
-      cleanupBridgeMarkers: !hadLiveWorker,
-    });
-    const after = sessionStore.getOwnedSession(sessionId);
-    if (ds) {
-      ds.session.status = 'closed';
-      ds.session.closedAt = after?.closedAt ?? ds.session.closedAt;
-    }
-  }
-
-  if (ds) {
     if (!ds.exitEventEmitted) {
       ds.exitEventEmitted = true;
       dashboardEventBus.publish({
@@ -2637,7 +5207,26 @@ export async function closeSession(
 
   // alreadyClosed = nothing happened on either path.
   const alreadyClosed = !killedLive && !wasOpen;
-  return { ok: true, alreadyClosed, known };
+  // The local row IS closed, but a remote session was deliberately left running
+  // (its control plane could not be verified, so cancelling it might have hit
+  // another tenant). Callers must render this differently from an ordinary close.
+  // Read the residual back off the authoritative row so it always matches disk
+  // (including the merge when a second id was parked). `prepared.residual` is only
+  // a fallback for the paths that never reached the store.
+  const closeResidual = isOwnedMojoClose
+    ? (mojoCloseResidualForRow(sessionStore.getOwnedSession(sessionId) ?? stored ?? ds?.session)
+      ?? prepared.residual)
+    : undefined;
+  if (closeResidual) {
+    return {
+      ok: true,
+      outcome: 'closed_with_residual',
+      residual: closeResidual,
+      alreadyClosed,
+      known,
+    };
+  }
+  return { ok: true, outcome: 'closed', alreadyClosed, known };
 }
 
 /**
@@ -2692,6 +5281,142 @@ export function destroyUnregisteredPersistentBacking(
  * non-destructive because the occupant may be a fresh live session created
  * while an older async restore/create continuation was in flight.
  */
+export type SetActiveSessionResult =
+  | { accepted: true; closedSessionId?: string }
+  | {
+      accepted: false;
+      reason: 'kept_pending_owner';
+      keptSessionId: string;
+      closedIncomingSessionId: string;
+    }
+  | {
+      accepted: false;
+      reason: 'both_pending';
+      keptSessionId: string;
+      preservedIncomingSessionId: string;
+    }
+  | {
+      accepted: false;
+      reason: 'inactive_incoming';
+      keptSessionId: string;
+      preservedIncomingSessionId: string;
+    }
+  | {
+      accepted: false;
+      reason: 'quarantine_reserved';
+      keptSessionId: string;
+      preservedIncomingSessionId: string;
+    }
+  | {
+      accepted: false;
+      reason: 'cleanup_failed';
+      keptSessionId: string;
+      preservedIncomingSessionId: string;
+      cleanupSessionId: string;
+      error: string;
+    };
+
+const activeSessionKeyLocks = new WeakMap<
+  Map<string, DaemonSession>,
+  Map<string, Promise<void>>
+>();
+
+/** Serialize asynchronous ownership decisions for one registry key. Ordinary
+ * bot turn admissions are intentionally concurrent, so a read/await/set helper
+ * is not a CAS unless every contender shares this lock. */
+export async function withActiveSessionKeyLock<T>(
+  map: Map<string, DaemonSession>,
+  key: string,
+  action: () => Promise<T> | T,
+): Promise<T> {
+  let locks = activeSessionKeyLocks.get(map);
+  if (!locks) {
+    locks = new Map();
+    activeSessionKeyLocks.set(map, locks);
+  }
+  const previous = locks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const hold = new Promise<void>(resolve => { release = resolve; });
+  const tail = previous.catch(() => { /* predecessor errors do not poison the lock */ }).then(() => hold);
+  locks.set(key, tail);
+  await previous.catch(() => { /* predecessor already reported its own error */ });
+  try {
+    return await action();
+  } finally {
+    release();
+    if (locks.get(key) === tail) locks.delete(key);
+  }
+}
+
+async function closeUnregisteredCollisionLoser(
+  map: Map<string, DaemonSession>,
+  loser: DaemonSession,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  // Operate on exact object identity in the caller's registry. Looking up by
+  // session id through the daemon-global registry can conflate a non-global
+  // restore map (or a stale duplicate object) with an unrelated canonical
+  // owner and close the wrong generation.
+  const sameIdDifferentOwner = [...map.values()].some(candidate =>
+    candidate !== loser && candidate.session.sessionId === loser.session.sessionId)
+    || (!!activeSessionsRegistry && activeSessionsRegistry !== map
+      && [...activeSessionsRegistry.values()].some(candidate =>
+        candidate !== loser && candidate.session.sessionId === loser.session.sessionId));
+  if (sameIdDifferentOwner) {
+    logger.error(
+      `[setActiveSessionSafe] refusing persistence close for ambiguous session id `
+      + `${loser.session.sessionId}; preserving every owner`,
+    );
+    return { ok: false, error: 'ambiguous_session_id' };
+  }
+
+  const stored = sessionStore.getSession(loser.session.sessionId);
+  try {
+    if (stored?.status !== 'closed') {
+      sessionStore.closeSession(loser.session.sessionId);
+    }
+  } catch (err) {
+    logger.error(
+      `[setActiveSessionSafe] durable loser close failed for ${loser.session.sessionId}: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return { ok: false, error: 'durable_close_failed' };
+  }
+
+  // The registry entry is deleted right below, so the loser's worker must be
+  // put on a guaranteed path to death here. killWorker refuses an unprepared
+  // live remote worker (P0-2) — correct for lineage, but on this path the
+  // refusal recreated the P0-new orphan: row closed, registry cleared,
+  // credential-carrying worker alive and unreachable. A remote loser is
+  // therefore retired process-only: SIGTERM now, SIGKILL by backstop. To be
+  // precise about the claim (fourth-round review): this SIGNALS death and arms
+  // the escalation — it does not synchronously prove the exit. That is
+  // acceptable here because nothing downstream gates on this process being
+  // gone (unlike the VC fence, which separately demands exit proof before
+  // admitting replay); the registry delete below is safe either way.
+  //
+  // No remote cancel is issued: the lineage stays on the CLOSED row
+  // (riffParentTaskId) as the manual-cleanup handle, mirroring the drain's
+  // isolation-over-deletion shape — named in the log below so an operator can
+  // actually find it. Local losers keep killWorker so their backing session
+  // is destroyed.
+  if (isRemoteBackendSession(loser)) {
+    if (loser.session.riffParentTaskId) {
+      logger.warn(
+        `[${tag(loser)}] collision loser owns remote lineage `
+        + `${loser.session.riffParentTaskId}; it is NOT cancelled and stays on the closed `
+        + 'row for manual cleanup',
+      );
+    }
+    retireWorkerProcessOnly(loser, 'collision_loser');
+  } else {
+    killWorker(loser);
+  }
+  for (const [registeredKey, candidate] of map) {
+    if (candidate === loser) map.delete(registeredKey);
+  }
+  return { ok: true };
+}
+
 function removeInactiveRegistration(
   map: Map<string, DaemonSession>,
   key: string,
@@ -2748,6 +5473,23 @@ export function findQuarantinedRoutingConflict(
   }
 }
 
+/** Clear a durable quarantine marker once a live owner has claimed the route.
+ * Runtime ownership (the Map + lock) is authoritative for this process even if
+ * the persistence write fails; a later update or restore attempt converges the
+ * stale on-disk marker. */
+function clearRestoreQuarantineMarker(ds: DaemonSession): void {
+  if (!ds.session.restoreQuarantinedAt) return;
+  delete ds.session.restoreQuarantinedAt;
+  try {
+    sessionStore.updateSession(ds.session);
+  } catch (err) {
+    logger.warn(
+      `[${tag(ds)}] Registered quarantined session but could not clear its persisted marker: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
 /**
  * Synchronous registration gate for creation paths that previously used a
  * bare Map.set(). A daemon close can update the shared Session object while
@@ -2777,20 +5519,7 @@ export function setActiveSessionIfActive(
     return false;
   }
   map.set(key, ds);
-  if (ds.session.restoreQuarantinedAt) {
-    delete ds.session.restoreQuarantinedAt;
-    try {
-      sessionStore.updateSession(ds.session);
-    } catch (err) {
-      // Runtime ownership is now authoritative and the Map prevents duplicates
-      // for this process. Keep running; a later persistence update (or the next
-      // restore attempt) will converge the stale on-disk marker.
-      logger.warn(
-        `[${tag(ds)}] Registered quarantined session but could not clear its persisted marker: `
-        + `${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
-  }
+  clearRestoreQuarantineMarker(ds);
   return true;
 }
 
@@ -2798,8 +5527,125 @@ export async function setActiveSessionSafe(
   map: Map<string, DaemonSession>,
   key: string,
   ds: DaemonSession,
-): Promise<boolean> {
-  return setActiveSessionIfActive(map, key, ds);
+): Promise<SetActiveSessionResult> {
+  const canonicalKey = activeSessionKey(ds);
+  if (canonicalKey !== key) {
+    throw new Error(
+      `refusing noncanonical active-session registration: requested=${key} canonical=${canonicalKey}`,
+    );
+  }
+  return withActiveSessionKeyLock(map, key, async () => {
+    // Reboot-resume guard (master): a daemon close can flip the shared Session
+    // to a non-active status while an async creator/restore awaited Lark/project
+    // metadata. Never publish that now-inactive row back into the live map; drop
+    // only our exact stale object so a newer owner of the same key is untouched.
+    if (ds.session.status !== 'active') {
+      if (map.get(key) === ds) map.delete(key);
+      logger.warn(
+        `[setActiveSessionSafe] refusing to register inactive session `
+        + `${ds.session.sessionId.substring(0, 8)} (status=${ds.session.status})`,
+      );
+      return {
+        accepted: false,
+        reason: 'inactive_incoming',
+        keptSessionId: ds.session.sessionId,
+        preservedIncomingSessionId: ds.session.sessionId,
+      };
+    }
+    const prev = map.get(key);
+    if (prev && prev !== ds) {
+      if (prev.session.sessionId === ds.session.sessionId) {
+        logger.error(
+          `[setActiveSessionSafe] refusing collision between distinct owners of session id `
+          + `${prev.session.sessionId}; preserving both objects and the durable row`,
+        );
+        return {
+          accepted: false,
+          reason: 'cleanup_failed',
+          keptSessionId: prev.session.sessionId,
+          preservedIncomingSessionId: ds.session.sessionId,
+          cleanupSessionId: prev.session.sessionId,
+          error: 'ambiguous_session_id',
+        };
+      }
+      const prevPending = hasProtectedSessionMutationOwnership(prev);
+      const incomingPending = hasProtectedSessionMutationOwnership(ds);
+      if (prevPending && incomingPending) {
+        logger.error(
+          `[setActiveSessionSafe] refusing collision between two unsettled Codex App owners `
+          + `${prev.session.sessionId} and ${ds.session.sessionId}; preserving both rows/panes`,
+        );
+        return {
+          accepted: false,
+          reason: 'both_pending',
+          keptSessionId: prev.session.sessionId,
+          preservedIncomingSessionId: ds.session.sessionId,
+        };
+      }
+      if (prevPending) {
+        logger.warn(
+          `[setActiveSessionSafe] keeping unsettled owner ${prev.session.sessionId.substring(0, 8)}; `
+          + `closing ledger-empty incoming ${ds.session.sessionId.substring(0, 8)}`,
+        );
+        const cleanup = await closeUnregisteredCollisionLoser(map, ds);
+        if (!cleanup.ok) {
+          return {
+            accepted: false,
+            reason: 'cleanup_failed',
+            keptSessionId: prev.session.sessionId,
+            preservedIncomingSessionId: ds.session.sessionId,
+            cleanupSessionId: ds.session.sessionId,
+            error: cleanup.error,
+          };
+        }
+        return {
+          accepted: false,
+          reason: 'kept_pending_owner',
+          keptSessionId: prev.session.sessionId,
+          closedIncomingSessionId: ds.session.sessionId,
+        };
+      }
+      logger.warn(
+        `[setActiveSessionSafe] key already occupied by ${prev.session.sessionId.substring(0, 8)} ` +
+        `(worker=${prev.worker ? 'live' : 'null'}); closing it before set`,
+      );
+      const cleanup = await closeUnregisteredCollisionLoser(map, prev);
+      if (!cleanup.ok) {
+        return {
+          accepted: false,
+          reason: 'cleanup_failed',
+          keptSessionId: prev.session.sessionId,
+          preservedIncomingSessionId: ds.session.sessionId,
+          cleanupSessionId: prev.session.sessionId,
+          error: cleanup.error,
+        };
+      }
+    }
+    // Reboot-resume guard (master): a durable quarantine reservation for this
+    // route (an inconclusive exact-backend teardown) must block a second runtime
+    // beside a possibly-live persistent target, even after the in-memory prev
+    // occupant above was closed. Closed rows never match, so an operator close
+    // immediately releases the route.
+    const quarantined = findQuarantinedRoutingConflict(key, ds.larkAppId, ds.session.sessionId);
+    if (quarantined) {
+      logger.warn(
+        `[setActiveSessionSafe] refusing to occupy routing key reserved by quarantined session `
+        + `${quarantined.sessionId.substring(0, 8)}`,
+      );
+      return {
+        accepted: false,
+        reason: 'quarantine_reserved',
+        keptSessionId: quarantined.sessionId,
+        preservedIncomingSessionId: ds.session.sessionId,
+      };
+    }
+    map.set(key, ds);
+    clearRestoreQuarantineMarker(ds);
+    return {
+      accepted: true,
+      ...(prev && prev !== ds ? { closedSessionId: prev.session.sessionId } : {}),
+    };
+  });
 }
 
 /**
@@ -2859,6 +5705,220 @@ const transferInputGates = new WeakMap<DaemonSession, TransferInputGate>();
 // Only this module can mark the synchronous replacement fork. External callers
 // cannot forge an option that bypasses the transfer gate.
 const transferReplacementForkBypass = new WeakSet<DaemonSession>();
+
+const ORDINARY_IM_RECEIPT_TIMEOUT_MS = 2_000;
+const ORDINARY_IM_MAX_ATTEMPTS = 2;
+
+type OrdinaryImDelivery = {
+  key: string;
+  ds: DaemonSession;
+  worker: ChildProcess;
+  workerGeneration: number;
+  message: Extract<DaemonToWorker, { type: 'message' | 'init' }>;
+  turnId: string;
+  attempt: number;
+  timer?: ReturnType<typeof setTimeout>;
+};
+
+/** Exact ordinary-IM turns awaiting the worker's synchronous receipt ACK. The
+ * daemon event has already been claimed by Lark dedup at this point, so losing
+ * this in-memory delivery without retry would permanently drop the message. */
+const pendingOrdinaryImDeliveries = new Map<string, OrdinaryImDelivery>();
+
+function ordinaryImDeliveryKey(ds: DaemonSession, turnId: string, workerGeneration: number): string {
+  return `${ds.session.sessionId}:${workerGeneration}:${turnId}`;
+}
+
+function clearOrdinaryImDelivery(record: OrdinaryImDelivery): void {
+  if (record.timer) clearTimeout(record.timer);
+  record.timer = undefined;
+  if (pendingOrdinaryImDeliveries.get(record.key) === record) {
+    pendingOrdinaryImDeliveries.delete(record.key);
+  }
+}
+
+function clearOrdinaryImDeliveryTimer(record: OrdinaryImDelivery): void {
+  if (record.timer) clearTimeout(record.timer);
+  record.timer = undefined;
+}
+
+function failOrdinaryImDelivery(record: OrdinaryImDelivery, reason: string): void {
+  if (pendingOrdinaryImDeliveries.get(record.key) !== record) return;
+  clearOrdinaryImDelivery(record);
+  logger.error(
+    `[${tag(record.ds)}] Ordinary IM worker delivery failed `
+    + `turn=${record.turnId.substring(0, 16)} generation=${record.workerGeneration} `
+    + `attempts=${record.attempt} reason=${reason}`,
+  );
+  if (record.ds.session.vcMeetingReceiver || isSilentScheduledTurn(record.ds, record.turnId)) return;
+  const loc = botLocale(getBot(record.ds.larkAppId).config);
+  void requireCallbacks().sessionReply(
+    sessionAnchorId(record.ds),
+    tr('worker.input_delivery_failed', { turnId: record.turnId.substring(0, 16) }, loc),
+    'text',
+    record.ds.larkAppId,
+    record.turnId,
+  ).catch(err => logger.error(
+    `[${tag(record.ds)}] Failed to report ordinary IM worker delivery failure: `
+    + `${err instanceof Error ? err.message : String(err)}`,
+  ));
+}
+
+function retryOrFailOrdinaryImDelivery(record: OrdinaryImDelivery, reason: string): void {
+  if (pendingOrdinaryImDeliveries.get(record.key) !== record) return;
+  if (
+    record.attempt < ORDINARY_IM_MAX_ATTEMPTS
+    && record.ds.worker === record.worker
+    && !record.worker.killed
+    && record.ds.workerGeneration === record.workerGeneration
+    && record.ds.session.workerGeneration === record.workerGeneration
+  ) {
+    logger.warn(
+      `[${tag(record.ds)}] Ordinary IM input missing worker receipt; retrying exact turn `
+      + `${record.turnId.substring(0, 16)} on generation ${record.workerGeneration} `
+      + `(reason=${reason})`,
+    );
+    sendOrdinaryImDeliveryAttempt(record);
+    return;
+  }
+  failOrdinaryImDelivery(record, reason);
+}
+
+function sendOrdinaryImDeliveryAttempt(record: OrdinaryImDelivery): boolean {
+  if (pendingOrdinaryImDeliveries.get(record.key) !== record) return false;
+  if (
+    record.ds.worker !== record.worker
+    || record.worker.killed
+    || record.ds.workerGeneration !== record.workerGeneration
+    || record.ds.session.workerGeneration !== record.workerGeneration
+  ) {
+    failOrdinaryImDelivery(record, 'worker_generation_changed');
+    return false;
+  }
+
+  if (record.timer) clearTimeout(record.timer);
+  record.timer = undefined;
+  const attempt = ++record.attempt;
+  try {
+    record.worker.send(record.message, (err) => {
+      if (pendingOrdinaryImDeliveries.get(record.key) !== record || record.attempt !== attempt) return;
+      if (err) {
+        retryOrFailOrdinaryImDelivery(record, `ipc_callback:${err.message}`);
+        return;
+      }
+      logger.info(
+        `[${tag(record.ds)}] Ordinary IM input enqueued to worker IPC `
+        + `turn=${record.turnId.substring(0, 16)} generation=${record.workerGeneration} attempt=${attempt}`,
+      );
+    });
+  } catch (err) {
+    queueMicrotask(() => retryOrFailOrdinaryImDelivery(
+      record,
+      `ipc_throw:${err instanceof Error ? err.message : String(err)}`,
+    ));
+    return true;
+  }
+
+  // The worker ACKs synchronously when its IPC handler claims the exact turn.
+  // Slow CLI startup/processing therefore does not extend this transport-only
+  // timeout; the later committed ACK retains input-queue semantics.
+  if (pendingOrdinaryImDeliveries.get(record.key) === record) {
+    record.timer = setTimeout(() => {
+      retryOrFailOrdinaryImDelivery(record, 'receipt_timeout');
+    }, ORDINARY_IM_RECEIPT_TIMEOUT_MS);
+    record.timer.unref?.();
+  }
+  return true;
+}
+
+function sendOrdinaryImDeliveryTracked(
+  ds: DaemonSession,
+  message: Extract<DaemonToWorker, { type: 'message' | 'init' }>,
+): boolean {
+  const turnId = message.turnId;
+  const worker = ds.worker;
+  const workerGeneration = ds.workerGeneration;
+  if (!turnId || !worker || worker.killed || !Number.isSafeInteger(workerGeneration) || (workerGeneration ?? 0) <= 0) {
+    return false;
+  }
+  const key = ordinaryImDeliveryKey(ds, turnId, workerGeneration!);
+  if (pendingOrdinaryImDeliveries.has(key)) return true;
+  const record: OrdinaryImDelivery = {
+    key,
+    ds,
+    worker,
+    workerGeneration: workerGeneration!,
+    message,
+    turnId,
+    attempt: 0,
+  };
+  pendingOrdinaryImDeliveries.set(key, record);
+  return sendOrdinaryImDeliveryAttempt(record);
+}
+
+function shouldTrackOrdinaryImDelivery(
+  ds: DaemonSession,
+  message: Extract<DaemonToWorker, { type: 'message' | 'init' }>,
+): boolean {
+  return !!message.turnId?.startsWith('om_')
+    && message.dispatchAttempt === undefined
+    && (message.type !== 'init' || (!!message.prompt && !message.adoptMode))
+    && !ds.adoptedFrom
+    && !ds.session.vcMeetingReceiver
+    && Number.isSafeInteger(ds.workerGeneration)
+    && (ds.workerGeneration ?? 0) > 0
+    && ds.session.workerGeneration === ds.workerGeneration;
+}
+
+function acknowledgeOrdinaryImDeliveryReceipt(
+  ds: DaemonSession,
+  turnId: string,
+  workerGeneration: number,
+): void {
+  const key = ordinaryImDeliveryKey(ds, turnId, workerGeneration);
+  const record = pendingOrdinaryImDeliveries.get(key);
+  if (!record) return;
+  clearOrdinaryImDeliveryTimer(record);
+  logger.info(
+    `[${tag(ds)}] Ordinary IM input received by worker `
+    + `turn=${turnId.substring(0, 16)} generation=${workerGeneration} attempt=${record.attempt}`,
+  );
+}
+
+function completeOrdinaryImDelivery(
+  ds: DaemonSession,
+  turnId: string,
+  workerGeneration: number,
+): void {
+  const key = ordinaryImDeliveryKey(ds, turnId, workerGeneration);
+  const record = pendingOrdinaryImDeliveries.get(key);
+  if (record) clearOrdinaryImDelivery(record);
+}
+
+function rejectOrdinaryImDelivery(
+  ds: DaemonSession,
+  turnId: string,
+  workerGeneration: number,
+  reason: string,
+): void {
+  const key = ordinaryImDeliveryKey(ds, turnId, workerGeneration);
+  const record = pendingOrdinaryImDeliveries.get(key);
+  if (!record) return;
+  retryOrFailOrdinaryImDelivery(record, `worker_rejected:${reason}`);
+}
+
+function abandonOrdinaryImDeliveriesForWorker(worker: ChildProcess): void {
+  for (const record of pendingOrdinaryImDeliveries.values()) {
+    if (record.worker === worker) clearOrdinaryImDelivery(record);
+  }
+}
+
+export function __testOnly_resetOrdinaryImDeliveries(): void {
+  for (const record of pendingOrdinaryImDeliveries.values()) {
+    if (record.timer) clearTimeout(record.timer);
+  }
+  pendingOrdinaryImDeliveries.clear();
+}
 
 export function isSessionTransferring(ds: DaemonSession): boolean {
   return transferInputGates.has(ds);
@@ -3029,7 +6089,20 @@ function releaseTransferInputGate(
     while (gate.messages.length > 0) {
       const message = gate.messages[0];
       try {
-        worker.send(message);
+        if (
+          message.type === 'message'
+          && shouldTrackOrdinaryImDelivery(ds, message)
+        ) {
+          // The transfer gate owns buffering/order; once a replacement
+          // generation exists, ordinary IM delivery returns to the same exact
+          // receipt protocol as steady-state input. The watchdog remains valid
+          // after the gate itself settles.
+          if (!sendOrdinaryImDeliveryTracked(ds, message)) {
+            throw new Error('replacement worker rejected tracked IM delivery');
+          }
+        } else {
+          worker.send(message);
+        }
         gate.messages.shift();
       } catch (err) {
         gate.needsWorker = true;
@@ -3144,11 +6217,23 @@ export async function transferSession(
      *  process and tries to attach to tmux, neither of which is appropriate
      *  in a unit test environment. Defaults to module-level forkWorker. */
     forkWorkerImpl?: typeof forkWorker;
+    /** @internal Override for tests — mirror of forkWorkerImpl for killWorker. */
+    killWorkerImpl?: typeof killWorker;
+    /** @internal Recursive marker: the bot-wide transfer mutation is held. */
+    mutationHeld?: boolean;
     /** @internal Override for tests — mirror of forkWorkerImpl for the
      * transfer-only worker detach path. */
     detachWorkerImpl?: (
       ds: DaemonSession,
     ) => boolean | void | Promise<boolean | void>;
+    /** Detach-fence budget (ms) for the observer teardown handshake. Defaults
+     *  to the tight TRANSFER_DETACH_FENCE_MS, which the cross-daemon peer path
+     *  needs to stay inside the leader's 5s HTTP abort. In-process callers with
+     *  no HTTP ceiling (the picker relay_confirm) pass a larger value
+     *  (TRANSFER_DETACH_FENCE_PICKER_MS) so a slightly-slow-but-clean teardown
+     *  is not misclassified as a failure. Ignored when detachWorkerImpl is set
+     *  (test doubles don't observe a real fence). */
+    detachTimeoutMs?: number;
   },
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   // Depth defense — unreachable per TS narrowing above, but guards against
@@ -3156,8 +6241,24 @@ export async function transferSession(
   if ((targetChatType as string) !== 'group' && (targetChatType as string) !== 'p2p') {
     return { ok: false, error: 'target_chat_type_unsupported' };
   }
+  const initial = findActiveBySessionId(sessionId);
+  if (!initial) return { ok: false, error: 'session_not_active' };
+  if (!opts?.mutationHeld) {
+    // Transfer rewrites both the source and target routing identities and may
+    // await scratch cleanup.  Drain every admitted turn for this bot first so
+    // no source prompt can become durable mid-transfer and no target creator
+    // can slip into the cleanup window.
+    return withBotTurnMutation(initial.larkAppId, () => transferSession(
+      sessionId,
+      targetChatId,
+      targetRootMessageId,
+      targetChatType,
+      targetScope,
+      { ...opts, mutationHeld: true },
+    ));
+  }
   const ds = findActiveBySessionId(sessionId);
-  if (!ds) return { ok: false, error: 'session_not_active' };
+  if (!ds || ds.session.status !== 'active') return { ok: false, error: 'session_not_active' };
   const sourceSession = ds.session;
   const sourceLifecycleIdentity = JSON.stringify({
     sessionId: sourceSession.sessionId,
@@ -3172,6 +6273,9 @@ export async function transferSession(
     runtimeAdoptedFrom: ds.adoptedFrom,
   });
   if (ds.session.vcMeetingReceiver) return { ok: false, error: 'vc_receiver_not_relayable' };
+  if (hasProtectedSessionMutationOwnership(ds)) {
+    return { ok: false, error: 'codex_app_dispatch_pending' };
+  }
   // Anchor-based identity. A thread-scope session in the SAME chat (different
   // root) is a legitimate cross-topic move, so we refuse only when the target
   // anchor equals the source anchor (relaying a session onto itself). Replaces
@@ -3262,7 +6366,13 @@ export async function transferSession(
   }
 
   const fkw = opts?.forkWorkerImpl ?? forkWorker;
-  const detach = opts?.detachWorkerImpl ?? detachWorkerForTransfer;
+  // The default detach observes a real fence and takes a per-call timeout; a
+  // test double only takes `ds`. Bind the requested fence onto the real impl
+  // only — a test double never observes a fence, so the budget is irrelevant
+  // (and its narrower signature wouldn't accept it).
+  const detachTimeoutMs = opts?.detachTimeoutMs ?? TRANSFER_DETACH_FENCE_MS;
+  const detach = opts?.detachWorkerImpl
+    ?? ((d: DaemonSession) => detachWorkerForTransfer(d, { timeoutMs: detachTimeoutMs }));
   const transferGate = beginTransferInputGate(ds);
   if (!transferGate) return { ok: false, error: 'worker_busy' };
   let uncertainRetiringWorker: ChildProcess | undefined;
@@ -3291,7 +6401,11 @@ export async function transferSession(
       if (existing === ds) continue;
       if (existing.larkAppId !== ds.larkAppId) continue;
       if (sessionAnchorId(existing) !== targetAnchor) continue;
-      if (isDisposableCommandScratch(existing)) {
+      // A durable dispatch ledger / activation journal makes the occupant a
+      // real conflict even when it currently has no worker; only a proven
+      // ledger-empty command scratch may be retired.
+      if (isDisposableCommandScratch(existing)
+        && !hasProtectedSessionMutationOwnership(existing)) {
         scratchesToClose.push(existing.session.sessionId);
         continue;
       }
@@ -3301,12 +6415,47 @@ export async function transferSession(
   for (const sid of scratchesToClose) {
     await closeSession(sid);
   }
+  // A partially hydrated daemon can have an active target row absent from the
+  // runtime map. Durable ownership makes that row a real conflict even when it
+  // has worker:null and no legacy CLI markers; only proven ledger-empty
+  // scratch rows may be retired.
+  const runtimeIds = new Set(activeSessionsRegistry
+    ? [...activeSessionsRegistry.values()].map(item => item.session.sessionId)
+    : []);
+  const persistedTargetConflicts = sessionStore.listSessions().filter(item =>
+    item.sessionId !== ds.session.sessionId
+    && item.status === 'active'
+    && (!item.larkAppId || item.larkAppId === ds.larkAppId)
+    && !item.vcMeetingReceiver
+    && (item.scope === 'chat' ? item.chatId : item.rootMessageId) === targetAnchor
+    && !runtimeIds.has(item.sessionId),
+  );
+  if (persistedTargetConflicts.some(item =>
+    hasProtectedSessionMutationOwnership(item)
+    || !!item.cliId
+    || !!item.lastCliInput
+    || item.queued === true)) {
+    return { ok: false, error: 'target_chat_has_session' };
+  }
+  for (const scratch of persistedTargetConflicts) {
+    await closeSession(scratch.sessionId);
+  }
   const postScratchStateError = validateAfterAwait();
   if (postScratchStateError) return postScratchStateError;
 
   const tagPrefix = sessionId.substring(0, 8);
   const oldAnchor = sessionAnchorId(ds);
   const oldChatId = ds.chatId;
+  const oldStreamCardId = ds.streamCardId;
+  const oldCurrentImageKey = ds.currentImageKey;
+
+  // Scratch/store cleanup above awaited. A fresh source turn may have been
+  // admitted during that window; recheck the durable dispatch ledger in the
+  // same synchronous section that precedes the destructive detach so transfer
+  // never abandons newly durable work.
+  if (hasProtectedSessionMutationOwnership(ds)) {
+    return { ok: false, error: 'codex_app_dispatch_pending' };
+  }
 
   // Detach only the worker/observer. Persistent backends and Riff keep the
   // owned CLI/task alive so the replacement can reattach below. PTY cannot
@@ -3476,7 +6625,7 @@ export async function transferSession(
  *  byte-level fork we can reproduce — they are refused. Riff / other pure-remote
  *  backends have no local rollout to fork either. */
 const FORK_CAPABLE_CLI_IDS: ReadonlySet<CliId> = new Set<CliId>([
-  'claude-code', 'seed', 'relay', 'aiden', 'codex',
+  'claude-code', 'seed', 'relay', 'codex',
 ]);
 
 /** True when this session can be byte-level forked via a CLI-native primitive.
@@ -3529,7 +6678,16 @@ export async function forkSession(
   targetRootMessageId: string,
   targetChatType: 'group' | 'p2p',
   targetScope: 'thread' | 'chat',
-  opts?: { forkWorkerImpl?: typeof forkWorker },
+  opts?: {
+    forkWorkerImpl?: typeof forkWorker;
+    childTitle?: string;
+    forkTaskText?: string;
+    larkThreadId?: string;
+    buildInitialPrompt?: (childSessionId: string) => string | CliTurnPayload;
+    turnId?: string;
+    senderOpenId?: string;
+    senderIsBot?: boolean;
+  },
 ): Promise<{ ok: true; childSessionId: string } | { ok: false; error: string }> {
   if ((targetChatType as string) !== 'group' && (targetChatType as string) !== 'p2p') {
     return { ok: false, error: 'target_chat_type_unsupported' };
@@ -3582,7 +6740,8 @@ export async function forkSession(
 
   // ── Mint the child session row (new botmux sessionId) ──
   const parentTitle = ds.session.title || '';
-  const childTitle = parentTitle ? `🔱 ${parentTitle}` : '🔱 分身';
+  const childTitle = opts?.childTitle?.trim()
+    || (parentTitle ? `🔱 ${parentTitle}` : '🔱 分身');
   const childSession = sessionStore.createSession(
     targetChatId,
     targetRootMessageId,
@@ -3594,10 +6753,16 @@ export async function forkSession(
   // child's first spawn resumes it and forks forward (pendingForkSession), then
   // the worker persists the child's own new id and clears the marker.
   childSession.forkedFrom = ds.session.sessionId;
+  childSession.forkTaskText = opts?.forkTaskText;
+  childSession.larkThreadId = opts?.larkThreadId;
+  childSession.lastCallerOpenId = opts?.senderOpenId;
+  childSession.quoteTargetId = opts?.turnId;
+  childSession.quoteTargetSenderOpenId = opts?.senderOpenId;
+  childSession.quoteTargetSenderIsBot = opts?.senderIsBot;
   childSession.pendingForkSession = true;
   childSession.cliSessionId = srcCliSessionId;
   childSession.cliId = ds.session.cliId;
-  childSession.workingDir = ds.session.workingDir;
+  childSession.workingDir = ds.workingDir ?? ds.session.workingDir;
   childSession.ownerOpenId = ds.session.ownerOpenId;
   childSession.backendType = ds.session.backendType;
   // Bot identity on the PERSISTED row. Every other createSession caller sets
@@ -3623,7 +6788,7 @@ export async function forkSession(
   //   • model / reasoningEffort / cliPathOverride / wrapperCli / agentFrozen:
   //     without these the child's sessionAgentConfig() sees !agentFrozen and
   //     re-freezes from the CURRENT bot config, silently dropping any per-session
-  //     /model or /effort override the source carried (reasoningEffort has no
+  //     model or effort override the source carried (reasoningEffort has no
   //     botCfg fallback at all → drops to undefined). Copying the frozen tuple
   //     keeps the clone's launch identity == the source's.
   // readIsolation is intentionally NOT copied: it is not a persisted Session
@@ -3638,6 +6803,9 @@ export async function forkSession(
   childSession.sandboxNetwork = ds.session.sandboxNetwork;
   childSession.model = ds.session.model;
   childSession.reasoningEffort = ds.session.reasoningEffort;
+  childSession.cliRuntime = ds.session.cliRuntime
+    ? { ...ds.session.cliRuntime, update: { ...ds.session.cliRuntime.update } }
+    : undefined;
   childSession.cliPathOverride = ds.session.cliPathOverride;
   childSession.wrapperCli = ds.session.wrapperCli;
   childSession.agentFrozen = ds.session.agentFrozen;
@@ -3660,7 +6828,7 @@ export async function forkSession(
     cliVersion: getCurrentCliVersion(),
     lastMessageAt: Date.now(),
     hasHistory: true,           // forked child resumes (forks) prior history on first spawn
-    workingDir: ds.session.workingDir,
+    workingDir: ds.workingDir ?? ds.session.workingDir,
     ownerOpenId: ds.session.ownerOpenId,
     // Fresh card in the target anchor — never inherit the source's card id.
     streamCardId: undefined,
@@ -3696,7 +6864,19 @@ export async function forkSession(
   // codex fork). The SOURCE ds is never touched.
   const fkw = opts?.forkWorkerImpl ?? forkWorker;
   try {
-    fkw(childDs, '', /*resume*/true);
+    const initialPrompt = opts?.buildInitialPrompt?.(childSession.sessionId) ?? '';
+    if (initialPrompt) {
+      rememberLastCliInput(
+        childDs,
+        opts?.forkTaskText ?? (typeof initialPrompt === 'string' ? initialPrompt : initialPrompt.content),
+        initialPrompt,
+      );
+    }
+    fkw(
+      childDs,
+      initialPrompt,
+      opts?.turnId ? { resume: true, turnId: opts.turnId } : true,
+    );
   } catch (err) {
     logger.error(
       `[${childSession.sessionId.substring(0, 8)}] fork child worker spawn failed: `
@@ -3724,6 +6904,30 @@ function resolvesToHome(p: string): boolean {
   catch { return p === homedir(); }
 }
 
+export function codexAppCleanInputAcceptedForSession(ds: DaemonSession): boolean {
+  try {
+    const botCfg = getBot(ds.larkAppId).config;
+    const effectiveCliId = ds.session.cliId ?? botCfg.cliId;
+    return effectiveCliId === 'codex-app'
+      && botCfg.codexAppCleanInput === true
+      && !ds.adoptedFrom;
+  } catch {
+    // Admission metadata is optional for every other CLI. If bot config is
+    // temporarily unavailable, fail closed instead of leaking a clean sidecar.
+    return false;
+  }
+}
+
+function cloneFrozenCodexAppInput(
+  input: CodexAppTurnInput | undefined,
+  turnId?: string,
+): CodexAppTurnInput | undefined {
+  if (!input) return undefined;
+  const cloned = structuredClone(input);
+  if (turnId && !cloned.clientUserMessageId) cloned.clientUserMessageId = turnId;
+  return cloned;
+}
+
 function canForkRegisteredSession(ds: DaemonSession): boolean {
   const key = activeSessionKey(ds);
   const registered = activeSessionsRegistry ? activeSessionsRegistry.get(key) : ds;
@@ -3744,12 +6948,482 @@ function codexAppInputForSession(
   turnId?: string,
 ): CodexAppTurnInput | undefined {
   if (!input) return undefined;
+  if (!codexAppCleanInputAcceptedForSession(ds)) return undefined;
+  return cloneFrozenCodexAppInput(input, turnId);
+}
+
+function codexAppDeliverySinkForTurn(
+  ds: DaemonSession,
+  turnId: string,
+  dispatchAttempt: number | undefined,
+): CodexAppDeliverySink {
+  const armedThrough = ds.suppressedFinalOutputTurns?.get(turnId);
+  if (dispatchAttempt !== undefined
+    && armedThrough !== undefined
+    && dispatchAttempt <= armedThrough) return 'suppressed';
+  if (ds.session.docCommentTargets?.[turnId] || ds.docCommentTurns?.has(turnId)) {
+    return 'doc_comment';
+  }
+  if (ds.pendingWaitPromises?.has(turnId)) return 'http_wait';
+  if (ds.asyncTriggerResults?.has(turnId)) return 'http_async';
+  return 'lark';
+}
+
+/** A recovered transient/non-IM sink has no safe provider to replay into.
+ * Treat it as consumed so the runner can advance, but never fall through to a
+ * Lark card. Doc-comment replay also fails closed: chunk posting has no durable
+ * per-chunk effect journal yet, so blind crash replay could duplicate comments. */
+function codexAppDeliveryMustFailClosed(
+  ds: DaemonSession,
+  entry: CodexAppDispatchLedgerEntry,
+): boolean {
+  const sink = entry.deliverySink
+    ?? (ds.session.docCommentTargets?.[entry.turnId]
+      ? 'doc_comment'
+      : ds.chatId.startsWith('http_wait_')
+        ? 'http_wait'
+        : ds.chatId.startsWith('http_async_')
+          ? 'http_async'
+          : 'lark');
+  if (sink === 'suppressed') return true;
+  if (sink === 'doc_comment') return !ds.docCommentTurns?.has(entry.turnId);
+  if (sink === 'http_wait') return !ds.pendingWaitPromises?.has(entry.turnId);
+  if (sink === 'http_async') return !ds.asyncTriggerResults?.has(entry.turnId);
+  return false;
+}
+
+function acceptCodexAppDispatch(
+  ds: DaemonSession,
+  payload: {
+    content: string;
+    codexAppInput?: CodexAppTurnInput;
+    replyTurnId?: string;
+    replyTarget?: FrozenSessionReplyTarget;
+    quoteTargetId?: string;
+    replyTargetSenderOpenId?: string;
+    replyTargetSenderIsBot?: boolean;
+    queuedActivationToken?: string;
+    codexAppSteerable?: true;
+  },
+  turnId: string | undefined,
+  dispatchAttempt: number | undefined,
+  vcMeetingImTurnOrigin: ReturnType<typeof resolveVcMeetingImTurnOrigin>,
+  opts: { persist?: boolean } = {},
+): string | undefined {
   const botCfg = getBot(ds.larkAppId).config;
   const effectiveCliId = ds.session.cliId ?? botCfg.cliId;
-  if (effectiveCliId !== 'codex-app' || botCfg.codexAppCleanInput !== true || ds.adoptedFrom) return undefined;
-  return turnId && !input.clientUserMessageId
-    ? { ...input, clientUserMessageId: turnId }
-    : input;
+  if (effectiveCliId !== 'codex-app' || !turnId) return undefined;
+  const dispatchId = randomUUID();
+  const priorLedger = ds.session.codexAppDispatchLedger;
+  ds.session.codexAppDispatchLedger = appendAcceptedCodexAppDispatch(
+    ds.session.codexAppDispatchLedger ?? [],
+    {
+      dispatchId,
+      turnId,
+      ...(payload.queuedActivationToken
+        ? { queuedActivationToken: payload.queuedActivationToken }
+        : {}),
+      ...(payload.replyTurnId ? { replyTurnId: payload.replyTurnId } : {}),
+      ...(payload.replyTarget ? { replyTarget: payload.replyTarget } : {}),
+      ...(payload.quoteTargetId ? { quoteTargetId: payload.quoteTargetId } : {}),
+      ...(payload.replyTargetSenderOpenId
+        ? { replyTargetSenderOpenId: payload.replyTargetSenderOpenId }
+        : {}),
+      ...(payload.replyTargetSenderIsBot !== undefined
+        ? { replyTargetSenderIsBot: payload.replyTargetSenderIsBot }
+        : {}),
+      deliverySink: codexAppDeliverySinkForTurn(ds, turnId, dispatchAttempt),
+      ...(payload.codexAppSteerable ? { codexAppSteerable: true } : {}),
+      ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+      content: payload.content,
+      ...(payload.codexAppInput ? { codexAppInput: payload.codexAppInput } : {}),
+      ...(vcMeetingImTurnOrigin ? { vcMeetingImTurnOrigin } : {}),
+    },
+  );
+  if (opts.persist !== false) {
+    try {
+      sessionStore.updateSession(ds.session);
+    } catch (err) {
+      ds.session.codexAppDispatchLedger = priorLedger;
+      throw err;
+    }
+  }
+  return dispatchId;
+}
+
+function rollbackAcceptedCodexAppDispatch(
+  ds: DaemonSession,
+  dispatchId: string | undefined,
+  turnId: string | undefined,
+  dispatchAttempt: number | undefined,
+): void {
+  if (!dispatchId || !turnId) return;
+  const cancelled = cancelCodexAppDispatch(ds.session.codexAppDispatchLedger ?? [], {
+    dispatchId,
+    turnId,
+    ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+  });
+  if (!cancelled.ok) return;
+  const priorLedger = ds.session.codexAppDispatchLedger;
+  ds.session.codexAppDispatchLedger = cancelled.ledger;
+  try {
+    sessionStore.updateSession(ds.session);
+    if (!hasUnsettledCodexAppDispatch(ds.session.codexAppDispatchLedger)) {
+      void Promise.resolve(callbacks?.onCodexAppLedgerDrained?.(ds)).catch(err => {
+        logger.error(
+          `[${ds.session.sessionId.slice(0, 8)}] post-rollback ledger-drain cleanup failed: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    }
+  } catch {
+    ds.session.codexAppDispatchLedger = priorLedger;
+  }
+}
+
+/**
+ * Recovery-seam at-most-once fence for a keyed follow-up turn (turnIdempotencyKey,
+ * PR #818). The turn-level idempotency lease terminalizes an interrupted keyed
+ * turn to a durable `failed(dispatch_unknown)` (worker-exit convergence / boot
+ * reconcile / same-key retry) and — unlike a fresh async-virtual session — LEAVES
+ * the shared session open and un-quarantined (P1-3). So a later refork of that
+ * session must NOT resurrect the interrupted turn: `noReplay` only lives on the
+ * transient input queues (pendingMessages / inflight), NOT on the durable Codex
+ * App dispatch ledger. Without this fence, the recovery path
+ * (codexAppRecoveredDispatches → worker init → recoveredAcceptedInputs, keyed on
+ * `state==='accepted'` alone) would re-issue `turn/start` for a turn the caller
+ * was already told is `failed` at-most-once — the ledger is the third replay
+ * channel the lease's noReplay does not reach (codex #818 recovery-seam finding).
+ *
+ * Fence: for each `accepted` (NEVER `prepared`) ledger entry whose OWNER-MATCHED
+ * async terminal is already `failed(dispatch_unknown)`, durably retire the entry
+ * via cancelCodexAppDispatch. The retirement is TRANSACTIONAL: if any candidate
+ * cannot be exact-cancelled (a prepared successor pins the FIFO, or the entry
+ * vanished), the whole batch is rolled back in-memory and the fence THROWS before
+ * any persist — never a partial retire, never a fork past a still-live
+ * terminalized `accepted`. Idempotent and re-run at EVERY recovery seam, so it
+ * also covers the window where the durable failed was written but a crash hit
+ * before the exit-time retirement (the durable async truth is authoritative,
+ * re-checked here). A `prepared` entry is never cancelled without proof — the
+ * runner may have crossed the write boundary; the fence only ever targets
+ * `accepted`, and a prepared frame blocking an accepted retirement aborts the
+ * fork (above). Owner-scoped: only THIS bot's failed evidence counts, so a
+ * foreign/unstamped async record never retires our accepted entry.
+ *
+ * FAIL-CLOSED (codex #818 recovery-seam round-2). At-most-once forbids replaying
+ * a turn the caller was already told is `failed`, so an ambiguous fence THROWS
+ * rather than proceeding to fork:
+ *   1. Read side uses `asyncTriggerStore.lookupStrict` — a present-but-unreadable
+ *      / corrupt terminal file must NOT fold into "no record" (soft `lookup`),
+ *      which would let the accepted entry re-enter the recovery snapshot and
+ *      replay. ENOENT / absent trigger is a genuine "no terminal" and is fine.
+ *   2. Retire persist failure (updateSession EIO): the in-memory ledger is rolled
+ *      back to `priorLedger` and the error is RETHROWN, aborting this fork before
+ *      the recovery snapshot is taken. `staggeredRecoveryFork` (the boot eager
+ *      re-attach caller) already try/catches each fork, isolates the row, and
+ *      retains it for a later retry — so the durable ledger + async truth stay
+ *      intact and the next seam re-attempts the retirement. Degrading to "replay
+ *      once" (the pre-fix behavior) would itself be the P1 we are closing.
+ * @throws when the authoritative async truth is unreadable, or the retirement
+ *  cannot be durably persisted — the caller (forkWorker) must abort this fork.
+ */
+function retireTerminalizedCodexAppLedgerEntriesForRecovery(ds: DaemonSession): void {
+  const ledger = ds.session.codexAppDispatchLedger;
+  if (!ledger || ledger.length === 0) return;
+  const ownerLarkAppId = ds.larkAppId;
+  const toRetire = ledger.filter(entry =>
+    entry.state === 'accepted'
+    && (() => {
+      // STRICT read: a present-but-unreadable / corrupt terminal file THROWS
+      // (fail-closed) instead of folding into "no record" and replaying. ONLY
+      // our own durable dispatch_unknown failed counts (async-trigger-store is
+      // keyed by sessionId, so a foreign/unstamped terminal on the same
+      // sessionId/triggerId must not retire our accepted entry — mirrors the
+      // owner-positive-proof gate used everywhere else in the idempotency path).
+      const rec = asyncTriggerStore.lookupStrict(ds.session.sessionId, entry.turnId);
+      return !!rec
+        && rec.ownerLarkAppId === ownerLarkAppId
+        && rec.result.status === 'failed'
+        && rec.result.reason === 'dispatch_unknown';
+    })());
+  if (toRetire.length === 0) return;
+  // TRANSACTIONAL retirement (codex #818 exact-retirement fail-open). All work is
+  // done against an in-memory working copy; nothing is persisted until EVERY
+  // owner-matched terminal candidate has been exact-cancelled. If ANY candidate
+  // cannot be cancelled — `prepared_successor_exists` (a later prepared frame
+  // pins the FIFO) or `dispatch_not_found` (the ledger changed under us) — we
+  // restore the in-memory ledger to `priorLedger` and THROW *before* any persist,
+  // aborting this fork fail-closed. A `continue`-and-fork would leave that
+  // terminalized `accepted` entry to be replayed as `recoveredAcceptedInputs`
+  // (the generation fence only constrains `prepared`, never re-adds noReplay to a
+  // surviving `accepted`), and a partial persist could retire some while forking
+  // the rest. All-or-nothing + fail-closed is the only safe shape.
+  const priorLedger = ds.session.codexAppDispatchLedger;
+  let workingLedger = [...(ds.session.codexAppDispatchLedger ?? [])];
+  const retiredTurnIds: string[] = [];
+  for (const entry of toRetire) {
+    const cancelled = cancelCodexAppDispatch(workingLedger, {
+      dispatchId: entry.dispatchId,
+      turnId: entry.turnId,
+      ...(entry.dispatchAttempt !== undefined ? { dispatchAttempt: entry.dispatchAttempt } : {}),
+    });
+    if (!cancelled.ok) {
+      // Cannot exact-cancel a terminalized accepted entry (prepared successor /
+      // vanished). Abort the whole retirement + fork fail-closed; a later seam
+      // re-attempts once the blocking prepared frame settles or the ledger
+      // stabilizes. NEVER fall through to fork with a live terminalized accepted.
+      ds.session.codexAppDispatchLedger = priorLedger;
+      throw new Error(
+        `recovery fence could not exact-retire terminalized Codex App dispatch `
+        + `turn=${entry.turnId} (${cancelled.error}); aborting fork (fail-closed)`,
+      );
+    }
+    workingLedger = cancelled.ledger;
+    retiredTurnIds.push(entry.turnId);
+  }
+  // Every candidate retired on the working copy — commit ONCE.
+  ds.session.codexAppDispatchLedger = workingLedger;
+  try {
+    sessionStore.updateSession(ds.session);
+    for (const turnId of retiredTurnIds) {
+      logger.warn(
+        `[${ds.session.sessionId.slice(0, 8)}] Recovery fence retired at-most-once terminalized `
+        + `Codex App dispatch turn=${turnId.slice(0, 12)} (durable failed:dispatch_unknown; not replayed)`,
+      );
+    }
+    if (!hasUnsettledCodexAppDispatch(ds.session.codexAppDispatchLedger)) {
+      void Promise.resolve(callbacks?.onCodexAppLedgerDrained?.(ds)).catch(err => {
+        logger.error(
+          `[${ds.session.sessionId.slice(0, 8)}] post-recovery-fence ledger-drain cleanup failed: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    }
+  } catch (err) {
+    // Persist failed (EIO/ENOSPC). Roll back the in-memory ledger so the durable
+    // async truth + the on-disk ledger stay consistent, then RETHROW to ABORT
+    // this fork BEFORE the recovery snapshot is taken (fail-closed). Degrading to
+    // "let the accepted entry replay once" is exactly the at-most-once violation
+    // this fence exists to close, so we must NOT proceed to fork. The boot eager
+    // re-attach caller (staggeredRecoveryFork) try/catches each fork, isolates
+    // this row, and retains it for a later retry — so the next seam re-attempts
+    // the retirement against the intact durable state.
+    ds.session.codexAppDispatchLedger = priorLedger;
+    logger.error(
+      `[${ds.session.sessionId.slice(0, 8)}] Recovery fence could not persist retired ledger; `
+      + `aborting fork (fail-closed), will retry next seam: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    throw err instanceof Error
+      ? err
+      : new Error(`recovery-fence ledger retirement persist failed: ${String(err)}`);
+  }
+}
+
+type QueuedWorkerForkSnapshot = {
+  queued: true;
+  queuedPrompt: Session['queuedPrompt'];
+  queuedCodexAppText: Session['queuedCodexAppText'];
+  queuedCodexAppMessageContext: Session['queuedCodexAppMessageContext'];
+  queuedActivationPending: Session['queuedActivationPending'];
+  queuedActivationToken: Session['queuedActivationToken'];
+  queuedActivationInput: Session['queuedActivationInput'];
+  queuedActivationTurnId: Session['queuedActivationTurnId'];
+  queuedActivationDispatchAttempt: Session['queuedActivationDispatchAttempt'];
+  queuedActivationResume: Session['queuedActivationResume'];
+  initialStartPending: DaemonSession['initialStartPending'];
+};
+
+type QueuedActivationJournalSnapshot = Pick<
+  Session,
+  | 'queuedActivationPending'
+  | 'queuedActivationToken'
+  | 'queuedActivationInput'
+  | 'queuedActivationTurnId'
+  | 'queuedActivationDispatchAttempt'
+  | 'queuedActivationResume'
+  | 'queuedPrompt'
+  | 'queuedCodexAppText'
+  | 'queuedCodexAppMessageContext'
+  | 'pendingRepoSetup'
+>;
+
+function snapshotQueuedActivationJournal(session: Session): QueuedActivationJournalSnapshot {
+  return {
+    queuedActivationPending: session.queuedActivationPending,
+    queuedActivationToken: session.queuedActivationToken,
+    queuedActivationInput: session.queuedActivationInput,
+    queuedActivationTurnId: session.queuedActivationTurnId,
+    queuedActivationDispatchAttempt: session.queuedActivationDispatchAttempt,
+    queuedActivationResume: session.queuedActivationResume,
+    queuedPrompt: session.queuedPrompt,
+    queuedCodexAppText: session.queuedCodexAppText,
+    queuedCodexAppMessageContext: session.queuedCodexAppMessageContext,
+    pendingRepoSetup: session.pendingRepoSetup
+      ? structuredClone(session.pendingRepoSetup)
+      : undefined,
+  };
+}
+
+function restoreQueuedActivationJournal(
+  session: Session,
+  snapshot: QueuedActivationJournalSnapshot,
+): void {
+  Object.assign(session, snapshot);
+}
+
+function clearQueuedActivationJournal(session: Session): void {
+  session.queuedActivationPending = undefined;
+  session.queuedActivationToken = undefined;
+  session.queuedActivationInput = undefined;
+  session.queuedActivationTurnId = undefined;
+  session.queuedActivationDispatchAttempt = undefined;
+  session.queuedActivationResume = undefined;
+  session.queuedPrompt = undefined;
+  session.queuedCodexAppText = undefined;
+  session.queuedCodexAppMessageContext = undefined;
+  session.pendingRepoSetup = undefined;
+}
+
+/** A worker disappeared before the exact activation ACK. Re-park non-Codex
+ * work from the retained exact input; ACK loss may duplicate, but N can never
+ * be silently replaced by a later inbound turn in the same daemon lifetime. */
+function reparkUnsubmittedQueuedActivation(ds: DaemonSession, reason: string): boolean {
+  if (!ds.session.queuedActivationPending
+    || !ds.session.queuedActivationToken
+    || ds.session.cliId === 'codex-app') return false;
+  ds.session.queued = true;
+  ds.session.queuedActivationPending = undefined;
+  ds.session.queuedActivationToken = undefined;
+  ds.initialStartPending = false;
+  ds.initialStartClaimToken = undefined;
+  ds.pendingPrompt ??= ds.session.queuedPrompt;
+  try {
+    sessionStore.updateSession(ds.session);
+  } catch (err) {
+    // Memory remains explicitly parked while the old durable marker still
+    // provides restart recovery on disk.
+    logger.error(
+      `[${tag(ds)}] Failed to persist queued activation re-park after ${reason}: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  logger.warn(`[${tag(ds)}] Re-parked unacknowledged queued activation after ${reason}`);
+  return true;
+}
+
+/** The opening activation was ACKed, but one of the turns held behind its
+ * runtime reservation was not accepted before that worker exited. Promote the
+ * exact FIFO head into a new durable queued activation so the next inbound or
+ * Dashboard activation reforks it before every remaining tail item. */
+function reparkQueuedActivationFollowUpTail(ds: DaemonSession, reason: string): boolean {
+  if (!ds.initialStartPending || ds.session.queuedActivationPending) return false;
+  const next = ds.pendingQueuedActivationFollowUps?.[0];
+  if (!next) return false;
+  const matchingCodexEntries = ds.session.cliId === 'codex-app'
+    ? (ds.session.codexAppDispatchLedger ?? []).filter(entry =>
+      (entry.state === 'accepted' || entry.state === 'prepared')
+      && entry.turnId === next.turnId
+      && entry.dispatchAttempt === next.dispatchAttempt)
+    : [];
+  if (matchingCodexEntries.length > 1) {
+    logger.error(
+      `[${tag(ds)}] Cannot re-park queued follow-up after ${reason}: `
+      + `${matchingCodexEntries.length} Codex entries match turn ${next.turnId}`,
+    );
+    return false;
+  }
+  const retainedCodexEntry = matchingCodexEntries[0];
+  const retainedCodexToken = retainedCodexEntry
+    ? (retainedCodexEntry.queuedActivationToken ?? randomUUID())
+    : undefined;
+  // A failed daemon→worker IPC normally rolls its newly accepted Codex entry
+  // back. If that rollback persistence itself failed, the durable FIFO remains
+  // authoritative: recover it through a tokened ACK journal instead of
+  // creating an invalid queued+unsettled hybrid.
+  ds.session.queued = !retainedCodexEntry;
+  ds.session.queuedPrompt = next.cliInput.content;
+  ds.session.queuedCodexAppText = next.cliInput.codexAppInput?.text;
+  ds.session.queuedCodexAppMessageContext = undefined;
+  ds.session.queuedActivationInput = next.cliInput;
+  ds.session.queuedActivationTurnId = next.turnId;
+  ds.session.queuedActivationDispatchAttempt = next.dispatchAttempt;
+  ds.session.queuedActivationPending = retainedCodexEntry ? true : undefined;
+  ds.session.queuedActivationToken = retainedCodexToken;
+  if (retainedCodexEntry && retainedCodexToken) {
+    retainedCodexEntry.queuedActivationToken = retainedCodexToken;
+  }
+  ds.pendingQueuedActivationFollowUps!.shift();
+  if (ds.pendingQueuedActivationFollowUps!.length === 0) {
+    ds.pendingQueuedActivationFollowUps = undefined;
+  }
+  ds.pendingPrompt = next.cliInput.content;
+  ds.initialStartPending = false;
+  ds.initialStartClaimToken = undefined;
+  try {
+    sessionStore.updateSession(ds.session);
+  } catch (err) {
+    // Keep the exact head parked in memory. The caller has already fenced the
+    // dead worker, so a later inbound can safely retry this owner even if the
+    // durable projection is temporarily unavailable.
+    logger.error(
+      `[${tag(ds)}] Failed to persist queued follow-up re-park after ${reason}: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  logger.warn(`[${tag(ds)}] Re-parked unaccepted queued activation follow-up after ${reason}`);
+  return true;
+}
+
+export const __testOnly_reparkQueuedActivationFollowUpTail = reparkQueuedActivationFollowUpTail;
+
+type AcceptedWorkerForkDispatch = {
+  dispatchId: string;
+  turnId: string;
+  dispatchAttempt?: number;
+};
+
+/** Compensate only the durable mutations made before a worker accepts its init
+ * IPC. This is one synchronous call stack, so removing the exact dispatch that
+ * this fork appended cannot race a later worker transition or damage the FIFO
+ * that existed before the attempt. Persist the queued payload and ledger in one
+ * write so a daemon crash cannot observe only half of the compensation. */
+function rollbackWorkerForkPreInit(
+  ds: DaemonSession,
+  queuedSnapshot: QueuedWorkerForkSnapshot | undefined,
+  acceptedDispatch: AcceptedWorkerForkDispatch | undefined,
+): void {
+  const exactActivationInput = ds.session.queuedActivationInput;
+  const exactActivationTurnId = ds.session.queuedActivationTurnId;
+  const exactActivationDispatchAttempt = ds.session.queuedActivationDispatchAttempt;
+  const exactActivationResume = ds.session.queuedActivationResume;
+  let changed = false;
+  if (acceptedDispatch) {
+    const cancelled = cancelCodexAppDispatch(
+      ds.session.codexAppDispatchLedger ?? [],
+      acceptedDispatch,
+    );
+    if (!cancelled.ok) {
+      throw new Error(`failed to cancel pre-init Codex App dispatch: ${cancelled.error}`);
+    }
+    ds.session.codexAppDispatchLedger = cancelled.ledger;
+    changed = true;
+  }
+  if (queuedSnapshot) {
+    ds.session.queued = queuedSnapshot.queued;
+    restoreQueuedActivationJournal(ds.session, queuedSnapshot);
+    // The activation may have folded a triggering group reply into the final
+    // init payload. Retain that exact retry body even though the in-flight
+    // marker/token are rolled back with the fenced child.
+    ds.session.queuedActivationPending = undefined;
+    ds.session.queuedActivationToken = undefined;
+    ds.session.queuedActivationInput = exactActivationInput;
+    ds.session.queuedActivationTurnId = exactActivationTurnId;
+    ds.session.queuedActivationDispatchAttempt = exactActivationDispatchAttempt;
+    ds.session.queuedActivationResume = exactActivationResume;
+    ds.initialStartPending = queuedSnapshot.initialStartPending;
+    changed = true;
+  }
+  if (changed) sessionStore.updateSession(ds.session);
 }
 
 /** Send one normal (non-raw) worker turn while applying the per-bot Codex App
@@ -3761,17 +7435,54 @@ export function sendWorkerInput(
   turnId?: string,
   opts: {
     dispatchAttempt?: number;
+    /** Explicit positive steer authorization (plain-human-interactive only).
+     * Persisted on the accepted ledger entry and forwarded to the worker so the
+     * serial runner may steer this turn into an active one. */
+    codexAppSteerable?: true;
+    /** At-most-once (idempotency lease): forward to the worker so a keyed
+     * follow-up delivered to a LIVE worker is tagged noReplay and never replays
+     * onto an auto-restarted CLI after a crash+terminalize (turn-level PR #71).
+     * The dormant-fork path rides `atMostOnce` on the fork init instead. */
+    atMostOnce?: true;
   } = {},
 ): boolean {
+  const remoteRetirementPhase = remoteRetirementAdmissionPhase(ds);
+  if (remoteRetirementPhase) {
+    const remoteBackend = (ds.initConfig?.backendType ?? ds.session.backendType) === 'mojo'
+      ? 'Mojo'
+      : 'Riff';
+    logger.warn(
+      `[${tag(ds)}] Rejected turn ${turnId ?? '?'} while ${remoteBackend} retirement fence is ${remoteRetirementPhase}`,
+    );
+    void callbacks?.sessionReply(
+      sessionAnchorId(ds),
+      tr('worker.remote_close_in_progress', { backend: remoteBackend }, localeForBot(ds.larkAppId)),
+      'text',
+      ds.larkAppId,
+      turnId,
+    ).catch(err => {
+      logger.warn(
+        `[${tag(ds)}] Failed to notify rejected remote close-race turn: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
+    return false;
+  }
   const transferGate = transferInputGates.get(ds);
   if ((!ds.worker || ds.worker.killed) && !transferGate) return false;
   const normalized = typeof payload === 'string' ? { content: payload } : payload;
-  const codexAppInput = codexAppInputForSession(ds, normalized.codexAppInput, turnId);
+  const effectiveCliId = ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+  const effectiveTurnId = turnId ?? (effectiveCliId === 'codex-app'
+    ? `codex-app-dispatch-${randomUUID()}`
+    : undefined);
+  const replyTurnId = turnId ? undefined : ds.currentReplyTarget?.turnId;
+  const routingTurnId = turnId ?? replyTurnId;
+  const replyContext = frozenReplyContextForTurn(ds, routingTurnId);
+  const vcMeetingImTurnOrigin = resolveVcMeetingImTurnOrigin(ds.session, routingTurnId);
   let nativeSessionTitlePrompt: string | undefined;
   let nativeSessionTitle: string | undefined;
   if (ds.session.nativeSessionTitleAwaitingContent && !ds.session.nativeSessionTitleUserDefined && !ds.adoptedFrom) {
     const bot = getBot(ds.larkAppId);
-    const effectiveCliId = ds.session.cliId ?? bot.config.cliId;
     if (effectiveCliId === 'codex') {
       nativeSessionTitlePrompt = extractBotmuxLarkNativeSessionTitlePrompt(
         normalized.codexAppInput?.text ?? normalized.content,
@@ -3789,35 +7500,595 @@ export function sendWorkerInput(
       }
     }
   }
-  const vcMeetingImTurnOrigin = resolveVcMeetingImTurnOrigin(ds.session, turnId);
+
+  if (hasQueuedActivationAdmissionGate(ds)) {
+    const queuedTurnId = effectiveTurnId
+      ?? routingTurnId
+      ?? `queued-activation-followup-${randomUUID()}`;
+    try {
+      admitQueuedActivationTail(ds, {
+        userPrompt: normalized.content,
+        cliInput: {
+          content: normalized.content,
+          ...(normalized.codexAppInput
+            ? { codexAppInput: normalized.codexAppInput }
+            : {}),
+          // R4-B1: freeze the admission-time steer authorization into the queued
+          // tail's frozen payload so promote/repark/restore COPY it verbatim
+          // (admission computed once; never re-inferred downstream).
+          ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
+        },
+        turnId: queuedTurnId,
+        ...(opts.dispatchAttempt !== undefined
+          ? { dispatchAttempt: opts.dispatchAttempt }
+          : {}),
+      });
+      logger.info(
+        `[${tag(ds)}] Staged turn ${queuedTurnId} behind queued activation ACK`,
+      );
+      return true;
+    } catch (err) {
+      logger.error(
+        `[${tag(ds)}] Failed to durably stage turn ${queuedTurnId} behind activation: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return false;
+    }
+  }
+
+  const codexAppInput = codexAppInputForSession(
+    ds,
+    normalized.codexAppInput,
+    effectiveTurnId,
+  );
+  const codexAppDispatchId = acceptCodexAppDispatch(
+    ds,
+    {
+      content: normalized.content,
+      ...(codexAppInput ? { codexAppInput } : {}),
+      ...(replyTurnId ? { replyTurnId } : {}),
+      replyTarget: replyContext.target,
+      ...(replyContext.quoteTargetId ? { quoteTargetId: replyContext.quoteTargetId } : {}),
+      ...(replyContext.replyTargetSenderOpenId
+        ? { replyTargetSenderOpenId: replyContext.replyTargetSenderOpenId }
+        : {}),
+      ...(replyContext.replyTargetSenderIsBot !== undefined
+        ? { replyTargetSenderIsBot: replyContext.replyTargetSenderIsBot }
+        : {}),
+      ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
+    },
+    effectiveTurnId,
+    opts.dispatchAttempt,
+    vcMeetingImTurnOrigin,
+  );
+  // Route through sendWorkerSessionInput so an in-flight routing transfer
+  // buffers this turn instead of dropping it (master's transfer input gate),
+  // while preserving PR #597's accepted-dispatch ledger + reply-context wiring.
   const message: Extract<DaemonToWorker, { type: 'message' }> = {
     type: 'message',
     content: normalized.content,
     ...(codexAppInput ? { codexAppInput } : {}),
     ...(nativeSessionTitle ? { nativeSessionTitle } : {}),
     ...(nativeSessionTitlePrompt ? { nativeSessionTitlePrompt } : {}),
-    ...(turnId ? { turnId } : {}),
+    ...(effectiveTurnId ? { turnId: effectiveTurnId } : {}),
+    ...(replyTurnId ? { replyTurnId } : {}),
     ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
+    ...(codexAppDispatchId ? { codexAppDispatchId } : {}),
+    ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
+    ...(opts.atMostOnce ? { atMostOnce: true } : {}),
     ...(vcMeetingImTurnOrigin
       ? { vcMeetingImTurnOrigin }
       : {}),
+    ...(mojoLivePatchForSession(ds) ?? {}),
   };
-  return sendWorkerSessionInput(ds, message);
+  // First moment with a reply context after a restore/resume-time quarantine.
+  deliverPendingMojoQuarantineNotice(ds, turnId, opts.dispatchAttempt);
+  // #597: the accept-ledger entry is already appended above; if the IPC send
+  // fails (returns false or throws) we MUST roll it back or the dispatch ledger
+  // keeps a phantom accepted turn. master's ordinary-IM-delivery tracking runs
+  // inside the same protected send so a tracked delivery still rolls back.
+  const performSend = (): boolean => {
+    if (!transferGate && shouldTrackOrdinaryImDelivery(ds, message)) {
+      return sendOrdinaryImDeliveryTracked(ds, message);
+    }
+    return sendWorkerSessionInput(ds, message);
+  };
+  try {
+    if (!performSend()) {
+      rollbackAcceptedCodexAppDispatch(
+        ds,
+        codexAppDispatchId,
+        effectiveTurnId,
+        opts.dispatchAttempt,
+      );
+      return false;
+    }
+  } catch {
+    rollbackAcceptedCodexAppDispatch(
+      ds,
+      codexAppDispatchId,
+      effectiveTurnId,
+      opts.dispatchAttempt,
+    );
+    return false;
+  }
+  return true;
 }
 
+/**
+ * Complete live-credential snapshot to ride along with a turn, so a live mojo
+ * session picks up a rotated / cleared JWT without a refork.
+ *
+ * Sent on EVERY turn rather than only when it differs from the init snapshot. The
+ * daemon cannot know which patches a live worker has already applied, so diffing
+ * against init was wrong in both directions:
+ *   - a deleted `mojo.jwt` produced no patch, leaving the old token in place;
+ *   - `init A → patch B → config rolled back to A` compared A against A and sent
+ *     nothing, leaving the backend on B.
+ * The backend de-duplicates against its own current value, which is the only
+ * authoritative source.
+ *
+ * The control plane is NOT included — it stays frozen for the session's lifetime.
+ */
+export function mojoLivePatchForSession(ds: DaemonSession): { mojoLivePatch: MojoLivePatch } | undefined {
+  const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
+  if (backendType !== 'mojo') return undefined;
+  let botCfg;
+  try {
+    botCfg = getBot(ds.larkAppId).config;
+  } catch {
+    return undefined;
+  }
+  // Resolves jwtEnv daemon-side across the same layers buildEnv() uses, so the
+  // worker receives a value and never an env map.
+  return {
+    mojoLivePatch: pickMojoLivePatch(botCfg.mojo, {
+      genericEnv: botCfg.env ? sanitizePerBotEnv(botCfg.env) : undefined,
+    }),
+  };
+}
+
+/**
+ * Is auxiliary UI an authorized output channel for this session/turn?
+ *
+ * The single source of truth for this policy: setupWorkerHandlers' own
+ * `managedAuxUiSuppressed` now delegates here instead of keeping a parallel copy
+ * that could drift. Deliberately conservative: a
+ * dedicated VC receiver, a silent scheduled turn, or a session with no real Lark
+ * transport must never receive a bypass message. Those cases still get the
+ * persisted quarantine state for dashboard/audit — the notice is only about the
+ * chat channel.
+ */
+/** Sessions with a quarantine notice send in flight, so it cannot double-post. */
+const mojoQuarantineNoticeInFlight = new Set<string>();
+
+/**
+ * THE auxiliary-UI suppression policy. One definition, two call sites.
+ *
+ * Previously setupWorkerHandlers held this as a closure and the quarantine notice
+ * COPIED three of its four checks — dropping `ordinaryManagedSuppression`, so a
+ * durable-suppressed turn still posted to Lark. Copying a policy is how the two
+ * diverge; this is the shared implementation both now call.
+ *
+ * Returns true when auxiliary UI must be suppressed.
+ */
+export function auxUiSuppressedFor(
+  ds: DaemonSession,
+  turnId?: string,
+  dispatchAttempt?: number,
+): boolean {
+  // No-transport session (apiOnly bot or HTTP virtual chat): there is no real
+  // Feishu chat to render into.
+  try {
+    if (!larkTransportEnabled({
+      chatId: ds.chatId,
+      apiOnly: getBot(ds.larkAppId).config.apiOnly,
+    })) return true;
+  } catch {
+    // Bot deregistered — fail closed.
+    return true;
+  }
+  if (isSilentScheduledTurn(ds, turnId)) return true;
+  if (ds.session.vcMeetingReceiver) return true;
+  // Durable ledger: an attempt at or below the armed watermark is a replay whose
+  // output already happened (or was deliberately suppressed).
+  const armedThrough = turnId ? ds.suppressedFinalOutputTurns?.get(turnId) : undefined;
+  return dispatchAttempt !== undefined
+    && armedThrough !== undefined
+    && dispatchAttempt <= armedThrough;
+}
+
+/**
+ * Deliver the one-time notice that a mojo session's earlier remote lineage was
+ * parked, then clear the flag.
+ *
+ * Quarantining happens during restore/resume where there is no reply context, so
+ * the notice is deferred to the first ACCEPTED turn — hot send and cold fork both
+ * call this, since a cold-resumed session goes straight to forkWorker and would
+ * otherwise never deliver it.
+ *
+ * The flag is marked delivered (`false`) only AFTER a successful send, so a
+ * transient Lark failure retries on the next turn instead of losing the notice
+ * permanently. For a suppressed channel (durable replay / silent schedule / VC
+ * receiver / no transport) the flag STAYS PENDING: that turn merely had no
+ * authorized output channel, so a later ordinary IM turn delivers it. The
+ * quarantine state itself is persisted for dashboard/audit either way.
+ */
+function deliverPendingMojoQuarantineNotice(
+  ds: DaemonSession,
+  turnId?: string,
+  dispatchAttempt?: number,
+): void {
+  if (ds.session.mojoQuarantineNoticePending !== true) return;
+  // In-flight guard: two turns can be accepted before the first sessionReply
+  // resolves, which would post the notice twice.
+  if (mojoQuarantineNoticeInFlight.has(ds.session.sessionId)) return;
+  const lineage = ds.session.mojoQuarantinedLineage;
+  if (!lineage) {
+    ds.session.mojoQuarantineNoticePending = undefined;
+    sessionStore.updateSession(ds.session);
+    return;
+  }
+  let botCfg;
+  try {
+    botCfg = getBot(ds.larkAppId).config;
+  } catch {
+    return; // Bot deregistered — retry once it is back.
+  }
+  // `false` = DELIVERED, distinct from `undefined` = never queued. Clearing to
+  // undefined made the restore migration read it as "old build, never notified"
+  // and queue the notice again after every restart.
+  const markDelivered = (): void => {
+    ds.session.mojoQuarantineNoticePending = false;
+    sessionStore.updateSession(ds.session);
+  };
+  if (auxUiSuppressedFor(ds, turnId, dispatchAttempt)) {
+    // Stay PENDING: this turn simply had no authorized channel (durable replay,
+    // silent schedule, VC receiver, no transport). A later ordinary IM turn
+    // delivers it. The quarantine state itself is already persisted for
+    // dashboard/audit either way.
+    logger.info(
+      `[${tag(ds)}] mojo quarantine notice deferred — no authorized output channel `
+      + 'for this turn; still pending',
+    );
+    return;
+  }
+  mojoQuarantineNoticeInFlight.add(ds.session.sessionId);
+  const message = tr('worker.mojo_lineage_quarantined', { lineage }, botLocale(botCfg));
+  void callbacks?.sessionReply(
+    sessionAnchorId(ds),
+    message,
+    'text',
+    ds.larkAppId,
+    // The turn that actually carried this delivery, not a stale reply target.
+    turnId,
+    ds.session.vcMeetingReceiver ? { sourceSessionId: ds.session.sessionId } : undefined,
+  ).then(markDelivered).catch((err) => {
+    // Flag intentionally left set: the next turn retries.
+    logger.warn(`[${tag(ds)}] failed to deliver mojo quarantine notice (will retry): ${err}`);
+  }).finally(() => {
+    mojoQuarantineNoticeInFlight.delete(ds.session.sessionId);
+  });
+}
+
+
+/** Promote the oldest durable activation successor into a fresh tokened
+ * journal and (for Codex App) its single accepted-ledger owner in one store
+ * update, then hand it to the current worker. The tail is never shifted merely
+ * because ChildProcess.send returned: the promoted journal survives until the
+ * adapter ACK carrying this token arrives. */
+export function promoteQueuedActivationTail(
+  ds: DaemonSession,
+  opts: { send?: boolean } = {},
+): boolean {
+  if (ds.session.queuedActivationPending) return true;
+  if (opts.send !== false
+    && (!ds.worker || ds.worker.killed)) return false;
+  const ordered = [...(ds.session.queuedActivationTail ?? [])]
+    .sort((a, b) => a.order - b.order || a.id.localeCompare(b.id));
+  const head = ordered[0];
+  if (!head) return false;
+
+  const priorJournal = snapshotQueuedActivationJournal(ds.session);
+  const priorTail = ds.session.queuedActivationTail?.map(entry => ({
+    ...entry,
+    cliInput: {
+      ...entry.cliInput,
+      ...(entry.cliInput.codexAppInput
+        ? { codexAppInput: structuredClone(entry.cliInput.codexAppInput) }
+        : {}),
+    },
+  }));
+  const priorLedger = ds.session.codexAppDispatchLedger?.map(entry => ({ ...entry }));
+  const priorPendingPrompt = ds.pendingPrompt;
+  const token = randomUUID();
+  const replyContext = frozenReplyContextForTurn(ds, head.turnId);
+  // The tail entry crossed its admission boundary with the clean-input gate
+  // already frozen. Do not re-run that immediate bot-config gate at promotion:
+  // a true→false toggle between N+1 admission and N's ACK would otherwise
+  // discard N+1's exact sidecar/hidden context. Only fill the deterministic id
+  // for legacy entries persisted before admission began stamping it.
+  const codexAppInput = cloneFrozenCodexAppInput(
+    head.cliInput.codexAppInput,
+    head.turnId,
+  );
+  const exactInput: CliTurnPayload = {
+    content: head.cliInput.content,
+    ...(codexAppInput ? { codexAppInput } : {}),
+    // R5-B1-2: preserve the frozen steer authorization onto the promoted
+    // queuedActivationInput so the ensuing fork/accept-ledger COPY (below) sees
+    // it. Only `=== true`; a missing/false tail head stays forced-serial.
+    ...(head.cliInput.codexAppSteerable === true ? { codexAppSteerable: true as const } : {}),
+  };
+  const vcMeetingImTurnOrigin = resolveVcMeetingImTurnOrigin(ds.session, head.turnId);
+
+  ds.session.queued = false;
+  ds.session.queuedActivationPending = true;
+  ds.session.queuedActivationToken = token;
+  ds.session.queuedActivationInput = exactInput;
+  ds.session.queuedActivationTurnId = head.turnId;
+  ds.session.queuedActivationDispatchAttempt = head.dispatchAttempt;
+  ds.session.queuedActivationResume = ds.hasHistory;
+  ds.session.queuedActivationTail = ordered.slice(1);
+  if (ds.session.queuedActivationTail.length === 0) {
+    ds.session.queuedActivationTail = undefined;
+  }
+  ds.pendingPrompt = exactInput.content;
+  ds.initialStartPending = true;
+
+  let codexAppDispatchId: string | undefined;
+  try {
+    codexAppDispatchId = acceptCodexAppDispatch(
+      ds,
+      {
+        content: exactInput.content,
+        ...(codexAppInput ? { codexAppInput } : {}),
+        queuedActivationToken: token,
+        replyTarget: replyContext.target,
+        ...(replyContext.quoteTargetId ? { quoteTargetId: replyContext.quoteTargetId } : {}),
+        ...(replyContext.replyTargetSenderOpenId
+          ? { replyTargetSenderOpenId: replyContext.replyTargetSenderOpenId }
+          : {}),
+        ...(replyContext.replyTargetSenderIsBot !== undefined
+          ? { replyTargetSenderIsBot: replyContext.replyTargetSenderIsBot }
+          : {}),
+        // R4-B1: COPY the frozen steer authorization from the promoted tail
+        // entry's payload onto the accept-ledger (admission computed once; never
+        // re-inferred at promote time).
+        ...(exactInput.codexAppSteerable ? { codexAppSteerable: true } : {}),
+      },
+      head.turnId,
+      head.dispatchAttempt,
+      vcMeetingImTurnOrigin,
+      { persist: false },
+    );
+    sessionStore.updateSession(ds.session);
+  } catch (err) {
+    restoreQueuedActivationJournal(ds.session, priorJournal);
+    ds.session.queuedActivationTail = priorTail;
+    ds.session.codexAppDispatchLedger = priorLedger;
+    ds.pendingPrompt = priorPendingPrompt;
+    logger.error(
+      `[${tag(ds)}] Failed to atomically promote queued activation tail ${head.id}: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return false;
+  }
+
+  if (opts.send === false) return true;
+  try {
+    ds.worker!.send({
+      type: 'message',
+      content: exactInput.content,
+      ...(codexAppInput ? { codexAppInput } : {}),
+      turnId: head.turnId,
+      ...(head.dispatchAttempt !== undefined
+        ? { dispatchAttempt: head.dispatchAttempt }
+        : {}),
+      ...(codexAppDispatchId ? { codexAppDispatchId } : {}),
+      // R6-B2: COPY the frozen steer authorization onto the live-worker IPC — the
+      // last hop. Without it a promoted N+1 reaches a live worker with the daemon
+      // ledger head steerable=true but the worker reservation false, so a
+      // legitimate superseded settlement would be wrongly rejected.
+      ...(exactInput.codexAppSteerable === true ? { codexAppSteerable: true as const } : {}),
+      queuedActivationToken: token,
+      ...(vcMeetingImTurnOrigin ? { vcMeetingImTurnOrigin } : {}),
+    } as DaemonToWorker);
+  } catch (err) {
+    // Durable ownership already moved to the journal (and Codex ledger). Never
+    // append another owner on retry; fence this IPC generation and let recovery
+    // replay the exact tokened head.
+    logger.error(
+      `[${tag(ds)}] Worker IPC rejected promoted activation ${head.id}; retaining journal: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+    try { ds.worker!.kill(); } catch { /* exit/error path will fence runtime */ }
+  }
+  return true;
+}
+
+export type QueuedActivationTailReservation = Pick<QueuedActivationTailEntry, 'id' | 'order'> & {
+  /** Clean-input decision captured synchronously with FIFO order, before any
+   * caller-specific async prompt construction. This field is runtime-only. */
+  codexAppInputAccepted?: boolean;
+};
+
+/** Reserve arrival order synchronously, before any caller-specific prompt
+ * rendering may await. Gaps are harmless; reusing an order after a failed
+ * durable admission would not be. */
+export function reserveQueuedActivationTailAdmission(
+  ds: DaemonSession,
+): QueuedActivationTailReservation {
+  const order = (ds.session.queuedActivationTailNextOrder ?? 0) + 1;
+  ds.session.queuedActivationTailNextOrder = order;
+  return {
+    id: randomUUID(),
+    order,
+    codexAppInputAccepted: codexAppCleanInputAcceptedForSession(ds),
+  };
+}
+
+/** Admit one exact successor behind a queued activation. The response boundary
+ * is the session-store write: callers must not report acceptance or use live
+ * worker IPC unless this returns. `reservation` lets routes reserve FIFO order
+ * before asynchronous prompt construction without duplicating persistence
+ * logic. */
+export function admitQueuedActivationTail(
+  ds: DaemonSession,
+  entry: Omit<QueuedActivationTailEntry, 'id' | 'order'>,
+  reservation: QueuedActivationTailReservation = reserveQueuedActivationTailAdmission(ds),
+  opts: { codexAppInputGateFrozen?: boolean } = {},
+): QueuedActivationTailEntry {
+  const acceptedCodexAppInput = opts.codexAppInputGateFrozen === true
+    ? cloneFrozenCodexAppInput(entry.cliInput.codexAppInput, entry.turnId)
+    : reservation.codexAppInputAccepted === true
+      ? cloneFrozenCodexAppInput(entry.cliInput.codexAppInput, entry.turnId)
+      : undefined;
+  const admitted: QueuedActivationTailEntry = {
+    id: reservation.id,
+    order: reservation.order,
+    ...entry,
+    cliInput: {
+      content: entry.cliInput.content,
+      ...(acceptedCodexAppInput ? { codexAppInput: acceptedCodexAppInput } : {}),
+      // R5-B1-2: preserve the frozen steer authorization across the tail rebuild
+      // (only `=== true`, never truthy). Dropping it here silently un-authorized
+      // every queued/opening turn — the strip point that defeated the R4 fix.
+      ...(entry.cliInput.codexAppSteerable === true ? { codexAppSteerable: true as const } : {}),
+    },
+  };
+  const priorTail = ds.session.queuedActivationTail;
+  const next = [...(priorTail ?? [])];
+  if (!next.some(candidate => candidate.id === admitted.id)) next.push(admitted);
+  next.sort((a, b) => a.order - b.order || a.id.localeCompare(b.id));
+  ds.session.queuedActivationTail = next;
+  try {
+    sessionStore.updateSession(ds.session);
+  } catch (err) {
+    ds.session.queuedActivationTail = priorTail;
+    throw err;
+  }
+  return admitted;
+}
+
+/** True while a live worker's opening activation still owns submission order.
+ * Every ingress that sees this state must use admitQueuedActivationTail rather
+ * than ordinary worker IPC. */
+export function hasQueuedActivationAdmissionGate(ds: DaemonSession): boolean {
+  return ds.session.queuedActivationPending === true
+    || (ds.session.queuedActivationTail?.length ?? 0) > 0
+    || (ds.queuedActivationTailAdmissionsOutstanding ?? 0) > 0
+    || ds.queuedActivationTailReleasePending !== undefined
+    || (ds.initialStartPending === true
+      && ds.session.queuedActivationInput !== undefined);
+}
+
+export type ForkResumeOrTurnId = boolean | string | {
+  resume?: boolean;
+  turnId?: string;
+  dispatchAttempt?: number;
+  /** The payload is an exact retained activation journal. Do not re-read the
+   * live clean-input feature flag on retry/replay. */
+  codexAppInputGateFrozen?: boolean;
+  /** Correlates a worker restart across the detach/refork boundary so late
+   * lifecycle events from the retired worker are not misattributed. */
+  restartAttemptId?: string;
+  /** At-most-once turn (idempotency lease): the worker must NEVER replay this
+   *  input after a CLI exit — not via inflight carry-over, not from the still-
+   *  queued pendingMessages. Once the daemon terminalizes the turn, re-executing
+   *  it on an auto-restarted CLI would violate at-most-once (codex #776 round-7
+   *  finding #1). */
+  atMostOnce?: boolean;
+};
+
+/** Central quarantine decision for one fork boundary — the SINGLE authority that
+ * keeps a restore-time "tail-only quarantine" from being forked incorrectly.
+ *
+ * A quarantined owner (see restoreActiveSessions) has an old activation-tail head
+ * that failed to promote transiently: the head sits un-promoted in the tail with
+ * the admission gate held (worker:null). The invariant across EVERY fork boundary
+ * (restore reattach, IM inbound refork, web-terminal lazy wake, and any future
+ * one) is enforced here so callers cannot each miss it:
+ *
+ *  - Not quarantined → pass the caller's args through unchanged.
+ *  - Quarantined + NON-empty prompt → REFUSE (`fork:false`). forkWorker cannot
+ *    verify the caller durably staged this turn behind the old head, so letting
+ *    it through could overtake the head. The inbound path must durable-admit the
+ *    turn into the tail first, then blank-recover (empty prompt) through here.
+ *  - Quarantined + empty prompt → retry the old head's promotion. On failure keep
+ *    the flag/gate/worker:null and REFUSE (a blank fork would leave a live worker
+ *    beside an unpromoted tail and permanently wedge the FIFO gate). On success,
+ *    clear the flag and rewrite the fork to recover the PROMOTED OLD HEAD (never
+ *    the caller's turn): Codex App recovers through its ledger with an empty
+ *    prompt; a non-Codex CLI resubmits the exact `queuedActivationInput` with the
+ *    persisted resume/turn/attempt — mirroring the daemon activation-recovery fork.
+ *
+ * Extracted (and exported) so the orchestration can be unit-tested without a real
+ * tmux/worker: mock `promoteQueuedActivationTail` and assert refuse vs. recover
+ * args, then that forkWorker applies them.
+ */
+export function resolveQuarantinedForkPlan(
+  ds: DaemonSession,
+  promptInput: string | CliTurnPayload,
+  resumeOrTurnId: ForkResumeOrTurnId,
+): { fork: boolean; promptInput: string | CliTurnPayload; resumeOrTurnId: ForkResumeOrTurnId } {
+  if (!ds.quarantinedActivationTailPromotion) {
+    return { fork: true, promptInput, resumeOrTurnId };
+  }
+  const content = typeof promptInput === 'string' ? promptInput : promptInput.content;
+  if (content.length > 0) {
+    logger.warn(
+      `[${tag(ds)}] Refused non-empty fork of a quarantined tail-only owner; `
+      + `caller must durable-admit the turn behind the old head, then blank-recover`,
+    );
+    return { fork: false, promptInput, resumeOrTurnId };
+  }
+  if (!promoteQueuedActivationTail(ds, { send: false })) {
+    logger.warn(
+      `[${tag(ds)}] Quarantined activation-tail promotion still failing at fork boundary; `
+      + `keeping worker:null quarantined owner (no fork) to avoid a live worker beside an unpromoted tail`,
+    );
+    return { fork: false, promptInput, resumeOrTurnId };
+  }
+  ds.quarantinedActivationTailPromotion = undefined;
+  // Promotion succeeded: the old head is now the tokened queued activation. Fork
+  // THAT, exactly like the daemon's queuedActivation recovery — Codex App through
+  // its dispatch ledger (empty prompt), non-Codex by resubmitting the exact input.
+  const recoverThroughCodexLedger =
+    (ds.session.cliId ?? getBot(ds.larkAppId).config.cliId) === 'codex-app';
+  return {
+    fork: true,
+    promptInput: recoverThroughCodexLedger ? '' : (ds.session.queuedActivationInput ?? ''),
+    resumeOrTurnId: {
+      resume: ds.session.queuedActivationResume ?? ds.hasHistory,
+      turnId: ds.session.queuedActivationTurnId,
+      dispatchAttempt: ds.session.queuedActivationDispatchAttempt,
+    },
+  };
+}
+
+/**
+ * Fork (or re-attach) a worker for `ds`.
+ *
+ * Returns `false` ONLY when a quarantined tail-only owner's promotion could not
+ * be recovered at this fork boundary (see resolveQuarantinedForkPlan): the caller
+ * MUST treat the session as still worker-less (no live worker was started) and
+ * leave the admission gate held. Every other outcome — forked, re-attached,
+ * staged behind an ACK, routed through a live owner, or spawn-deferred during
+ * device isolation — returns `true`.
+ */
 export function forkWorker(
   ds: DaemonSession,
   promptInput: string | CliTurnPayload,
-  resumeOrTurnId: boolean | string | {
-    resume?: boolean;
-    turnId?: string;
-    dispatchAttempt?: number;
-    restartAttemptId?: string;
-  } = false,
-): void {
+  resumeOrTurnId: ForkResumeOrTurnId = false,
+): boolean {
   const gatedPrompt = typeof promptInput === 'string' ? { content: promptInput } : promptInput;
-  const transferGate = transferInputGates.get(ds);
-  if (transferGate && !transferReplacementForkBypass.has(ds)) {
+  const remoteRetirementPhase = remoteRetirementAdmissionPhase(ds);
+  if (remoteRetirementPhase) {
+    // A close/shutdown coordinator owns this exact remote generation. Never
+    // spawn a replacement behind its back: a fork can materialize the opening
+    // prompt before sendWorkerInput gets a chance to reject it. Route non-empty
+    // input through the ordinary fence solely for the user-visible warning.
     if (gatedPrompt.content !== '') {
       const gatedTurnId = typeof resumeOrTurnId === 'string'
         ? resumeOrTurnId
@@ -3831,6 +8102,47 @@ export function forkWorker(
         ...(gatedDispatchAttempt !== undefined
           ? { dispatchAttempt: gatedDispatchAttempt }
           : {}),
+        ...(gatedPrompt.codexAppSteerable === true
+          ? { codexAppSteerable: true as const }
+          : {}),
+      });
+    }
+    logger.warn(
+      `[${tag(ds)}] Refused worker fork while remote retirement fence is ${remoteRetirementPhase}`,
+    );
+    // The request was handled by the retirement fence; false is reserved for
+    // tail-only quarantine promotion failures by this function's contract.
+    return true;
+  }
+  const transferGate = transferInputGates.get(ds);
+  if (transferGate && !transferReplacementForkBypass.has(ds)) {
+    if (gatedPrompt.content !== '') {
+      const gatedTurnId = typeof resumeOrTurnId === 'string'
+        ? resumeOrTurnId
+        : typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
+        ? resumeOrTurnId.turnId
+        : undefined;
+      const gatedDispatchAttempt = typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
+        ? resumeOrTurnId.dispatchAttempt
+        : undefined;
+      const gatedAtMostOnce = typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
+        ? resumeOrTurnId.atMostOnce
+        : undefined;
+      sendWorkerInput(ds, promptInput, gatedTurnId, {
+        ...(gatedDispatchAttempt !== undefined
+          ? { dispatchAttempt: gatedDispatchAttempt }
+          : {}),
+        // R6-B3 (transfer-gate sibling): sendWorkerInput reads steer
+        // authorization from OPTS, not the payload. A steerable opening/refork
+        // rerouted through the transfer gate must carry the flag here too, or it
+        // silently downgrades true → false like the direct-route branch did.
+        ...(gatedPrompt.codexAppSteerable === true ? { codexAppSteerable: true as const } : {}),
+        // At-most-once (codex #818 P1-5): a keyed follow-up fork rerouted through
+        // the transfer gate to sendWorkerInput must preserve atMostOnce, else the
+        // replacement CLI's input is replayable and a crash after the daemon
+        // terminalized the turn re-runs it. forkWorker's own init path sets this
+        // from resumeOrTurnId.atMostOnce; the reroute must forward it identically.
+        ...(gatedAtMostOnce ? { atMostOnce: true as const } : {}),
       });
     } else {
       transferGate.needsWorker = true;
@@ -3845,7 +8157,10 @@ export function forkWorker(
         }
       });
     }
-    return;
+    // Buffered/deferred behind the routing transfer: no live worker started
+    // now, but the turn is durably staged, so this is not the quarantine
+    // refusal that boolean-false signals to callers.
+    return true;
   }
 
   // Device enrollment briefly freezes every daemon before the one-way host
@@ -3859,34 +8174,35 @@ export function forkWorker(
     }
   })) {
     logger.info(`[${tag(ds)}] worker spawn deferred during device credential activation`);
-    return;
+    return true;
   }
-  if (!canForkRegisteredSession(ds)) return;
-  const cb = requireCallbacks();
-  const bot = getBot(ds.larkAppId);
-  const botCfg = bot.config;
+
+  // Central quarantine guard — the single source of truth for the tail-only
+  // restore quarantine invariant (documented on resolveQuarantinedForkPlan). Runs
+  // before ANY prompt derivation or session mutation so a refusal is side-effect
+  // free, and so a recovered plan rewrites the prompt/resume args used below.
+  const quarantinePlan = resolveQuarantinedForkPlan(ds, promptInput, resumeOrTurnId);
+  if (!quarantinePlan.fork) return false;
+  promptInput = quarantinePlan.promptInput;
+  resumeOrTurnId = quarantinePlan.resumeOrTurnId;
+
+  // Refuse a closed or superseded session before any mutation (master guard).
+  if (!canForkRegisteredSession(ds)) return false;
+
   const promptPayload = typeof promptInput === 'string' ? { content: promptInput } : promptInput;
   const prompt = promptPayload.content;
-  // 不变式：一旦真正起 CLI，会话就不再是「待办池(queued)」parked 态。无论由哪条
-  // 路径触发（激活按钮 / 拖到进行中 / 群里来消息抢先起会话），都在此清掉 queued
-  // 标记并落盘——否则重启后会被当 parked 恢复成 hasHistory:false 而丢掉真历史。
-  if (ds.session.queued) {
-    ds.session.queued = false;
-    ds.session.queuedPrompt = undefined;
-    ds.session.queuedCodexAppText = undefined;
-    ds.session.queuedCodexAppMessageContext = undefined;
-    sessionStore.updateSession(ds.session);
-  }
-  // worker.js lives in the same directory as daemon.js (src/)
-  const workerPath = join(__dirname, '..', 'worker.js');
-  const t = tag(ds);
-  ds.localProcessAttestation = undefined;
-  ds.workerReady = false;
-
+  // R4-B1: the frozen steer authorization rides on the CliTurnPayload (computed
+  // once by the daemon at admission, COPIED here). A bare-string promptInput or a
+  // system/recovery opening carries no flag ⇒ forced serial. Never re-inferred.
+  const initCodexAppSteerable = typeof promptInput === 'object'
+    && promptInput !== null
+    && promptInput.codexAppSteerable === true;
   let resume = false;
   let initTurnId: string | undefined;
   let initDispatchAttempt: number | undefined;
   let restartAttemptId: string | undefined;
+  let initCodexAppInputGateFrozen = promptInput === ds.session.queuedActivationInput;
+  let initAtMostOnce: boolean | undefined;
   if (typeof resumeOrTurnId === 'string') {
     initTurnId = resumeOrTurnId;
   } else if (typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null) {
@@ -3894,16 +8210,130 @@ export function forkWorker(
     initTurnId = resumeOrTurnId.turnId;
     initDispatchAttempt = resumeOrTurnId.dispatchAttempt;
     restartAttemptId = resumeOrTurnId.restartAttemptId;
+    initCodexAppInputGateFrozen ||= resumeOrTurnId.codexAppInputGateFrozen === true;
+    initAtMostOnce = resumeOrTurnId.atMostOnce;
   } else {
     resume = resumeOrTurnId;
   }
+  if (ds.session.queuedActivationPending && ds.session.queuedActivationResume !== undefined) {
+    resume = ds.session.queuedActivationResume;
+  }
+
+  // Central double-fork guard. A live worker with durable ownership must never
+  // be killed and replaced: empty reforks are rejected, while a real follow-up
+  // is appended through the existing worker's ordinary durable FIFO. Keep this
+  // before queued/cwd/sandbox mutations so a rejected refork is side-effect free.
+  if (ds.worker && !ds.worker.killed
+    && hasProtectedSessionMutationOwnership(ds)) {
+    if (prompt.length === 0) {
+      logger.warn(`[${tag(ds)}] Refused empty worker refork while durable activation ownership is non-empty`);
+      return true;
+    }
+    if (hasQueuedActivationAdmissionGate(ds)) {
+      const turnId = initTurnId
+        ?? ds.currentReplyTarget?.turnId
+        ?? `queued-activation-followup-${randomUUID()}`;
+      admitQueuedActivationTail(ds, {
+        userPrompt: prompt,
+        cliInput: {
+          content: prompt,
+          ...(promptPayload.codexAppInput
+            ? { codexAppInput: promptPayload.codexAppInput }
+            : {}),
+          // R5-B1-2: preserve the frozen steer authorization on the double-fork
+          // staged tail entry (only `=== true`).
+          ...(initCodexAppSteerable ? { codexAppSteerable: true as const } : {}),
+        },
+        turnId,
+        ...(initDispatchAttempt !== undefined
+          ? { dispatchAttempt: initDispatchAttempt }
+          : {}),
+      });
+      logger.info(
+        `[${tag(ds)}] Staged double-fork prompt behind queued activation ACK `
+        + `(turn=${turnId})`,
+      );
+      return true;
+    }
+    const routed = sendWorkerInput(ds, promptPayload, initTurnId, {
+      ...(initDispatchAttempt !== undefined ? { dispatchAttempt: initDispatchAttempt } : {}),
+      // R6-B3: sendWorkerInput reads steer authorization from OPTS (not the
+      // payload), so the direct-route double-fork (protected ownership, no
+      // activation gate — e.g. only an unsettled ledger) must pass it through
+      // opts too. The gate branch above already admits with the flag; this
+      // sibling branch would otherwise silently downgrade true → false.
+      ...(initCodexAppSteerable ? { codexAppSteerable: true as const } : {}),
+    });
+    logger[routed ? 'info' : 'warn'](
+      `[${tag(ds)}] ${routed ? 'Routed' : 'Failed to route'} double-fork prompt through existing durable owner`,
+    );
+    return true;
+  }
+
+  const cb = requireCallbacks();
+  const bot = getBot(ds.larkAppId);
+  const botCfg = bot.config;
+  // A bare /repo placeholder (and a non-Codex empty group-join setup) owns no
+  // model turn. Starting its CLI with an empty prompt must not mint a queued
+  // activation token: the worker has nothing to submit and could never ACK it.
+  // Real raw openings and clean Codex sidecars remain tokened.
+  if (ds.session.queued
+    && ds.session.pendingRepoSetup
+    && prompt.length === 0
+    && !promptPayload.codexAppInput
+    && !ds.pendingRawInput
+    && (ds.session.queuedActivationTail?.length ?? 0) === 0) {
+    const priorJournal = snapshotQueuedActivationJournal(ds.session);
+    ds.session.queued = false;
+    clearQueuedActivationJournal(ds.session);
+    try {
+      sessionStore.updateSession(ds.session);
+    } catch (err) {
+      ds.session.queued = true;
+      restoreQueuedActivationJournal(ds.session, priorJournal);
+      throw err;
+    }
+  }
+  const queuedForkSnapshot: QueuedWorkerForkSnapshot | undefined = ds.session.queued
+    ? {
+        queued: true,
+        queuedPrompt: ds.session.queuedPrompt,
+        queuedCodexAppText: ds.session.queuedCodexAppText,
+        queuedCodexAppMessageContext: ds.session.queuedCodexAppMessageContext,
+        queuedActivationPending: ds.session.queuedActivationPending,
+        queuedActivationToken: ds.session.queuedActivationToken,
+        queuedActivationInput: ds.session.queuedActivationInput,
+        queuedActivationTurnId: ds.session.queuedActivationTurnId,
+        queuedActivationDispatchAttempt: ds.session.queuedActivationDispatchAttempt,
+        queuedActivationResume: ds.session.queuedActivationResume,
+        initialStartPending: ds.initialStartPending,
+      }
+    : undefined;
+  let acceptedForkDispatch: AcceptedWorkerForkDispatch | undefined;
+  let spawnedWorker: ChildProcess | undefined;
+  let worker!: ChildProcess;
+  let startupState!: WorkerStartupState;
+  let initMsg!: Extract<DaemonToWorker, { type: 'init' }>;
+  let agentCfg!: ReturnType<typeof sessionAgentConfig>;
+  const t = tag(ds);
+  ds.localProcessAttestation = undefined;
+  try {
+  // worker.js lives in the same directory as daemon.js (src/)
+  const workerPath = join(__dirname, '..', 'worker.js');
 
   // Per-turn authority is never inferred from mutable session state. Human
   // message routes pass their accepted Lark message id explicitly; restore,
   // scheduler, card retry and other system starts stay unattributed. Falling
   // back to currentReplyTarget here would let a later system prompt reuse an
   // older human turn after a worker replacement.
-  const initAttributionTurnId = initTurnId;
+  let initAttributionTurnId = initTurnId
+    ?? (queuedForkSnapshot ? ds.session.pendingRepoSetup?.turnId : undefined);
+  // Reply routing is frozen only from the same explicitly accepted turn. A
+  // system prompt must not borrow an older mutable currentReplyTarget.
+  const initReplyTurnId = initTurnId;
+  const initReplyContext = prompt.length > 0
+    ? frozenReplyContextForTurn(ds, initReplyTurnId)
+    : undefined;
 
   // A fork() whose cwd no longer exists emits an unhandled 'error' (spawn
   // ENOENT) that crashes the WHOLE daemon (→ pm2 crash-loop). Fall back to
@@ -3996,7 +8426,10 @@ export function forkWorker(
   // real bmx-<sid>; without this, bmx-diag-<sid> + its .ansi file would leak.
   if (!ds.initConfig?.adoptMode && !ds.adoptedFrom) reclaimParkedCrashDiagnostic(ds);
 
-  const agentCfg = sessionAgentConfig(ds, botCfg);
+  agentCfg = sessionAgentConfig(ds, botCfg);
+  if (!initTurnId && prompt.length > 0 && agentCfg.cliId === 'codex-app') {
+    initAttributionTurnId = `codex-app-dispatch-${randomUUID()}`;
+  }
   ensureCliEnv(agentCfg.cliId, agentCfg.cliPathOverride);
   let nativeSessionTitle: string | undefined;
   let nativeSessionTitlePrompt: string | undefined;
@@ -4048,6 +8481,17 @@ export function forkWorker(
   // (`~/.claude.json` for claude, `.claude-runtime/.claude.json` for seed).
   const familyAdapter = createCliAdapterSync(agentCfg.cliId, agentCfg.cliPathOverride);
   if (familyAdapter.claudeStateJsonPath) ensureClaudeFolderTrust(cwd, familyAdapter.claudeStateJsonPath);
+  const resolvedBackendType = resolvePairedSpawnBackendType(
+    agentCfg.cliId,
+    ds.session.backendType,
+    botCfg.backendType,
+    config.daemon.backendType,
+  );
+  if (ds.session.cliId !== agentCfg.cliId || ds.session.backendType !== resolvedBackendType) {
+    ds.session.cliId = agentCfg.cliId;
+    ds.session.backendType = resolvedBackendType;
+    sessionStore.updateSession(ds.session);
+  }
 
   // Prepend the botmux wrapper bin dir to PATH so CLIs can call `botmux send` etc.
   // Single source of truth (resolveBotmuxWrapperBinDir): core-only → dedicated
@@ -4058,9 +8502,135 @@ export function forkWorker(
   const pathWithBotmux = prependBotmuxBin(botmuxBinDir, process.env.PATH);
 
   const forkEnv = workerForkEnv(process.env);
-  const worker = fork(workerPath, [], {
+  // Dequeue only after every earlier launch-preparation write has finished.
+  // The exact input remains journaled until the worker confirms its adapter
+  // submission boundary; daemon send/ready are intentionally too early.
+  const recoveredActivationLedgerEntry = ds.session.queuedActivationPending
+    ? [...(ds.session.codexAppDispatchLedger ?? [])]
+      .reverse()
+      .find(entry => entry.state === 'accepted' || entry.state === 'prepared')
+    : undefined;
+  const queuedActivationToken = queuedForkSnapshot
+    ? randomUUID()
+    : ds.session.queuedActivationPending
+      ? (ds.session.queuedActivationToken
+        ?? recoveredActivationLedgerEntry?.queuedActivationToken
+        ?? randomUUID())
+      : undefined;
+  if (queuedForkSnapshot) {
+    ds.session.queued = false;
+    ds.session.queuedActivationPending = true;
+    ds.session.queuedActivationToken = queuedActivationToken;
+    ds.session.queuedActivationResume = resume;
+    ds.initialStartPending = true;
+  } else if (ds.session.queuedActivationPending && queuedActivationToken) {
+    // Migrate journals written before the token/ACK protocol. The queued
+    // activation is the newest unsettled FIFO entry; stamp the same token onto
+    // both journal and entry before the recovery worker can submit it.
+    let migrated = ds.session.queuedActivationToken !== queuedActivationToken;
+    ds.session.queuedActivationToken = queuedActivationToken;
+    ds.initialStartPending = true;
+    if (recoveredActivationLedgerEntry
+      && recoveredActivationLedgerEntry.queuedActivationToken !== queuedActivationToken) {
+      recoveredActivationLedgerEntry.queuedActivationToken = queuedActivationToken;
+      migrated = true;
+    }
+    if (migrated) sessionStore.updateSession(ds.session);
+  }
+
+  // Snapshot the prior durable FIFO before accepting this fork's new prompt.
+  // A pure reattach receives the full snapshot; a refork carrying N+1 restores
+  // old N first and reserves N+1 through the normal worker write path.
+  // FIRST fence out any keyed turn already terminalized to a durable
+  // failed(dispatch_unknown): the turn-level idempotency lease (PR #818) leaves
+  // the shared session open, so without this the recovery path would replay an
+  // at-most-once turn the caller was already told failed (the ledger is the third
+  // replay channel `noReplay` does not reach). Idempotent + re-checked here.
+  //
+  // FAIL-CLOSED via THROW (codex #818 recovery-seam round-3): if the fence cannot
+  // PROVE it is safe to build the recovery snapshot — unreadable/corrupt
+  // authoritative async terminal, a terminalized accepted entry that cannot be
+  // exact-cancelled, or a retirement persist failure — it THROWS. We deliberately
+  // do NOT catch-and-`return false` here: `forkWorker`'s bool return is widely
+  // IGNORED by callers (the keyed `/api/trigger` dormant path forks and then
+  // unconditionally returns `queued`, so a swallowed false would strand the turn
+  // `running`), and a `return false` would also bypass the outer
+  // `rollbackWorkerForkPreInit` that restores the queued-activation journal
+  // mutated above. Letting it throw routes through forkWorker's existing outer
+  // catch (pre-init rollback + rethrow) and then the keyed trigger's post-barrier
+  // convergence, which durably terminalizes the turn to `failed` (observable,
+  // at-most-once) — the correct contract for every fork-failure path.
+  if (agentCfg.cliId === 'codex-app') {
+    retireTerminalizedCodexAppLedgerEntriesForRecovery(ds);
+  }
+  const codexAppRecoveredDispatches = agentCfg.cliId === 'codex-app'
+    ? (ds.session.codexAppDispatchLedger ?? []).map(entry => ({ ...entry }))
+    : [];
+  const promptCodexAppInput = initCodexAppInputGateFrozen
+    ? cloneFrozenCodexAppInput(promptPayload.codexAppInput, initAttributionTurnId)
+    : codexAppInputForSession(ds, promptPayload.codexAppInput, initAttributionTurnId);
+  if (queuedForkSnapshot) {
+    ds.session.queuedActivationInput = {
+      content: prompt,
+      ...(promptCodexAppInput ? { codexAppInput: promptCodexAppInput } : {}),
+      // R4-B1: preserve the frozen steer authorization when re-parking N+1 behind
+      // a recovery fork (COPY, never re-infer).
+      ...(initCodexAppSteerable ? { codexAppSteerable: true } : {}),
+    };
+    ds.session.queuedActivationTurnId = initAttributionTurnId;
+    ds.session.queuedActivationDispatchAttempt = initDispatchAttempt;
+  }
+  const initVcMeetingImTurnOrigin = resolveVcMeetingImTurnOrigin(
+    ds.session,
+    initTurnId ?? initReplyTurnId,
+  );
+  const codexAppDispatchId = prompt.length > 0
+    ? acceptCodexAppDispatch(
+        ds,
+        {
+          content: prompt,
+          ...(promptCodexAppInput ? { codexAppInput: promptCodexAppInput } : {}),
+          ...(queuedActivationToken ? { queuedActivationToken } : {}),
+          ...(initReplyTurnId ? { replyTurnId: initReplyTurnId } : {}),
+          ...(initReplyContext ? {
+            replyTarget: initReplyContext.target,
+            ...(initReplyContext.quoteTargetId
+              ? { quoteTargetId: initReplyContext.quoteTargetId }
+              : {}),
+            ...(initReplyContext.replyTargetSenderOpenId
+              ? { replyTargetSenderOpenId: initReplyContext.replyTargetSenderOpenId }
+              : {}),
+            ...(initReplyContext.replyTargetSenderIsBot !== undefined
+              ? { replyTargetSenderIsBot: initReplyContext.replyTargetSenderIsBot }
+              : {}),
+          } : {}),
+          // R4-B1: COPY the frozen steer authorization onto the fork's
+          // accept-ledger entry so a recovered/opening first turn is steerable
+          // exactly as the daemon admitted it (admission computed once; COPIED).
+          ...(initCodexAppSteerable ? { codexAppSteerable: true } : {}),
+        },
+        initAttributionTurnId,
+        initDispatchAttempt,
+        initVcMeetingImTurnOrigin,
+      )
+    : undefined;
+  if (codexAppDispatchId && initAttributionTurnId) {
+    acceptedForkDispatch = {
+      dispatchId: codexAppDispatchId,
+      turnId: initAttributionTurnId,
+      ...(initDispatchAttempt !== undefined
+        ? { dispatchAttempt: initDispatchAttempt }
+        : {}),
+    };
+  }
+  if (queuedForkSnapshot && !codexAppDispatchId) {
+    sessionStore.updateSession(ds.session);
+  }
+
+  worker = fork(workerPath, [], {
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    execArgv: workerForkExecArgv(),
     cwd,
     env: {
       ...forkEnv,
@@ -4077,7 +8647,8 @@ export function forkWorker(
       LARK_APP_SECRET: larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly }) ? botCfg.larkAppSecret : '',
     },
   } as WindowsForkOptions);
-  const startupState: WorkerStartupState = {
+  spawnedWorker = worker;
+  startupState = {
     ready: false, failureNotified: false,
     initTurnId: initAttributionTurnId,
     initDispatchAttempt,
@@ -4089,6 +8660,31 @@ export function forkWorker(
   worker.on('error', (err) => {
     const reason = (err as Error)?.message ?? String(err);
     logger.error(`[${t}] Worker fork error: ${reason}`);
+    if (ds.worker === worker) {
+      if (ds.session.queuedActivationPending) {
+        // The durable opening journal remains authoritative until the adapter
+        // proves submission. A failed child must release only its runtime
+        // claim so the next generation can replay that exact head.
+        ds.initialStartPending = false;
+        ds.initialStartClaimToken = undefined;
+      } else {
+        reparkQueuedActivationFollowUpTail(ds, 'worker error during activation follow-up handoff');
+      }
+      const retainExactRetirementGeneration = ds.remoteShutdownState !== undefined
+        || ds.remoteCloseState !== undefined;
+      if (!retainExactRetirementGeneration) {
+        ds.worker = null;
+        ds.workerPort = null;
+        ds.workerToken = null;
+        ds.workerViewToken = null;
+        ds.managedTurnOrigin = undefined;
+        ds.remoteCloseState = undefined;
+      }
+      // The retirement coordinator owns a prepared generation. Keep the exact
+      // ChildProcess pointer until exit so it can decide whether abort/commit
+      // was durably verified.
+      try { worker.kill(); } catch { /* best-effort failed-child fence */ }
+    }
     if (startupState.failureNotified) return;
     startupState.failureNotified = true;
     emitSessionLifecycleHook(ds, 'session.requires_attention', {
@@ -4138,13 +8734,10 @@ export function forkWorker(
   });
 
   // Send init config — use per-bot settings
-  const promptCodexAppInput = codexAppInputForSession(
-    ds,
-    promptPayload.codexAppInput,
-    initAttributionTurnId,
-  );
   const runtimeIdentity = runtimeBuildIdentity();
-  const initMsg: DaemonToWorker = {
+  const feedbackPolicy = resolveFeedbackPolicyForDelivery({ dataDir: config.session.dataDir, larkAppId: ds.larkAppId, chatId: ds.chatId, bot: botCfg });
+  ds.feedbackPolicy = feedbackPolicy;
+  initMsg = {
     type: 'init',
     sessionId: ds.session.sessionId,
     chatId: ds.chatId,
@@ -4158,6 +8751,9 @@ export function forkWorker(
     launchShell: botCfg.launchShell,
     model: agentCfg.model,
     reasoningEffort: agentCfg.reasoningEffort,
+    // dsh runner turn timeout: read live from bot config so tuning bots.json
+    // takes effect on the next worker fork without recreating the session.
+    turnTimeoutMs: botCfg.turnTimeoutMs,
     disableCliBypass: botCfg.disableCliBypass === true,
     codexRpcInput: botCfg.codexRpcInput === true || config.codexRpcInputDefault,
     // Startup commands run on every fresh spawn (incl. resume) so session-only
@@ -4203,7 +8799,18 @@ export function forkWorker(
     // Shared Herdr is not derivable from sessionId: preserve the exact host +
     // managed-agent affinity across daemon/worker replacement.
     persistentBackendTarget: ds.session.persistentBackendTarget,
-    backendConfig: botCfg.riff,
+    // One backendConfig channel shared by the remote backends; the selector
+    // picks the shape matching backendType. A mojo bot with no `mojo` block is
+    // valid (all fields optional), so an undefined here is not an error.
+    //
+    // mojo goes through sessionMojoConfig so the control-plane identity frozen at
+    // creation survives a cold resume: without it, editing the bot between two
+    // messages would silently move a live session from cloud to host execution,
+    // or resume it against a different tenant/workspace than the one holding its
+    // remote session.
+    backendConfig: botCfg.backendType === 'mojo' || agentCfg.cliId === 'mojo'
+      ? sessionMojoConfig(ds, botCfg, { freeze: true }).config
+      : botCfg.riff,
     riffParentTaskId: ds.session.riffParentTaskId,
     riffRepoDirs: ds.session.riffRepoDirs,
     deferredScheduleRun: ds.session.deferredScheduleRun,
@@ -4211,6 +8818,7 @@ export function forkWorker(
     ...(nativeSessionTitlePrompt ? { nativeSessionTitlePrompt } : {}),
     prompt,
     ...(promptCodexAppInput ? { promptCodexAppInput } : {}),
+    ...(queuedActivationToken ? { queuedActivationToken } : {}),
     resume,
     // One-shot native fork intent (see Session.pendingForkSession). Only the
     // child's FIRST spawn resumes the SOURCE transcript (cliSessionId still
@@ -4229,6 +8837,7 @@ export function forkWorker(
     // Feishu (uploader/cred-write are also skipped downstream on the same test).
     larkAppSecret: larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly }) ? botCfg.larkAppSecret : '',
     apiOnly: botCfg.apiOnly,
+    feedback: feedbackPolicy,
     // Freeze the ACTUAL loaded bots-config path (getLoadedConfigPath) so a
     // no-transport worker's fs-policy denies it from a HOST-owned fact, not a
     // guess off BOTS_CONFIG env (which the agent could see/forge). When it lives
@@ -4236,16 +8845,34 @@ export function forkWorker(
     // rather than silently masking an arbitrary parent dir (codex P1). Omitted
     // from forkAdoptWorker below — its observe branch returns before fs-policy.
     loadedBotsConfigPath: getLoadedConfigPath(),
+    // PROVENANCE of that path: 'loaded' = the daemon actually parsed this exact
+    // file (a real registry authority, safe to pin onto CLI children);
+    // 'synthetic' = core-only placeholder that was never parsed. The worker must
+    // not guess this from the filesystem — existence and provenance are
+    // independent facts (see core/config-dir.ts BotsConfigProvenance).
+    loadedBotsConfigProvenance: getLoadedConfigProvenance(),
     brand: normalizeBrand(botCfg.brand),
     botName: bot.botName,
     botOpenId: bot.botOpenId,
     locale: botLocale(botCfg),
     turnId: initAttributionTurnId,
+    ...(initReplyTurnId ? { replyTurnId: initReplyTurnId } : {}),
     dispatchAttempt: initDispatchAttempt,
-    vcMeetingImTurnOrigin: resolveVcMeetingImTurnOrigin(
-      ds.session,
-      initAttributionTurnId,
-    ),
+    ...(codexAppDispatchId ? { codexAppDispatchId } : {}),
+    // R4-B1: COPY the frozen steer authorization onto the first-turn init so the
+    // worker can fold follow-ups into this opening turn (canSteer requires the
+    // group root to be steerable). System/recovery openings carry no flag.
+    ...(initCodexAppSteerable ? { codexAppSteerable: true as const } : {}),
+    ...(codexAppRecoveredDispatches.length > 0
+      ? { codexAppRecoveredDispatches }
+      : {}),
+    ...((ds.session.codexAppGenerationCommits?.length ?? 0) > 0
+      ? { codexAppGenerationCommits: ds.session.codexAppGenerationCommits }
+      : {}),
+    // At-most-once (idempotency lease): ride the flag on the init message so the
+    // worker tags the keyed init prompt no-replay (codex #776 round-7 #1).
+    ...(initAtMostOnce ? { atMostOnce: true } : {}),
+    vcMeetingImTurnOrigin: initVcMeetingImTurnOrigin,
     pluginBindings: botCfg.plugins,
     skillPolicy: botCfg.skills,
     ...(runtimeIdentity.status === 'known'
@@ -4264,8 +8891,15 @@ export function forkWorker(
       sessionStore.updateSession(ds.session);
     }
   }
-  worker.send(initMsg);
   ds.initConfig = initMsg;
+  // New generation ledger. NOT a plain reset: the previous generation's keys are
+  // parked until its worker is observed to exit, because the double-fork guard
+  // kills asynchronously and spawns the replacement synchronously.
+  startNewGenerationEnvLedger(ds, initMsg.env);
+  // Cold-resume path: a workerless session goes straight here without passing
+  // through sendWorkerInput, so without this the "notice on the next message"
+  // promise was never kept for exactly the sessions most likely to need it.
+  deliverPendingMojoQuarantineNotice(ds, initAttributionTurnId, initDispatchAttempt);
 
   // Stamp cliId on the persisted session so the dashboard can show a CLI badge
   // even after the session is closed. Do this before installing worker handlers:
@@ -4292,35 +8926,102 @@ export function forkWorker(
   setupWorkerHandlers(ds, worker, startupState, workerGeneration);
 
   ds.worker = worker;
+  if (shouldTrackOrdinaryImDelivery(ds, initMsg)) {
+    sendOrdinaryImDeliveryTracked(ds, initMsg);
+  } else {
+    worker.send(initMsg);
+  }
   ds.spawnedAt = Date.now();
+  // master: per-runtime-key CLI version (the init send already happened above via
+  // the tracked-delivery if/else — do NOT re-send initMsg here).
   ds.cliVersion = getCurrentCliVersion(runtimeInstallationKey({
     cliId: agentCfg.cliId,
     cliRuntime: agentCfg.cliRuntime,
     cliPathOverride: agentCfg.cliPathOverride,
   }));
-  sessionStore.updateSessionPid(ds.session.sessionId, worker.pid ?? null);
+  // #597: init has been dispatched. A later child 'error' event is ambiguous
+  // (init may already be executing), so only synchronous failures before this
+  // point are safe to compensate; clear the pre-init compensation handle.
+  spawnedWorker = undefined;
+  } catch (err) {
+    if (ds.worker === spawnedWorker) {
+      ds.worker = null;
+      ds.workerPort = null;
+      ds.workerToken = null;
+      ds.workerViewToken = null;
+    }
+    if (spawnedWorker) {
+      try { spawnedWorker.kill(); } catch { /* best-effort pre-init child fence */ }
+    }
+    try {
+      rollbackWorkerForkPreInit(ds, queuedForkSnapshot, acceptedForkDispatch);
+    } catch (rollbackErr) {
+      logger.error(
+        `[${tag(ds)}] Worker pre-init failure could not durably restore queued/FIFO state: `
+        + `${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`,
+      );
+      throw new AggregateError(
+        [err, rollbackErr],
+        `Worker pre-init failed and durable rollback failed for ${ds.session.sessionId}`,
+      );
+    }
+    throw err;
+  }
+  ds.initConfig = initMsg;
+  // New generation ledger. NOT a plain reset: the previous generation's keys are
+  // parked until its worker is observed to exit, because the double-fork guard
+  // kills asynchronously and spawns the replacement synchronously.
+  startNewGenerationEnvLedger(ds, initMsg.env);
+  try {
+    sessionStore.updateSessionPid(ds.session.sessionId, worker.pid ?? null);
+  } catch (err) {
+    // Init may already be executing. PID bookkeeping failure must not turn an
+    // accepted activation into a retryable error or orphan the attached child.
+    logger.error(`[${t}] Failed to persist attached worker pid: ${err instanceof Error ? err.message : String(err)}`);
+  }
   logger.info(`[${t}] Worker forked (pid: ${worker.pid}, active: ${cb.getActiveCount()})`);
 
   // Reset the exit-emit flag for the freshly spawned worker so a subsequent
   // exit publishes again (the previous lifecycle's flag would otherwise mask it).
   ds.exitEventEmitted = false;
   // Notify dashboard SSE subscribers a new session is live.
-  dashboardEventBus.publish({
-    type: 'session.spawned',
-    body: { session: composeRowFromActive(ds) },
-  });
-  cb.enforceLiveSessionCap?.();
-  emitSessionLifecycleHook(ds, 'session.start', {
-    reason: resume ? 'resume' : 'worker_spawn',
-    pid: worker.pid ?? null,
-  });
+  try {
+    dashboardEventBus.publish({
+      type: 'session.spawned',
+      body: { session: composeRowFromActive(ds) },
+    });
+  } catch (err) {
+    logger.error(`[${t}] Failed to publish attached worker state: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  try {
+    cb.enforceLiveSessionCap?.();
+  } catch (err) {
+    logger.error(`[${t}] Failed to enforce live-session cap after attach: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  try {
+    emitSessionLifecycleHook(ds, 'session.start', {
+      reason: resume ? 'resume' : 'worker_spawn',
+      pid: worker.pid ?? null,
+    });
+  } catch (err) {
+    logger.error(`[${t}] Failed to emit attached worker lifecycle hook: ${err instanceof Error ? err.message : String(err)}`);
+  }
   // Usage ledger: fresh spawns anchor the baseline so pre-existing transcript
   // history is never billed. Restores reconcile instead — an in-flight turn
   // may have completed inside tmux while the daemon was down, and that work
   // was submitted by botmux (anchoring would swallow it).
-  if (resume) reconcileUsageForDaemonSession(ds);
-  else anchorUsageForDaemonSession(ds);
-  recordOwnershipForDaemonSession(ds);
+  try {
+    if (resume) reconcileUsageForDaemonSession(ds);
+    else anchorUsageForDaemonSession(ds);
+  } catch (err) {
+    logger.error(`[${t}] Failed to initialize attached worker usage state: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  try {
+    recordOwnershipForDaemonSession(ds);
+  } catch (err) {
+    logger.error(`[${t}] Failed to record attached worker ownership: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  return true;
 }
 
 // ─── Shared worker IPC handler ──────────────────────────────────────────────
@@ -4437,6 +9138,13 @@ function setupWorkerHandlers(
   // Codex badge before a role switch starts a non-Codex worker.
   ds.codexServiceTier = undefined;
   ds.pendingCodexTierCardRefresh = undefined;
+  // Active runtime is likewise authority of this exact worker generation. The
+  // new worker republishes it via active_runtime after re-reading the rollout;
+  // clear it here so the window between respawn and that first observation
+  // cannot leave a stale model/effort tail on the card.
+  ds.activeModel = undefined;
+  ds.activeReasoningEffort = undefined;
+  ds.pendingActiveRuntimeCardRefresh = undefined;
   const handlerSession = ds.session;
   const handlerAnchor = sessionAnchorId(ds);
   const handlerLarkAppId = ds.larkAppId;
@@ -4500,19 +9208,14 @@ function setupWorkerHandlers(
   };
   /** Auxiliary worker UI is never an authorized output channel for a dedicated
    * VC receiver. Dashboard/audit state is still updated before these guards. */
-  const managedAuxUiSuppressed = (turnId?: string, dispatchAttempt?: number): boolean => {
-    // No-transport session (apiOnly bot or HTTP virtual chat): there is no real
-    // Feishu chat to render a card/reaction into. Suppress ALL auxiliary UI at
-    // the single source every aux-UI handler funnels through — this is the
-    // authoritative fix, NOT a fake "success" message id from sessionReply (a
-    // synthetic id would get stored as streamCardId and later scheduleCardPatch
-    // → updateMessage would still dial Feishu). Dashboard/web-terminal state is
-    // still updated before these guards, so the terminal view is unaffected.
-    if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) return true;
-    if (isSilentScheduledTurn(ds, turnId)) return true;
-    if (ds.session.vcMeetingReceiver) return true;
-    return ordinaryManagedSuppression(turnId, dispatchAttempt);
-  };
+  // Delegates to the shared policy (auxUiSuppressedFor) so this and the mojo
+  // quarantine notice cannot drift apart. Suppressing here is the authoritative
+  // fix, NOT a fake "success" message id from sessionReply (a synthetic id would
+  // get stored as streamCardId and later scheduleCardPatch → updateMessage would
+  // still dial Feishu). Dashboard/web-terminal state is updated before these
+  // guards, so the terminal view is unaffected.
+  const managedAuxUiSuppressed = (turnId?: string, dispatchAttempt?: number): boolean =>
+    auxUiSuppressedFor(ds, turnId, dispatchAttempt);
   /** final_output is the sole exception: listener_thread and exact IM replies
    * may proceed into the durable action ledger; silent/stale attempts do not. */
   const managedFinalOutputSuppressed = (
@@ -4594,6 +9297,30 @@ function setupWorkerHandlers(
         sessionStore.updateSession(ds.session);
         break;
       }
+      case 'turn_input_received': {
+        if (
+          ds.worker !== worker
+          || ds.workerGeneration !== workerGeneration
+          || ds.session.workerGeneration !== workerGeneration
+        ) {
+          logger.warn(`[${t}] Ignored turn_input_received from stale worker generation`);
+          break;
+        }
+        acknowledgeOrdinaryImDeliveryReceipt(ds, msg.turnId, workerGeneration);
+        break;
+      }
+      case 'turn_input_rejected': {
+        if (
+          ds.worker !== worker
+          || ds.workerGeneration !== workerGeneration
+          || ds.session.workerGeneration !== workerGeneration
+        ) {
+          logger.warn(`[${t}] Ignored turn_input_rejected from stale worker generation`);
+          break;
+        }
+        rejectOrdinaryImDelivery(ds, msg.turnId, workerGeneration, msg.reason);
+        break;
+      }
       case 'turn_input_committed': {
         // Bind the receipt to the exact live worker generation. A late ACK
         // from a replaced worker cannot make the replacement appear to have
@@ -4606,6 +9333,9 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored turn_input_committed from stale worker generation`);
           break;
         }
+        // Compatibility/fallback: a commit also proves receipt if the earlier
+        // receipt ACK was delayed or dropped on the reverse IPC channel.
+        completeOrdinaryImDelivery(ds, msg.turnId, workerGeneration);
         if (recordDispatchInputCommit(ds.session, msg.turnId, workerGeneration)) {
           sessionStore.updateSession(ds.session);
           if (msg.turnId.startsWith('mlrp_turn_')) {
@@ -4640,6 +9370,69 @@ function setupWorkerHandlers(
         };
         break;
       }
+      case 'queued_activation_submitted': {
+        if (ds.worker !== worker || msg.sessionId !== ds.session.sessionId) break;
+        if (!ds.session.queuedActivationPending
+          || !ds.session.queuedActivationToken
+          || ds.session.queuedActivationToken !== msg.activationToken) {
+          logger.warn(`[${t}] Ignored stale queued activation ACK ${msg.activationToken.substring(0, 8)}`);
+          break;
+        }
+        const releaseReservation = async (attempt: number): Promise<void> => {
+          if (ds.worker !== worker || !ds.initialStartPending) return;
+          try {
+            if (cb.onQueuedActivationSubmitted) {
+              const released = await cb.onQueuedActivationSubmitted(ds, msg.activationToken);
+              if (released === false && ds.worker === worker && ds.initialStartPending) {
+                const delayMs = Math.min(100 * (2 ** Math.min(attempt, 6)), 5_000);
+                logger.warn(
+                  `[${t}] Queued activation follow-up was not accepted (attempt ${attempt + 1}); `
+                  + `retrying in ${delayMs}ms`,
+                );
+                const timer = setTimeout(() => { void releaseReservation(attempt + 1); }, delayMs);
+                timer.unref?.();
+              }
+            } else {
+              ds.initialStartPending = false;
+              ds.initialStartClaimToken = undefined;
+            }
+          } catch (err) {
+            logger.error(
+              `[${t}] Queued activation follow-up release failed unexpectedly; `
+              + `delivery was not retried because acceptance is unknown: `
+              + `${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        };
+
+        const journal = snapshotQueuedActivationJournal(ds.session);
+        const persistActivationAck = async (attempt: number): Promise<void> => {
+          if (ds.worker !== worker
+            || !ds.session.queuedActivationPending
+            || ds.session.queuedActivationToken !== msg.activationToken) return;
+          clearQueuedActivationJournal(ds.session);
+          try {
+            sessionStore.updateSession(ds.session);
+          } catch (err) {
+            restoreQueuedActivationJournal(ds.session, journal);
+            const delayMs = Math.min(100 * (2 ** Math.min(attempt, 6)), 5_000);
+            logger.error(
+              `[${t}] Failed to persist queued activation ACK; retained journal and `
+              + `will retry in ${delayMs}ms: ${err instanceof Error ? err.message : String(err)}`,
+            );
+            const timer = setTimeout(() => { void persistActivationAck(attempt + 1); }, delayMs);
+            timer.unref?.();
+            return;
+          }
+          // Crossing the adapter boundary means this session now owns CLI
+          // history even if the worker dies before it can publish a session id.
+          ds.hasHistory = true;
+          await releaseReservation(0);
+        };
+        await persistActivationAck(0);
+        break;
+      }
+
       case 'ready': {
         if (!ownsLifecycleMutation()) {
           logger.warn(`[${t}] Ignored ready from stale/transferring worker generation`);
@@ -4825,6 +9618,7 @@ function setupWorkerHandlers(
         // in-flight. In that case CARD_POSTING_SENTINEL is already set — don't
         // POST a second card; the in-flight POST becomes this turn's card.
         if (ds.streamCardId === CARD_POSTING_SENTINEL) break;
+        const postingGeneration = ds.streamCardTurnGeneration ?? 0;
         ds.streamCardId = CARD_POSTING_SENTINEL;
         try {
           ds.streamCardNonce = randomBytes(4).toString('hex');
@@ -4872,7 +9666,11 @@ function setupWorkerHandlers(
           // this "starting" card is orphaned (never entered frozenCards, so
           // recallFrozenCards can't withdraw it). Mirrors the screen_update POST
           // branch which clears the flag after posting.
-          ds.streamCardPending = false;
+          const superseded = (ds.streamCardTurnGeneration ?? 0) !== postingGeneration;
+          if (!superseded) {
+            ds.streamCardPending = false;
+            ds.streamCardPendingTurnId = undefined;
+          }
           ds.parkedStreamCardNonce = undefined;
           persistStreamCardState(ds);
           // Re-sync worker's display mode (it starts fresh in 'hidden')
@@ -4883,17 +9681,19 @@ function setupWorkerHandlers(
           recallFrozenCards(ds);
           flushPendingLocalCliOpenReadinessPatch(ds);
           flushPendingRiffUrlPatch(ds);
+          flushPendingActiveRuntimePatch(ds);
           flushPendingCodexServiceTierPatch(ds);
           // Fresh ready POST: if this turn is already `working` (e.g. relay
           // resume where the CLI kept running), arm here — same authorized arm
           // point as the reuse branch, now that streamCardId is the real id.
           syncUsageRefreshTimer(ds);
+          if (superseded && ds.streamCardPendingTurnId) {
+            void postTurnStartingCard(ds, cb.sessionReply, ds.streamCardPendingTurnId);
+          }
         } catch (err) {
           if (!ownsLifecycleMutation()) break;
           if (err instanceof MessageWithdrawnError) {
-            logger.warn(`[${t}] Root message withdrawn, closing stale session`);
-            killWorker(ds);
-            cb.closeSession(ds);
+            await closeWithdrawnSessionIfLedgerEmpty(ds, 'Root message withdrawn while creating worker-ready card');
             break;
           }
           logger.warn(`[${t}] Failed to send streaming card, falling back to static card: ${err}`);
@@ -4945,9 +9745,7 @@ function setupWorkerHandlers(
           } catch (fallbackErr) {
             if (!ownsLifecycleMutation()) break;
             if (fallbackErr instanceof MessageWithdrawnError) {
-              logger.warn(`[${t}] Root message withdrawn, closing stale session`);
-              killWorker(ds);
-              cb.closeSession(ds);
+              await closeWithdrawnSessionIfLedgerEmpty(ds, 'Root message withdrawn while creating fallback worker-ready card');
               break;
             }
             throw fallbackErr;
@@ -4989,10 +9787,19 @@ function setupWorkerHandlers(
           sendWorkerSessionInput(ds, {
             type: 'raw_input',
             content: rawInput,
-            ...(rawTurnId ? { turnId: rawTurnId } : {}),
+            // Passthrough commands (/compact, /model, ...) become REAL mojo turns,
+            // so they must carry the same credential snapshot a normal message
+            // does — otherwise a cleared or rotated JWT simply did not apply here.
+            ...(mojoLivePatchForSession(ds) ?? {}),
+            ...((ds.session.queuedActivationTurnId ?? rawTurnId)
+              ? { turnId: ds.session.queuedActivationTurnId ?? rawTurnId }
+              : {}),
             followUpContent: followUp?.cliInput,
             ...(followUp?.turnId ? { followUpTurnId: followUp.turnId } : {}),
             ...(followUpCodexAppInput ? { followUpCodexAppInput } : {}),
+            ...(ds.session.queuedActivationToken
+              ? { queuedActivationToken: ds.session.queuedActivationToken }
+              : {}),
           });
           logger.info(`[${t}] Sent pending raw input after prompt_ready: ${rawInput.substring(0, 80)}${followUp ? ` (+follow-up ${followUp.cliInput.length} chars)` : ''}`);
           if (followUp) rememberLastCliInput(ds, followUp.userPrompt, {
@@ -5071,6 +9878,29 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'active_runtime': {
+        if (
+          ds.worker !== worker
+          || ds.workerGeneration !== workerGeneration
+          || ds.session.workerGeneration !== workerGeneration
+        ) {
+          logger.warn(`[${t}] Ignored active_runtime from stale worker generation`);
+          break;
+        }
+        const model = msg.model?.trim() || undefined;
+        const reasoningEffort = msg.reasoningEffort?.trim() || undefined;
+        if (
+          ds.activeModel === model
+          && ds.activeReasoningEffort === reasoningEffort
+        ) {
+          break;
+        }
+        ds.activeModel = model;
+        ds.activeReasoningEffort = reasoningEffort;
+        scheduleActiveRuntimePatch(ds);
+        break;
+      }
+
       case 'codex_service_tier': {
         if (
           ds.worker !== worker
@@ -5083,6 +9913,13 @@ function setupWorkerHandlers(
         ds.codexServiceTier = effectiveCliId === 'codex'
           ? (msg.snapshot ?? undefined)
           : undefined;
+        // Model/effort now flow through the active_runtime channel (Codex
+        // publishes them from every turn_context, same as TRAE), so this
+        // handler is scoped to the ⚡ service-tier badge only and must NOT
+        // also write activeModel/activeReasoningEffort — doing so would race
+        // the active_runtime writer and, since thread_settings_applied is not
+        // emitted in many sessions, could clobber the good value with a stale
+        // one.
         scheduleCodexServiceTierPatch(ds);
         break;
       }
@@ -5097,6 +9934,11 @@ function setupWorkerHandlers(
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenContent = msg.content;
         ds.lastScreenStatus = (msg.usageLimit ?? ds.usageLimit) ? 'limited' : msg.status;
+        // A suspend that arrived mid-turn parked itself here. Defer until this
+        // screen_update has finished using process state — suspendWorker nulls
+        // `worker` + `lastScreenStatus`, which everything below still reads
+        // (usage ledger, turn reactions, transition hook, final card).
+        queueMicrotask(() => runPendingSuspendIfSettled(ds, ownsWorkerSession));
 
         // State-boundary clear: the moment we leave `working` (→ idle/limited),
         // stop the periodic usage refresh immediately — BEFORE the aux-UI /
@@ -5112,7 +9954,10 @@ function setupWorkerHandlers(
         // upstream debouncer — by the time we get here, status flips are
         // already coarse-grained.
         if (prevStatus !== ds.lastScreenStatus) {
-          const dashboardRow = composeRowFromActive(ds);
+          // fresh:true —— 这是「状态边沿触发的 refresh 读」，transcript 此刻刚追加完
+          // 本轮输出。绕过 resolver 对懒创建 rollout 的 30s miss 负缓存，否则首轮
+          // (spawn 时 rollout 还没落盘)徽标要等 30s 后某次边沿才出现。
+          const dashboardRow = composeRowFromActive(ds, { fresh: true });
           dashboardEventBus.publish({
             type: 'session.update',
             body: {
@@ -5128,6 +9973,9 @@ function setupWorkerHandlers(
                 previewUserAt: dashboardRow.previewUserAt,
                 previewBotAt: dashboardRow.previewBotAt,
                 previewBotState: dashboardRow.previewBotState,
+                // 任务态随运行态边沿一起推：working→idle 时 todo 往往刚变化，
+                // 不带上会让看板「待办」列停在旧值。?? null 让清空也能同步（patch 合并）。
+                openTodos: dashboardRow.openTodos ?? null,
               },
             },
           });
@@ -5190,6 +10038,7 @@ function setupWorkerHandlers(
           // New turn — create a fresh card, old card freezes at its last state.
           // Generate new nonce so old card buttons are distinguishable.
           const isNewTurn = !!ds.streamCardPending;
+          const postingGeneration = ds.streamCardTurnGeneration ?? 0;
           ds.streamCardNonce = randomBytes(4).toString('hex');
           // New turn → image_key from previous turn no longer valid
           if (isNewTurn) ds.currentImageKey = undefined;
@@ -5225,6 +10074,8 @@ function setupWorkerHandlers(
                 return;
               }
               ds.streamCardId = msgId;
+              const superseded = (ds.streamCardTurnGeneration ?? 0) !== postingGeneration;
+              if (!superseded) ds.streamCardPendingTurnId = undefined;
               ds.parkedStreamCardNonce = undefined;
               persistStreamCardState(ds);
               // New card live — recall any cards parked by previous turns
@@ -5235,26 +10086,32 @@ function setupWorkerHandlers(
               recallFrozenCards(ds);
               flushPendingLocalCliOpenReadinessPatch(ds);
               flushPendingRiffUrlPatch(ds);
+              flushPendingActiveRuntimePatch(ds);
               flushPendingCodexServiceTierPatch(ds);
               // New-turn POST is the FIRST working screen_update of the turn —
               // the else (same-turn PATCH) branch never runs for it, so arm the
               // periodic usage refresh here (once the real card id exists, not
               // the POSTING sentinel). syncUsageRefreshTimer re-checks state.
               syncUsageRefreshTimer(ds);
+              if (superseded && ds.streamCardPendingTurnId) {
+                void postTurnStartingCard(ds, cb.sessionReply, ds.streamCardPendingTurnId);
+              }
             })
-            .catch(err => {
+            .catch(async err => {
               if (!ownsLifecycleMutation()) return;
               if (err instanceof MessageWithdrawnError) {
-                logger.warn(`[${t}] Root message withdrawn, closing stale session`);
-                killWorker(ds);
-                cb.closeSession(ds);
+                await closeWithdrawnSessionIfLedgerEmpty(ds, 'Root message withdrawn while creating streaming card');
                 return;
               }
               logger.debug(`[${t}] Failed to create streaming card: ${err}`);
               ds.streamCardId = undefined;
               clearPendingLocalCliOpenReadinessPatch(ds);
+              ds.pendingActiveRuntimeCardRefresh = undefined;
               ds.pendingCodexTierCardRefresh = undefined;
               persistStreamCardState(ds);
+              if ((ds.streamCardTurnGeneration ?? 0) !== postingGeneration && ds.streamCardPendingTurnId) {
+                void postTurnStartingCard(ds, cb.sessionReply, ds.streamCardPendingTurnId);
+              }
             });
         } else {
           // Same turn — PATCH only on status change. Image PATCHes go through
@@ -5303,6 +10160,14 @@ function setupWorkerHandlers(
         const prevStatus = ds.lastScreenStatus;
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenStatus = (msg.usageLimit ?? ds.usageLimit) ? 'limited' : msg.status;
+        // Same deferred-suspend checkpoint as the screen_update branch, and
+        // deferred for the same reason (see runPendingSuspendIfSettled).
+        // The predicate is defense-in-depth here: the handler's fence already
+        // dropped every message from a replaced worker before the switch, so a
+        // stale `idle` cannot reach this case at all. Passing it keeps the
+        // deferred callback from acting on a generation that stopped owning the
+        // session between enqueue and drain.
+        queueMicrotask(() => runPendingSuspendIfSettled(ds, ownsWorkerSession));
         emitSessionStateTransitionHook(ds, prevStatus, ds.lastScreenStatus, {
           source: 'screenshot_uploaded',
           imageKey: msg.imageKey,
@@ -5729,6 +10594,33 @@ function setupWorkerHandlers(
           break;
         }
 
+        // EVERY remote backend is a lineage-owning backend, not a local CLI
+        // process. Stop before crash-loop accounting: for riff the restart IPC
+        // is a guaranteed no-op, and for mojo it is WORSE than a no-op — the
+        // worker executes it, cancelling the remote session and cold-booting a
+        // context-less replacement, so treating a mojo backend exit as a local
+        // CLI crash silently destroyed remote context (fourth-round review).
+        if (isRemoteBackendSession(ds)) {
+          const retirementPhase = remoteRetirementAdmissionPhase(ds);
+          logger.warn(
+            `[${t}] Remote backend exited; automatic restart is unsupported`
+            + (retirementPhase ? ` (${retirementPhase})` : ''),
+          );
+          // Explicit /close and daemon shutdown already own the user-visible
+          // lifecycle. Only an unexpected backend exit needs recovery guidance.
+          if (!retirementPhase && !suppressExitUi) {
+            try {
+              await scopedReply(tr('cmd.restart.remote_unsupported', undefined, loc), 'text', undefined);
+            } catch (replyErr) {
+              if (replyErr instanceof MessageWithdrawnError) {
+                logger.warn(`[${t}] Root message withdrawn, closing stale session`);
+                cb.closeSession(ds);
+              }
+            }
+          }
+          break;
+        }
+
         // Rate-limit auto-restart to prevent crash loops
         const key = ds.session.sessionId;
         const rc = restartCounts.get(key) ?? { count: 0, lastAt: 0 };
@@ -5800,8 +10692,7 @@ function setupWorkerHandlers(
               await scopedReply(parts.join('\n\n'), 'text', undefined);
             } catch (replyErr) {
               if (replyErr instanceof MessageWithdrawnError && ownsLifecycleMutation()) {
-                logger.warn(`[${t}] Root message withdrawn, closing stale session`);
-                cb.closeSession(ds);
+                await closeWithdrawnSessionIfLedgerEmpty(ds, 'Root message withdrawn while sending crash diagnostic');
               }
             }
           }
@@ -5814,7 +10705,7 @@ function setupWorkerHandlers(
         if (ds.worker && !ds.worker.killed) {
           logger.info(`[${t}] Auto-restarting ${sessionCliDisplayName(ds, botCfg)}...`);
           ds.workerReady = false;
-          ds.worker.send({ type: 'restart', env: latestPerBotEnvForRestart(ds) } as DaemonToWorker);
+          ds.worker.send({ type: 'restart', reason: 'cli_crash', env: latestPerBotEnvForRestart(ds) } as DaemonToWorker);
         }
         break;
       }
@@ -5852,8 +10743,16 @@ function setupWorkerHandlers(
         if (msg.taskId === null) {
           // follow-up 血缘断裂：清掉持久化锚点，否则 daemon 重启会复活已判坏的 parent。
           if (ds.session.riffParentTaskId) {
+            const priorTaskId = ds.session.riffParentTaskId;
             ds.session.riffParentTaskId = undefined;
-            sessionStore.updateSession(ds.session);
+            try {
+              sessionStore.updateSession(ds.session);
+            } catch (err) {
+              ds.session.riffParentTaskId = priorTaskId;
+              logger.error(
+                `[${t}] Failed to clear Riff lineage: ${err instanceof Error ? err.message : String(err)}`,
+              );
+            }
           }
           break;
         }
@@ -5863,7 +10762,43 @@ function setupWorkerHandlers(
         // next message continues the riff conversation in the warm sandbox
         // instead of cold-booting a context-less fresh task (4-5 min).
         ds.session.riffParentTaskId = msg.taskId;
-        sessionStore.updateSession(ds.session);
+        try {
+          sessionStore.updateSession(ds.session);
+        } catch (err) {
+          // Retain the newest runtime lineage. A close_result or later task-id
+          // event retries persistence; reverting here would make a follow-up
+          // target the stale parent while the worker owns the new child.
+          logger.error(
+            `[${t}] Failed to persist Riff lineage ${msg.taskId}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        break;
+      }
+
+      case 'close_result': {
+        const pending = pendingRemoteWorkerCloses.get(msg.requestId);
+        if (!pending
+          || pending.worker !== worker
+          || pending.sessionId !== ds.session.sessionId
+          || ds.worker !== worker) {
+          logger.warn(`[${t}] Ignored stale/unmatched remote close result ${msg.requestId}`);
+          break;
+        }
+        pendingRemoteWorkerCloses.delete(msg.requestId);
+        pending.resolve({
+          ok: msg.ok,
+          ...(msg.taskId ? { taskId: msg.taskId } : {}),
+          ...(msg.error ? { error: msg.error } : {}),
+          ...(msg.recovery ? { recovery: msg.recovery } : {}),
+          // Forwarded, never re-derived: the backend may keep writes fenced on a
+          // close that is otherwise retryable, and only it knows that.
+          ...(msg.admission ? { admission: msg.admission } : {}),
+          // Same reason, and this one was the leak: an ok:true close carrying a
+          // local residual arrived here, lost the field, and was published as an
+          // ordinary closed row while the backend still held the containment
+          // handle for a subtree it could not prove gone.
+          ...(msg.residual ? { residual: msg.residual } : {}),
+        });
         break;
       }
 
@@ -5996,6 +10931,45 @@ function setupWorkerHandlers(
           // never let a projection/store failure crash the worker IPC loop.
           logger.error(`[${t}] Failed to persist turn_terminal for ${msg.turnId.substring(0, 8)}: ${err.message}`);
         }
+        // Async-HTTP settle-on-terminal (core-only completion bug #70): a turn
+        // the worker's bridge gate suppressed as GENUINE SILENCE (the model
+        // terminated with a bare nothing-to-send sentinel, no `botmux send`)
+        // emits turn_terminal but NO final_output, so the async-trigger result
+        // would stay `pending` and the poller would hang `running` until timeout.
+        // Settle it here with EMPTY content — nothing-to-send is a legitimate
+        // completed-with-empty-output for an HTTP task.
+        //
+        // POSITIVE EVIDENCE ONLY: we settle solely on the worker's explicit
+        // `outputDisposition === 'nothing_to_send'` flag, never on a bare
+        // `completed`. A bare completed terminal is NOT proof of silence — the
+        // RPC-hydration timeout path (worker.ts hydrateCompletedRpcTurn) emits
+        // `completed` with no final_output after fs-lag while the real answer is
+        // still materializing; settling that empty would mask a lost reply.
+        // Guarded further so it never double-settles a final_output-completed
+        // turn (pending-only), never touches a managed VC-meeting receiver, and
+        // only affects this bot's own pending async result. Feishu turns have no
+        // asyncTriggerResults entry, so their silent-turn behavior is unchanged.
+        if (msg.status === 'completed'
+          && msg.outputDisposition === 'nothing_to_send'
+          && !ds.session.vcMeetingReceiver) {
+          const pendingAsync = ds.asyncTriggerResults?.get(msg.turnId);
+          if (pendingAsync && pendingAsync.status === 'pending') {
+            const completedAt = Date.now();
+            pendingAsync.status = 'completed';
+            pendingAsync.content = '';
+            pendingAsync.completedAt = completedAt;
+            try {
+              asyncTriggerStore.recordCompleted(ds.session.sessionId, msg.turnId, '', completedAt, ds.larkAppId);
+            } catch (err: any) {
+              logger.error(`[${t}] Failed to persist async terminal-settle for ${msg.turnId.substring(0, 8)}: ${err.message}`);
+            }
+            // Cleared like the final_output path so worker-exit convergence does
+            // not retro-fail this now-completed turn. Per-triggerId delete so a
+            // concurrent sibling keyed turn's convergence entry is untouched.
+            ds.idempotentAsyncTurns?.delete(msg.turnId);
+            logger.info(`[${t}] Settled async HTTP turn ${msg.turnId.substring(0, 8)} completed (empty output; nothing-to-send)`);
+          }
+        }
         if (msg.turnId.startsWith('mlrp_turn_') && msg.status !== 'completed') {
           markMessageListenerRunPreviewFailed(msg.turnId, {
             sessionId: msg.sessionId,
@@ -6047,8 +11021,48 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Dropped managed_turn_origin with mismatched sessionId`);
           break;
         }
+        // Isolated children use one stable per-session pathname visible through
+        // an exact Seatbelt/bwrap read carve-out.
+        // Only the daemon handler for the CURRENT ChildProcess generation may
+        // replace it. Stale workers can still emit IPC, but the identity guard
+        // above drops them before filesystem mutation, so they cannot overwrite
+        // a successor capability (or unlink it during teardown).
+        if (msg.originChannelId) {
+          if (!/^[a-f0-9]{64}$/.test(msg.originChannelId)) {
+            ds.managedTurnOrigin = undefined;
+            logger.error(`[${t}] Refused managed origin publication with an invalid pane channel`);
+            break;
+          }
+          try {
+            const ipcPort = Number(process.env.BOTMUX_DAEMON_IPC_PORT);
+            replaceManagedOriginCapabilityFile(
+              managedOriginCapabilityPath(
+                config.session.dataDir,
+                msg.sessionId,
+                msg.originChannelId,
+              ),
+              JSON.stringify({
+                sessionId: msg.sessionId,
+                channelId: msg.originChannelId,
+                capability: msg.capability,
+                ...(Number.isSafeInteger(ipcPort) && ipcPort > 0 && ipcPort <= 65_535
+                  ? { ipcPort }
+                  : {}),
+                ...(msg.turnId ? { turnId: msg.turnId } : {}),
+                ...(msg.dispatchAttempt !== undefined
+                  ? { dispatchAttempt: msg.dispatchAttempt }
+                  : {}),
+              }),
+            );
+          } catch (err) {
+            ds.managedTurnOrigin = undefined;
+            logger.error(`[${t}] Failed to publish daemon-owned managed origin capability: ${err instanceof Error ? err.message : String(err)}`);
+            break;
+          }
+        }
         ds.managedTurnOrigin = {
           capability: msg.capability,
+          ...(msg.originChannelId ? { originChannelId: msg.originChannelId } : {}),
           ...(msg.turnId ? { turnId: msg.turnId } : {}),
           ...(msg.dispatchAttempt !== undefined
             ? { dispatchAttempt: msg.dispatchAttempt }
@@ -6074,6 +11088,12 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored stale managed turn origin revoke after capability rotation`);
           break;
         }
+        if (msg.originChannelId
+          && ds.managedTurnOrigin?.originChannelId
+          && ds.managedTurnOrigin.originChannelId !== msg.originChannelId) {
+          logger.warn(`[${t}] Ignored managed_turn_origin_revoked for a different pane channel`);
+          break;
+        }
         if (!msg.capability && ds.managedTurnOrigin
           && (ds.managedTurnOrigin.turnId !== msg.turnId
             || ds.managedTurnOrigin.dispatchAttempt !== msg.dispatchAttempt)) {
@@ -6084,12 +11104,270 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'codex_app_dispatch_transition': {
+        const acknowledge = (ok: boolean, error?: string): void => {
+          try {
+            worker.send({
+              type: 'codex_app_dispatch_persisted',
+              requestId: msg.requestId,
+              ok,
+              ...(error ? { error } : {}),
+            } as DaemonToWorker);
+          } catch { /* worker exit makes the prepared/final state replayable */ }
+        };
+        if (ds.worker !== worker) {
+          acknowledge(false, 'stale_worker_generation');
+          break;
+        }
+        if (msg.sessionId !== ds.session.sessionId) {
+          acknowledge(false, 'session_mismatch');
+          break;
+        }
+        const ledger = ds.session.codexAppDispatchLedger ?? [];
+        let next: { ok: true; ledger: CodexAppDispatchLedgerEntry[] } | { ok: false; error: string };
+        if (msg.operation === 'submit') {
+          if (msg.entries.length !== 1) {
+            acknowledge(false, 'submit_requires_one_entry');
+            break;
+          }
+          next = prepareCodexAppDispatch(ledger, msg.entries[0]);
+        } else if (msg.operation === 'retry') {
+          if (msg.entries.length !== 1) {
+            acknowledge(false, 'retry_requires_one_entry');
+            break;
+          }
+          next = retryPreparedCodexAppDispatch(ledger, msg.entries[0]);
+        } else {
+          if (msg.entries.length !== 1) {
+            acknowledge(false, 'cancel_requires_one_entry');
+            break;
+          }
+          next = cancelCodexAppDispatch(ledger, msg.entries[0]);
+        }
+        if (!next.ok) {
+          acknowledge(false, next.error);
+          break;
+        }
+        const priorLedger = ds.session.codexAppDispatchLedger;
+        ds.session.codexAppDispatchLedger = next.ledger;
+        let persisted = false;
+        try {
+          sessionStore.updateSession(ds.session);
+          persisted = true;
+          acknowledge(true);
+        } catch (err: any) {
+          ds.session.codexAppDispatchLedger = priorLedger;
+          acknowledge(false, err?.message ?? 'session_store_write_failed');
+        }
+        if (persisted && !hasUnsettledCodexAppDispatch(ds.session.codexAppDispatchLedger)) {
+          try { await cb.onCodexAppLedgerDrained?.(ds); }
+          catch (err) { logger.error(`[${t}] post-drain cleanup failed: ${err instanceof Error ? err.message : String(err)}`); }
+        }
+        break;
+      }
+
+      case 'codex_app_generation_active': {
+        if (ds.worker !== worker || msg.sessionId !== ds.session.sessionId) break;
+        if (!msg.fresh) break;
+        const priorCommits = ds.session.codexAppGenerationCommits;
+        ds.session.codexAppGenerationCommits = retainFreshCodexAppGeneration(
+          ds.session.codexAppGenerationCommits ?? [],
+          msg.generation,
+        );
+        try {
+          sessionStore.updateSession(ds.session);
+        } catch (err) {
+          ds.session.codexAppGenerationCommits = priorCommits;
+          logger.error(`[${t}] Failed to persist fresh Codex App generation: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        break;
+      }
+
       case 'session_close_ready': {
         resolveCloseFence(msg.sessionId, workerGeneration);
         break;
       }
 
       case 'final_output': {
+        if (msg.codexAppSettlement) {
+          const settlement = msg.codexAppSettlement;
+          const acknowledge = (ok: boolean, error?: string): void => {
+            try {
+              worker.send({
+                type: 'codex_app_dispatch_persisted',
+                requestId: settlement.requestId,
+                ok,
+                ...(error ? { error } : {}),
+              } as DaemonToWorker);
+            } catch { /* runner keeps the final unacknowledged for replacement */ }
+          };
+          if (ds.worker !== worker) {
+            acknowledge(false, 'stale_worker_generation');
+            break;
+          }
+          if (msg.sessionId !== ds.session.sessionId) {
+            acknowledge(false, 'session_mismatch');
+            break;
+          }
+          if (committedCodexAppSequence(
+            ds.session.codexAppGenerationCommits ?? [],
+            settlement.generation,
+            settlement.seq,
+          )) {
+            acknowledge(true);
+            if (!hasUnsettledCodexAppDispatch(ds.session.codexAppDispatchLedger)) {
+              try { await cb.onCodexAppLedgerDrained?.(ds); }
+              catch (err) { logger.error(`[${t}] post-drain cleanup failed: ${err instanceof Error ? err.message : String(err)}`); }
+            }
+            break;
+          }
+          const identity = {
+            dispatchId: settlement.dispatchId,
+            turnId: msg.turnId,
+            ...(msg.dispatchAttempt !== undefined
+              ? { dispatchAttempt: msg.dispatchAttempt }
+              : {}),
+          };
+          const preview = settleCodexAppDispatch(
+            ds.session.codexAppDispatchLedger ?? [],
+            ds.session.codexAppGenerationCommits ?? [],
+            identity,
+            settlement.generation,
+            settlement.seq,
+          );
+          if (!preview.ok) {
+            acknowledge(false, preview.error);
+            break;
+          }
+          // R4/R5-B4 defense-in-depth: a `steer_superseded` settlement silently
+          // advances the FIFO without delivering, so it is ONLY legitimate for a
+          // genuine plain-Lark steerable head that STILL has a successor. Reject
+          // (ACK=false, no pop, no receiver completion, no mutation) BEFORE the
+          // commit block below if the settled entry is not steerable, not an
+          // explicit Lark sink, belongs to a VC / durable-receiver / special
+          // channel, or is the SOLE remaining head. R5: `deliverySink` must be
+          // exactly 'lark' — admission always writes both sink and steerable
+          // together, so "steerable=true + sink missing" can only be a
+          // mixed/corrupt/legacy ledger and must fail closed, not be treated as
+          // safe Lark. And a lone forged superseded (no successor) must never
+          // silently commit the only head — the real final would then find no
+          // pending turn. preview.ledger is the post-settle remainder.
+          if (msg.disposition === 'steer_superseded') {
+            const entry = preview.settledEntry;
+            const supersededHeadOk = entry.codexAppSteerable === true
+              && entry.deliverySink === 'lark'
+              && entry.vcMeetingImTurnOrigin === undefined
+              && ds.session.vcMeetingReceiver === undefined
+              && preview.ledger.length > 0;
+            if (!supersededHeadOk) {
+              logger.warn(
+                `[${t}] Rejected steer_superseded for non-steerable/special/last head `
+                + `(turn ${msg.turnId.substring(0, 8)}, sink=${entry.deliverySink ?? 'legacy'}, `
+                + `steerable=${entry.codexAppSteerable === true}, successors=${preview.ledger.length})`,
+              );
+              acknowledge(false, 'superseded_head_not_plain_lark_steerable_with_successor');
+              break;
+            }
+          }
+          const key = `${ds.session.sessionId}:${settlement.generation}:${settlement.seq}`;
+          let inFlight = codexAppFinalSettlementInFlight.get(key);
+          if (!inFlight) {
+            inFlight = (async () => {
+              const unavailableSinkFailClosed = codexAppDeliveryMustFailClosed(
+                ds,
+                preview.settledEntry,
+              );
+              const deliverySuppressed = msg.suppressDelivery === true
+                || managedFinalOutputSuppressed(msg.turnId, msg.dispatchAttempt)
+                || unavailableSinkFailClosed;
+              if (unavailableSinkFailClosed
+                && preview.settledEntry.deliverySink !== 'suppressed'
+                && msg.suppressDelivery !== true) {
+                logger.warn(
+                  `[${t}] Codex App recovery suppressed unavailable `
+                  + `${preview.settledEntry.deliverySink ?? 'legacy non-Lark'} sink `
+                  + `(turn ${msg.turnId.substring(0, 8)})`,
+                );
+              }
+              const alreadyDelivered = ds.lastBridgeEmittedUuid === finalOutputDedupeKey(ds, msg);
+              const owned = deliverySuppressed || !msg.content.trim() || alreadyDelivered
+                ? true
+                : await new Promise<boolean>(resolve => {
+                    deliverFinalOutput(
+                      ds,
+                      msg,
+                      t,
+                      0,
+                      resolve,
+                      () => ds.worker === worker
+                        && ds.session.sessionId === msg.sessionId,
+                      preview.settledEntry.replyTarget,
+                    );
+                  });
+              if (!owned) return false;
+
+              // Re-read after the asynchronous external delivery. A concurrent
+              // replacement may already have committed this signed sequence;
+              // that is idempotent success, never a second FIFO pop.
+              if (committedCodexAppSequence(
+                ds.session.codexAppGenerationCommits ?? [],
+                settlement.generation,
+                settlement.seq,
+              )) return true;
+              const committed = settleCodexAppDispatch(
+                ds.session.codexAppDispatchLedger ?? [],
+                ds.session.codexAppGenerationCommits ?? [],
+                identity,
+                settlement.generation,
+                settlement.seq,
+              );
+              if (!committed.ok) return false;
+              if (msg.dispatchAttempt !== undefined) {
+                try {
+                  // Durable receivers must not depend on the worker surviving
+                  // the daemon ACK long enough to emit a later terminal IPC.
+                  // Persist the exact completed attempt first; the worker's
+                  // ordered duplicate terminal remains idempotent.
+                  await cb.onTurnTerminal?.(ds, {
+                    type: 'turn_terminal',
+                    sessionId: ds.session.sessionId,
+                    turnId: msg.turnId,
+                    dispatchAttempt: msg.dispatchAttempt,
+                    status: 'completed',
+                  }, { workerGeneration });
+                } catch (err) {
+                  logger.error(`[${t}] Failed to persist Codex App settlement terminal: ${err instanceof Error ? err.message : String(err)}`);
+                  return false;
+                }
+              }
+              const priorLedger = ds.session.codexAppDispatchLedger;
+              const priorCommits = ds.session.codexAppGenerationCommits;
+              ds.session.codexAppDispatchLedger = committed.ledger;
+              ds.session.codexAppGenerationCommits = committed.commits;
+              try {
+                // One atomic sessions-file replacement owns both the exact FIFO
+                // pop and cumulative runner ACK boundary. Only after this write
+                // may the worker acknowledge final-end to the runner.
+                sessionStore.updateSession(ds.session);
+                return true;
+              } catch (err) {
+                ds.session.codexAppDispatchLedger = priorLedger;
+                ds.session.codexAppGenerationCommits = priorCommits;
+                logger.error(`[${t}] Failed to persist Codex App final settlement: ${err instanceof Error ? err.message : String(err)}`);
+                return false;
+              }
+            })().finally(() => codexAppFinalSettlementInFlight.delete(key));
+            codexAppFinalSettlementInFlight.set(key, inFlight);
+          }
+          const persisted = await inFlight;
+          acknowledge(persisted, persisted ? undefined : 'final_settlement_failed');
+          if (persisted && !hasUnsettledCodexAppDispatch(ds.session.codexAppDispatchLedger)) {
+            try { await cb.onCodexAppLedgerDrained?.(ds); }
+            catch (err) { logger.error(`[${t}] post-drain cleanup failed: ${err instanceof Error ? err.message : String(err)}`); }
+          }
+          break;
+        }
+
         // Adopt-bridge: worker harvested the assistant turn from Claude Code's
         // transcript JSONL and forwarded it to us. Dedup with a session-scoped
         // key so a re-drain can't re-send the same answer or cross-suppress
@@ -6125,7 +11403,14 @@ function setupWorkerHandlers(
         if (msg.turnId.startsWith('mlrp_turn_')) {
           markMessageListenerRunPreviewRunning(msg.turnId);
         }
-        deliverFinalOutput(ds, msg, t, 0, ownsLifecycleMutation);
+        deliverFinalOutput(
+          ds,
+          msg,
+          t,
+          0,
+          undefined,
+          ownsLifecycleMutation,
+        );
         break;
       }
 
@@ -6165,6 +11450,7 @@ function setupWorkerHandlers(
   });
 
   worker.on('exit', (code, signal) => {
+    abandonOrdinaryImDeliveriesForWorker(worker);
     const transferRetirement = transferRetiringWorkers.has(worker);
     transferRetiringWorkers.delete(worker);
     clearLifecycleRetirement(ds, worker);
@@ -6186,13 +11472,33 @@ function setupWorkerHandlers(
     // old worker's exit fires AFTER the new worker has been assigned.
     if (ds.worker === worker) {
       restartCoordinator.failSession(ds.session.sessionId);
+      if (ds.session.queuedActivationPending) {
+        // Journal ownership is backend-independent. The next worker replays
+        // this exact head with queuedActivationResume before durable tail N+1.
+        ds.initialStartPending = false;
+        ds.initialStartClaimToken = undefined;
+      } else {
+        reparkQueuedActivationFollowUpTail(ds, 'worker exit during activation follow-up handoff');
+      }
       ds.worker = null;
       ds.workerReady = false;
       ds.workerPort = null;
+      // A queued suspend for THIS generation is now moot — the worker it was
+      // about is gone. Leaving it set would suspend the replacement on its
+      // first idle (the deferred checkpoint's own "worker gone" branch cannot
+      // help: it only runs on a screen update that will never arrive).
+      clearPendingSuspendClaim(ds, 'worker exited');
       // Dead worker generation — stop the periodic usage refresh immediately
       // instead of waiting a tick for it to self-clear on !workerHasInitialized.
       clearUsageRefreshTimer(ds);
+      ds.workerToken = null;
+      ds.workerViewToken = null;
       ds.managedTurnOrigin = undefined;
+      if (ds.remoteCloseState) {
+        ds.remoteCloseState = { ...ds.remoteCloseState, phase: 'uncertain' };
+      }
+      // Do not clear remoteShutdownState here. Only the shutdown coordinator can
+      // release a generation after lineage persistence or admission restore.
       // This worker generation is gone. Invalidate any stuck-warning card it
       // posted so a late click cannot inject keys into a replacement worker.
       invalidateStuckWarning(ds, 'worker_exit');
@@ -6252,6 +11558,28 @@ function setupWorkerHandlers(
 // ─── Bridge final-output delivery (with retry) ──────────────────────────────
 
 const FINAL_OUTPUT_RETRY_BACKOFF_MS = [0, 5000, 15000];  // immediate, +5s, +15s
+const codexAppFinalSettlementInFlight = new Map<string, Promise<boolean>>();
+
+/**
+ * Shutdown-only view of the in-flight Codex App final-settlement promises. Each
+ * entry is a `deliverFinalOutput` awaited inside the IPC message handler that
+ * has NOT yet reached its `cb.onTurnTerminal` call; a settlement resolving
+ * enqueues the turn terminal. During graceful shutdown, after all worker IPC
+ * channels have disconnected (so no NEW settlement can be created), the daemon
+ * bounded-waits these to settle BEFORE closing the turn-terminal queue
+ * admission — otherwise a settlement that resolves post-close would have its
+ * terminal refused and lost. Returns a snapshot array (safe to Promise.all).
+ */
+export function snapshotCodexAppFinalSettlements(): Promise<boolean>[] {
+  return [...codexAppFinalSettlementInFlight.values()];
+}
+
+/** Current in-flight Codex App final-settlement count. After all worker IPC has
+ *  disconnected the map cannot grow, so a re-read of 0 after awaiting the
+ *  snapshot confirms settlement quiescence. */
+export function codexAppFinalSettlementCount(): number {
+  return codexAppFinalSettlementInFlight.size;
+}
 
 function finalOutputDedupeKey(ds: DaemonSession, msg: Extract<WorkerToDaemon, { type: 'final_output' }>): string {
   return `${msg.sessionId ?? ds.session.sessionId}:${msg.lastUuid || msg.turnId}`;
@@ -6336,20 +11664,72 @@ async function finishTurnReactions(ds: DaemonSession): Promise<void> {
   }
 }
 
-/** Deliver a bridge `final_output` to Lark. The worker emits each turn
- *  exactly once (it pops the turn off its queue at emit time), so the
- *  daemon owns retries on transient failures. After 3 attempts we log
+/** Deliver a bridge `final_output` to Lark. The current worker generation pops
+ *  the turn at emit time, while replacement recovery may replay it with the
+ *  same provider key; the daemon owns bounded transient retries. After 3 attempts we log
  *  and give up — the user's answer is lost; better than leaking memory
  *  via an unbounded retry loop. */
+async function persistFinalOutputFeedback(
+  ds: DaemonSession,
+  msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
+  content: string,
+  effectiveCliId: string,
+  messageId: string,
+  policy: import('../services/feedback-policy.js').FeedbackPolicy,
+  baseCard: Record<string, unknown>,
+  requesterSubjectId: string | undefined,
+  webhookDestinations: import('../services/feedback-outbox.js').FeedbackWebhookDestination[] | undefined,
+  logTag: string,
+): Promise<void> {
+  try {
+    const { getSkillFeedbackStore } = await import('../services/skill-feedback-store.js');
+    const feedbackStore = await getSkillFeedbackStore(config.session.dataDir);
+    feedbackStore.recordTurnDelivery({
+      botAppId: ds.larkAppId,
+      sessionId: ds.session.sessionId,
+      turnId: msg.turnId,
+      nativeSessionId: msg.sourceHermesSessionId ?? ds.session.cliSessionId,
+      platform: 'lark',
+      platformAppId: ds.larkAppId,
+      platformMessageId: messageId,
+      chatId: ds.chatId,
+      topicRootId: ds.session.rootMessageId,
+      dispatchAttempt: msg.dispatchAttempt,
+      content,
+      cliId: effectiveCliId,
+      cliVersion: ds.cliVersion,
+      model: ds.session.model,
+      reasoningEffort: ds.session.reasoningEffort,
+      cardMode: 'feedback',
+      status: 'delivered',
+      usage: msg.usage,
+      policy,
+      baseCard,
+      requesterSubjectId,
+      webhookDestinations,
+      context: { ...(resolveFeedbackTeamId({ dataDir: config.session.dataDir, chatId: ds.chatId }) ? { teamId: resolveFeedbackTeamId({ dataDir: config.session.dataDir, chatId: ds.chatId }) } : {}) },
+    });
+  } catch (error) {
+    logger.warn(
+      `[${logTag}] Failed to persist final-output feedback delivery: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
 function deliverFinalOutput(
   ds: DaemonSession,
   msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
   t: string,
   attempt: number,
-  stillCurrent: () => boolean = () => true,
+  onComplete?: (owned: boolean) => void,
+  isStillOwned: () => boolean = () => true,
+  frozenReplyTarget?: FrozenSessionReplyTarget,
   frozenUsage?: CardUsageSnapshot,
 ): void {
-  if (!stillCurrent()) return;
+  if (!isStillOwned()) {
+    onComplete?.(false);
+    return;
+  }
   let cardUsage = frozenUsage;
   const managedReceiver = !!ds.session.vcMeetingReceiver;
   // Wait Mode / HTTP Sync Override:
@@ -6362,6 +11742,7 @@ function deliverFinalOutput(
     waitPromise.resolve(msg.content);
     ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
     logger.info(`[${t}] Intercepted final_output for Wait Mode HTTP request (turn ${msg.turnId.substring(0, 8)})`);
+    onComplete?.(true);
     return;
   }
 
@@ -6376,8 +11757,15 @@ function deliverFinalOutput(
     // (with content + usage) after a daemon restart drops the in-memory Map.
     // Stamp the owning bot for cross-bot isolation.
     asyncTriggerStore.recordCompleted(ds.session.sessionId, msg.turnId, msg.content, completedAt, ds.larkAppId, msg.usage);
+    // This idempotent async turn produced its terminal output — drop its
+    // worker-exit convergence entry so a later graceful exit of this generation
+    // is not retro-failed (codex #776 round-6 finding #1). Per-triggerId delete so
+    // a concurrent sibling keyed turn on the same shared session is untouched
+    // (codex #818 P1-1).
+    ds.idempotentAsyncTurns?.delete(msg.turnId);
     ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
     logger.info(`[${t}] Captured final_output for Async HTTP request (turn ${msg.turnId.substring(0, 8)})`);
+    onComplete?.(true);
     return;
   }
   const cb = requireCallbacks();
@@ -6398,12 +11786,17 @@ function deliverFinalOutput(
       : opts,
   );
   setTimeout(async () => {
-    if (!stillCurrent()) return;
+    if (!isStillOwned()) {
+      logger.info(`[${t}] Bridge final_output abandoned — worker/session ownership changed`);
+      onComplete?.(false);
+      return;
+    }
     // Guard: if the user closed the session (or it was torn down for any
     // other reason) between attempts, don't post a stale final answer to
     // a closed thread.
     if (ds.session.status === 'closed') {
       logger.info(`[${t}] Bridge final_output abandoned — session closed (turn ${msg.turnId.substring(0, 8)})`);
+      onComplete?.(true);
       return;
     }
     try {
@@ -6415,9 +11808,9 @@ function deliverFinalOutput(
         // （模型没显式 botmux send），默认 @ 回原评论人，仅首块加。
         const chunks = chunkCommentText(msg.content);
         for (let i = 0; i < chunks.length; i++) {
-          if (!stillCurrent()) return;
+          if (!isStillOwned()) { onComplete?.(false); return; }
           await replyToDocComment(ds.larkAppId, { fileToken: docTurn.fileToken, fileType: docTurn.fileType }, docTurn.commentId, chunks[i], i === 0 ? docTurn.replyToOpenId : undefined);
-          if (!stillCurrent()) return;
+          if (!isStillOwned()) { onComplete?.(false); return; }
         }
         // The user-visible reply is committed. Consume the route and dedupe
         // marker BEFORE best-effort reaction cleanup: a missing/expired
@@ -6436,6 +11829,7 @@ function deliverFinalOutput(
           }
         }
         logger.info(`[${t}] doc-comment final_output → posted ${chunks.length} comment(s) on file=${docTurn.fileToken.slice(0, 12)} (turn ${msg.turnId.substring(0, 8)})`);
+        onComplete?.(true);
         return;
       }
 
@@ -6449,6 +11843,7 @@ function deliverFinalOutput(
           `[${t}] Suppressed doc-native final_output without comment target ` +
           `(turn ${msg.turnId.substring(0, 8)})`,
         );
+        onComplete?.(true);
         return;
       }
 
@@ -6482,6 +11877,7 @@ function deliverFinalOutput(
           `[${t}] VC final_output lost current membership authority `
           + `(${managedDecision.errorCode}) turn=${msg.turnId.substring(0, 8)}`,
         );
+        onComplete?.(true);
         return;
       }
       const revalidateManagedSend = (): void => {
@@ -6561,6 +11957,12 @@ function deliverFinalOutput(
         : imOrigin?.replyTargetSenderOpenId
           ?? daemonCardFooterRecipientOpenId(ds, effectiveCliId);
       const localHomeLinkMode = daemonCardLocalHomeLinkMode(ds);
+      // forkWorker snapshots the effective policy for this worker lifetime.
+      // Keep daemon fallback delivery aligned with the same frozen policy the
+      // worker/Riff environment received; live config applies on the next fork.
+      const feedbackPolicy = managedReceiver ? undefined : ds.feedbackPolicy;
+      const feedbackRequesterSubjectId = recipientOpenId;
+      const feedback = feedbackPolicy && feedbackRequesterSubjectId ? { policy: feedbackPolicy } : undefined;
       cardUsage ??= getDaemonReplyCardUsageSnapshot(ds, effectiveCliId);
       const cardJson = msg.kind === 'local-turn' || msg.kind === 'local-turn-headless'
         ? buildContextualReplyCard({
@@ -6576,16 +11978,19 @@ function deliverFinalOutput(
             workingDir: ds.workingDir,
             localHomeLinkMode,
             usage: cardUsage,
+            ...(feedback ? { feedback } : {}),
           })
-        : buildMarkdownCard(
-            safeAssistantText,
+        : buildCanonicalFinalReplyCard({
+            markdown: safeAssistantText,
+            ...(feedback ? { feedback } : {}),
             recipientOpenId,
-            renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir),
-            localeForBot(ds.larkAppId),
-            ds.workingDir,
+            brand: renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir),
+            locale: localeForBot(ds.larkAppId),
+            workingDir: ds.workingDir,
             localHomeLinkMode,
-            cardUsage,
-          );
+            usage: cardUsage,
+          });
+      const baseFeedbackCard = feedback ? JSON.parse(cardJson) as Record<string, unknown> : undefined;
 
       const proposedOutput = {
         targetChatId: ds.chatId,
@@ -6609,12 +12014,25 @@ function deliverFinalOutput(
           }, proposedOutput)
         : undefined;
       const preparedListenerReply = preparedImReply ?? preparedDeliveryReply;
+      // Codex App final settlement is delivery-before-commit. If the daemon
+      // dies after Lark accepts the reply but before the FIFO/sequence commit,
+      // the replacement must retry with the same provider key. Keep the key
+      // dispatch-stable (not generation/seq-stable), so the user-visible Lark
+      // message is idempotent across crash reconciliation. The existing
+      // outbound-hook contract remains unchanged; it is a separate best-effort
+      // side effect and is not covered by the provider UUID.
+      const codexAppSettlementReply = msg.codexAppSettlement
+        ? {
+            uuid: `ca_${msg.codexAppSettlement.dispatchId}`.slice(0, 50),
+          }
+        : undefined;
       if (preparedListenerReply?.kind === 'conflict') {
         ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
         logger.error(
           `[${t}] VC listener fallback suppressed (${preparedListenerReply.reason}) `
           + `turn=${msg.turnId.substring(0, 8)}: ${preparedListenerReply.detail}`,
         );
+        onComplete?.(true);
         return;
       }
       const canonicalOutput = preparedListenerReply?.canonicalOutput ?? proposedOutput;
@@ -6661,11 +12079,15 @@ function deliverFinalOutput(
       };
       if (preparedListenerReply?.kind === 'succeeded' && preparedListenerReply.messageId) {
         recordPrimaryOutput(preparedListenerReply.messageId);
+        if (feedbackPolicy && baseFeedbackCard) {
+          await persistFinalOutputFeedback(ds, msg, safeAssistantText, effectiveCliId, preparedListenerReply.messageId, feedbackPolicy!, baseFeedbackCard, feedbackRequesterSubjectId, getBot(ds.larkAppId).config.feedbackWebhooks?.destinations, t);
+        }
         ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
         logger.info(
           `[${t}] VC listener fallback replayed existing provider result `
           + `(turn ${msg.turnId.substring(0, 8)})`,
         );
+        onComplete?.(true);
         return;
       }
 
@@ -6673,29 +12095,36 @@ function deliverFinalOutput(
       // place. message.patch is silent (no Feishu notification / unread), which
       // used to swallow the answer; a brand-new message always pings.
       revalidateManagedSend();
+      if (!isStillOwned()) {
+        onComplete?.(false);
+        return;
+      }
+      const deliveryReplyOptions = preparedListenerReply
+        ? {
+            uuid: preparedListenerReply.providerKey,
+            quoteMessageId: canonicalOutput.quoteTargetId,
+            beforeQuoteFallback: revalidateManagedSend,
+            // Managed output has one audited external effect (the Lark
+            // provider call). Never fan meeting content out to user hooks,
+            // including the first attempt and crash reconciliation replay.
+            suppressHook: true,
+            ...(!imOrigin && listenerOutputOwner
+              ? {
+                  placement: canonicalOutput.placement ?? 'auto',
+                  ...(meetingTopicKey ? { meetingTopicKey } : {}),
+                }
+              : {}),
+          }
+        : codexAppSettlementReply;
       const messageId = await scopedReply(
         canonicalOutput.content,
         canonicalOutput.msgType,
-        msg.turnId,
-        preparedListenerReply
-          ? {
-              uuid: preparedListenerReply.providerKey,
-              quoteMessageId: canonicalOutput.quoteTargetId,
-              beforeQuoteFallback: revalidateManagedSend,
-              // Managed output has one audited external effect (the Lark
-              // provider call). Never fan meeting content out to user hooks,
-              // including the first attempt and crash reconciliation replay.
-              suppressHook: true,
-              ...(!imOrigin && listenerOutputOwner
-                ? {
-                    placement: canonicalOutput.placement ?? 'auto',
-                    ...(meetingTopicKey ? { meetingTopicKey } : {}),
-                  }
-                : {}),
-            }
-          : undefined,
+        msg.replyTurnId ?? msg.turnId,
+        frozenReplyTarget && !managedReceiver
+          ? { ...deliveryReplyOptions, replyTarget: frozenReplyTarget }
+          : deliveryReplyOptions,
       );
-      if (!stillCurrent()) return;
+      if (!isStillOwned()) { onComplete?.(true); return; }
       recordPrimaryOutput(messageId);
       if (msg.turnId.startsWith('mlrp_turn_')) {
         markMessageListenerRunPreviewReplied(msg.turnId, {
@@ -6708,14 +12137,25 @@ function deliverFinalOutput(
       }
       ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
       logger.info(`[${t}] Bridge final_output forwarded (turn ${msg.turnId.substring(0, 8)}, ${msg.content.length} chars, kind=${msg.kind ?? 'bridge'}, attempt ${attempt + 1})`);
+      if (feedbackPolicy && baseFeedbackCard && messageId) {
+        await persistFinalOutputFeedback(ds, msg, safeAssistantText, effectiveCliId, messageId, feedbackPolicy!, baseFeedbackCard, feedbackRequesterSubjectId, getBot(ds.larkAppId).config.feedbackWebhooks?.destinations, t);
+      }
+      onComplete?.(true);
     } catch (err: any) {
-      if (!stillCurrent()) return;
+      if (!isStillOwned()) { onComplete?.(false); return; }
       if (err instanceof MessageWithdrawnError) {
-        // Root message gone — no point retrying. Mark as emitted so any
-        // duplicate IPC is correctly deduped, and tear the session down.
-        ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
-        logger.warn(`[${t}] Root message withdrawn while forwarding final_output, closing session`);
-        cb.closeSession(ds);
+        // Withdrawal is permanent for this target, but it is not explicit
+        // abandon. Keep an unsettled FIFO owner recoverable; only ledger-empty
+        // sessions may commit the dedupe marker and auto-close.
+        if (await closeWithdrawnSessionIfLedgerEmpty(
+          ds,
+          'Root message withdrawn while forwarding final_output',
+        )) {
+          ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+          onComplete?.(true);
+        } else {
+          onComplete?.(false);
+        }
         return;
       }
       const next = attempt + 1;
@@ -6729,10 +12169,11 @@ function deliverFinalOutput(
         }
         // Don't commit the dedup marker — leave room for any future
         // retransmit (e.g. daemon restart that re-fires the IPC).
+        onComplete?.(false);
         return;
       }
       logger.warn(`[${t}] Bridge final_output attempt ${next} failed (${err.message}); retrying in ${FINAL_OUTPUT_RETRY_BACKOFF_MS[next]}ms`);
-      deliverFinalOutput(ds, msg, t, next, stillCurrent, cardUsage);
+      deliverFinalOutput(ds, msg, t, next, onComplete, isStillOwned, frozenReplyTarget, cardUsage);
     }
   }, FINAL_OUTPUT_RETRY_BACKOFF_MS[attempt] ?? 0);
 }
@@ -6745,6 +12186,7 @@ export const __testOnly_setupWorkerHandlers = setupWorkerHandlers;
 export const __testOnly_reserveWorkerGeneration = reserveWorkerGeneration;
 export const __testOnly_finishTurnReactions = finishTurnReactions;
 export const __testOnly_finalOutputDedupeKey = finalOutputDedupeKey;
+export const __testOnly_retireTerminalizedCodexAppLedgerEntriesForRecovery = retireTerminalizedCodexAppLedgerEntriesForRecovery;
 
 // ─── Fork adopt worker ──────────────────────────────────────────────────────
 
@@ -6880,6 +12322,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   const worker = fork(workerPath, [], {
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    execArgv: workerForkExecArgv(),
     cwd: adoptCwd,
     env: {
       ...forkEnv,
@@ -6997,6 +12440,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     cliPathOverride: agentCfg.cliPathOverride,
     cliSessionId: isStructuredBridge ? adopted.sessionId : undefined,
     model: agentCfg.model,
+    turnTimeoutMs: botCfg.turnTimeoutMs,
     disableCliBypass: botCfg.disableCliBypass === true,
     codexRpcInput: botCfg.codexRpcInput === true || config.codexRpcInputDefault,
     // Adopt is normally observe-only (prompt=''), driven later by 'message'
@@ -7061,6 +12505,10 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   };
   worker.send(initMsg);
   ds.initConfig = initMsg;
+  // New generation ledger. NOT a plain reset: the previous generation's keys are
+  // parked until its worker is observed to exit, because the double-fork guard
+  // kills asynchronously and spawns the replacement synchronously.
+  startNewGenerationEnvLedger(ds, initMsg.env);
   // Stamp cliId on the persisted session so the dashboard can show a CLI badge
   // even after the session is closed. Adopt sessions inherit the adopted CLI's id.
   // Do this before installing worker handlers: a fast worker can emit `ready`
@@ -7315,6 +12763,13 @@ function cleanupPersistentBackendSessions(
   let lastCliId: string | undefined;
   try { lastCliId = readFileSync(cliIdFile, 'utf-8').trim(); } catch { /* first run */ }
   const currentCliId = config.daemon.cliId;
+  // Codex App sessions with an unsettled dispatch ledger must reconcile before
+  // any CLI-change sweep tears their backing pane down.
+  const unsettledNames = new Set(
+    activeSessions_
+      .filter(hasProtectedSessionMutationOwnership)
+      .map(session => backend.sessionName(session.sessionId)),
+  );
   const belongsToBackend = (session: Session) =>
     session.backendType === backendType ||
     (session.backendType === undefined && backendType === 'tmux');
@@ -7446,6 +12901,10 @@ function cleanupPersistentBackendSessions(
     logger.info(`CLI_ID changed (${lastCliId} → ${currentCliId}), killing all ${backendType} sessions`);
     // Legacy per-topic hosts are still enumerable by bmx-* name.
     for (const name of backend.listBotmuxSessions()) {
+      if (unsettledNames.has(name)) {
+        logger.warn(`Preserving ${backendType} ${name}: unsettled Codex App dispatch must reconcile first`);
+        continue;
+      }
       // A dispatcher-created runtime session already runs the current CLI.
       // Never let the stale last-cli marker tear it down during restore.
       if (runtimeNames.has(name)) continue;

@@ -7,8 +7,12 @@ import { SessionsKanbanView, type SessionsKanbanCallbacks, type SessionsKanbanSt
 import {
   canRestartSession,
   CLI_FILTER_OPTIONS,
+  SESSION_STATUS_OPTIONS,
+  deriveSessionBoardColumn,
   groupSessionsByTopic,
   isUnknownChatSession,
+  preferChatFilterLabel,
+  chatFilterLabelIsUnresolved,
   restartConfirmMessage,
   historySenderKey,
   sessionLocationText,
@@ -509,6 +513,11 @@ describe('dashboard sessions filters', () => {
     expect((html.match(/<article class="session-card/g) ?? []).length).toBe(1);
   });
 
+  it('surfaces stalled sessions as a filterable needs-you state', () => {
+    expect(SESSION_STATUS_OPTIONS).toContain('stalled');
+    expect(deriveSessionBoardColumn({ status: 'stalled' })).toBe('needs-you');
+  });
+
   it('derives CLI filter options from the shared CLI registry', () => {
     expect(CLI_FILTER_OPTIONS).toContain('codex');
     expect(CLI_FILTER_OPTIONS).toContain('codex-app');
@@ -532,6 +541,7 @@ describe('dashboard sessions filters', () => {
     expect(canRestartSession({ status: 'closed', adopt: false })).toBe(false);
     expect(canRestartSession({ status: 'idle', adopt: true })).toBe(false);
     expect(canRestartSession({ status: 'starting', pendingRepo: true })).toBe(false);
+    expect(canRestartSession({ status: 'idle', adopt: false, cliId: 'riff' })).toBe(false);
   });
 
   it('formats session location labels for group chats and direct chats', () => {
@@ -549,6 +559,31 @@ describe('dashboard sessions filters', () => {
     expect(isUnknownChatSession(row, () => 'SellerIM Agent 集中营')).toBe(false);
     expect(isUnknownChatSession(namedDirect)).toBe(false);
     expect(isUnknownChatSession({}, () => null)).toBe(false);
+  });
+
+  it('detects chat-filter labels that still fall back to the raw chatId', () => {
+    expect(chatFilterLabelIsUnresolved('单聊 · oc_dm - Nil-RD', 'oc_dm')).toBe(true);
+    expect(chatFilterLabelIsUnresolved('单聊 · 韩毅 - Nil-RD', 'oc_dm')).toBe(false);
+    expect(chatFilterLabelIsUnresolved('群聊 · oc_group', 'oc_group')).toBe(true);
+    expect(chatFilterLabelIsUnresolved('anything', '')).toBe(false);
+  });
+
+  it('prefers a resolved chat-filter label over a raw-id one during dedup', () => {
+    // Same p2p chatId: one row resolved the human name, another (a scheduled
+    // task with no user sender) fell back to the raw id. The resolved name must
+    // win regardless of arrival order, even though ASCII `oc_…` sorts before CJK.
+    const resolved = '单聊 · 韩毅 - 韩毅';
+    const rawId = '单聊 · oc_cfa427 - 韩毅';
+    expect(preferChatFilterLabel(undefined, rawId, 'oc_cfa427')).toBe(rawId);
+    expect(preferChatFilterLabel(rawId, resolved, 'oc_cfa427')).toBe(resolved);
+    expect(preferChatFilterLabel(resolved, rawId, 'oc_cfa427')).toBe(resolved);
+  });
+
+  it('falls back to a deterministic lexicographic pick when both labels are equally resolved', () => {
+    expect(preferChatFilterLabel('群聊 · B', '群聊 · A', 'oc_x')).toBe('群聊 · A');
+    expect(preferChatFilterLabel('群聊 · A', '群聊 · B', 'oc_x')).toBe('群聊 · A');
+    // Both unresolved (raw id) → still deterministic, no crash.
+    expect(preferChatFilterLabel('群聊 · oc_x', '群聊 · oc_x', 'oc_x')).toBe('群聊 · oc_x');
   });
 
   it('groups consecutive app/bot history records by sender identity', () => {
@@ -596,6 +631,7 @@ describe('dashboard sessions kanban react view', () => {
         { sessionId: 's-todo', status: 'idle', cliId: 'codex', title: 'Todo', botName: 'Bot A', lastMessageAt: 2000 },
         { sessionId: 's-progress', status: 'working', cliId: 'codex', title: 'Working', botName: 'Bot A', lastMessageAt: 3000 },
         { sessionId: 's-review', status: 'limited', cliId: 'codex', title: 'Review', botName: 'Bot A', lastMessageAt: 4000 },
+        { sessionId: 's-stalled', status: 'stalled', cliId: 'codex-app', title: 'Stalled', botName: 'Bot A', lastMessageAt: 4500 },
         { sessionId: 's-done', status: 'closed', cliId: 'codex', title: 'Done', botName: 'Bot A', lastMessageAt: 5000 },
       ],
     });
@@ -609,6 +645,7 @@ describe('dashboard sessions kanban react view', () => {
     expect(html).toContain('data-id="s-progress"');
     expect(html).toContain('role="button"');
     expect(html).toContain('class="session-signal"');
+    expect(html).toContain('长时间无进展');
     expect(html).toContain('class="card-act kanban-card-act"');
   });
 
@@ -681,5 +718,43 @@ describe('dashboard sessions kanban react view', () => {
 
     expect(html).toContain('data-action="terminal"');
     expect(html).toContain('data-action="write-link"');
+  });
+});
+
+describe('deriveSessionBoardColumn', () => {
+  it('drops closed sessions off the board', () => {
+    expect(deriveSessionBoardColumn({ status: 'closed' })).toBeNull();
+  });
+
+  it('routes needs-you signals ahead of runtime state', () => {
+    expect(deriveSessionBoardColumn({ status: 'working', pendingRepo: true })).toBe('needs-you');
+    expect(deriveSessionBoardColumn({ status: 'idle', tuiPromptActive: true })).toBe('needs-you');
+    expect(deriveSessionBoardColumn({ status: 'idle', agentAttention: { kind: 'x', reason: 'y', at: 1 } })).toBe('needs-you');
+    expect(deriveSessionBoardColumn({ status: 'limited' })).toBe('needs-you');
+  });
+
+  it('folds "starting" into the "working" (进行中) column', () => {
+    for (const status of ['starting', 'working', 'analyzing', 'active']) {
+      expect(deriveSessionBoardColumn({ status })).toBe('working');
+    }
+  });
+
+  it('treats idle/dormant with no open todos as idle', () => {
+    expect(deriveSessionBoardColumn({ status: 'idle' })).toBe('idle');
+    expect(deriveSessionBoardColumn({ status: 'dormant' })).toBe('idle');
+    // openTodos present but nothing left → still idle (task delivered).
+    expect(deriveSessionBoardColumn({ status: 'idle', openTodos: { total: 3, done: 3, remaining: 0, hasInProgress: false } })).toBe('idle');
+  });
+
+  it('routes an idle process with unfinished todos to the "待办" (todo) column', () => {
+    expect(deriveSessionBoardColumn({ status: 'idle', openTodos: { total: 3, done: 1, remaining: 2, hasInProgress: false } })).toBe('todo');
+    expect(deriveSessionBoardColumn({ status: 'dormant', openTodos: { total: 2, done: 0, remaining: 2, hasInProgress: true } })).toBe('todo');
+  });
+
+  it('keeps running/needs-you state ahead of the todo task-state', () => {
+    // 运行态优先：机器还在跑就归「进行中」，即便有未完成 todo。
+    expect(deriveSessionBoardColumn({ status: 'working', openTodos: { total: 3, done: 1, remaining: 2, hasInProgress: true } })).toBe('working');
+    // needs-you 信号仍最高优先。
+    expect(deriveSessionBoardColumn({ status: 'idle', pendingRepo: true, openTodos: { total: 3, done: 1, remaining: 2, hasInProgress: false } })).toBe('needs-you');
   });
 });

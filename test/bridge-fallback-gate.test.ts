@@ -1,12 +1,23 @@
 import { describe, it, expect } from 'vitest';
 import {
-  BRIDGE_NO_REPLY_SENTINEL,
+  BRIDGE_NOTHING_TO_SEND_SENTINEL,
+  BRIDGE_NO_REPLY_SENTINEL_LEGACY,
   buildBridgeSendMarkerContent,
   buildBridgeSendPreviewText,
+  bridgePostText,
+  isBridgeNothingToSendFinal,
   shouldEmitEmptyCompletedBridgeFallback,
+  shouldEmitFailedBridgeFallback,
   shouldSuppressBridgeEmit,
+  structuredFallbackKind,
+  stripTrailingBridgeSentinelLine,
+  stripTrailingOaiMemoryCitation,
   type BridgeSendMarker,
 } from '../src/services/bridge-fallback-gate.js';
+import {
+  CODEX_CONNECTION_ERROR_CODE,
+  CODEX_RATE_LIMIT_ERROR_CODE,
+} from '../src/services/codex-transcript.js';
 
 const turn = (markTimeMs: number | undefined, isLocal: boolean | undefined = false) =>
   ({ markTimeMs, isLocal });
@@ -18,6 +29,179 @@ const markerForContent = (sentAtMs: number, content: string): BridgeSendMarker =
     ...buildBridgeSendMarkerContent(content),
   } as BridgeSendMarker;
 };
+
+const memoryCitation = (lineEnding = '\n', rolloutIds = '019c1234') => [
+  '<oai-mem-citation>',
+  '<citation_entries>',
+  'MEMORY.md:10-12|note=[routing context]',
+  '</citation_entries>',
+  '<rollout_ids>',
+  rolloutIds,
+  '</rollout_ids>',
+  '</oai-mem-citation>',
+].join(lineEnding);
+
+describe('stripTrailingOaiMemoryCitation', () => {
+  it('strips only a complete citation suffix and its separator', () => {
+    expect(stripTrailingOaiMemoryCitation(`Visible answer.\n\n${memoryCitation()}`))
+      .toBe('Visible answer.');
+    expect(stripTrailingOaiMemoryCitation(memoryCitation())).toBe('');
+  });
+
+  it('accepts CRLF, trailing whitespace, and an empty rollout_ids section', () => {
+    expect(stripTrailingOaiMemoryCitation(`Visible answer.\r\n\r\n${memoryCitation('\r\n', '')}\r\n  `))
+      .toBe('Visible answer.');
+  });
+
+  it('preserves middle-of-body occurrences and fenced examples', () => {
+    const middle = `${memoryCitation()}\n\nMore visible prose.`;
+    expect(stripTrailingOaiMemoryCitation(middle)).toBe(middle);
+
+    const fenced = `Example:\n\n\`\`\`xml\n${memoryCitation()}\n\`\`\``;
+    expect(stripTrailingOaiMemoryCitation(fenced)).toBe(fenced);
+  });
+
+  it('preserves inline, malformed, and incomplete blocks', () => {
+    const inline = `answer ${memoryCitation()}`;
+    expect(stripTrailingOaiMemoryCitation(inline)).toBe(inline);
+
+    const missingRollouts = '<oai-mem-citation>\n<citation_entries>x</citation_entries>\n</oai-mem-citation>';
+    expect(stripTrailingOaiMemoryCitation(missingRollouts)).toBe(missingRollouts);
+
+    const unclosed = '<oai-mem-citation>\n<citation_entries>x</citation_entries>\n<rollout_ids>';
+    expect(stripTrailingOaiMemoryCitation(unclosed)).toBe(unclosed);
+  });
+
+  it('stops each section at its first closing tag', () => {
+    const extraCitationText = [
+      '<oai-mem-citation>',
+      '<citation_entries>first</citation_entries>',
+      'visible text after the first closing tag',
+      '<citation_entries>second</citation_entries>',
+      '<rollout_ids>019c1234</rollout_ids>',
+      '</oai-mem-citation>',
+    ].join('\n');
+    expect(stripTrailingOaiMemoryCitation(extraCitationText)).toBe(extraCitationText);
+
+    const extraRolloutText = [
+      '<oai-mem-citation>',
+      '<citation_entries>entry</citation_entries>',
+      '<rollout_ids>first</rollout_ids>',
+      'visible text after the first closing tag',
+      '<rollout_ids>second</rollout_ids>',
+      '</oai-mem-citation>',
+    ].join('\n');
+    expect(stripTrailingOaiMemoryCitation(extraRolloutText)).toBe(extraRolloutText);
+  });
+
+  it('handles a large malformed suffix without combinatorial backtracking', () => {
+    const repeatedCandidates = '</citation_entries><citation_entries>x'.repeat(25_000);
+    const malformed = `<oai-mem-citation><citation_entries>${repeatedCandidates}`
+      + '<rollout_ids>missing final envelope';
+    expect(stripTrailingOaiMemoryCitation(malformed)).toBe(malformed);
+  });
+});
+
+describe('stripTrailingBridgeSentinelLine', () => {
+  it('bare sentinel strips to empty (genuine silence)', () => {
+    expect(stripTrailingBridgeSentinelLine(BRIDGE_NOTHING_TO_SEND_SENTINEL)).toBe('');
+    expect(stripTrailingBridgeSentinelLine(`  ${BRIDGE_NOTHING_TO_SEND_SENTINEL}\n`)).toBe('');
+    // legacy token too
+    expect(stripTrailingBridgeSentinelLine(BRIDGE_NO_REPLY_SENTINEL_LEGACY)).toBe('');
+  });
+
+  it('prose + trailing sentinel line strips to just the prose (the real answer)', () => {
+    expect(stripTrailingBridgeSentinelLine(`Here is the answer.\n\n${BRIDGE_NOTHING_TO_SEND_SENTINEL}`))
+      .toBe('Here is the answer.');
+    // legacy token, single blank line before it
+    expect(stripTrailingBridgeSentinelLine(`Line one\nLine two\n${BRIDGE_NO_REPLY_SENTINEL_LEGACY}`))
+      .toBe('Line one\nLine two');
+  });
+
+  it('leaves finals whose last non-empty line is NOT a bare sentinel untouched', () => {
+    // token inline in a sentence
+    const inline = `I will stay quiet. ${BRIDGE_NOTHING_TO_SEND_SENTINEL}`;
+    expect(stripTrailingBridgeSentinelLine(inline)).toBe(inline);
+    // token followed by more prose (not trailing)
+    const notTrailing = `${BRIDGE_NOTHING_TO_SEND_SENTINEL}\n\nActually here is more.`;
+    expect(stripTrailingBridgeSentinelLine(notTrailing)).toBe(notTrailing);
+    // ordinary answer, no sentinel at all
+    expect(stripTrailingBridgeSentinelLine('just a normal reply')).toBe('just a normal reply');
+  });
+
+  it('preserves interior blank lines but trims those orphaned before the stripped sentinel', () => {
+    expect(stripTrailingBridgeSentinelLine(`para one\n\npara two\n\n${BRIDGE_NOTHING_TO_SEND_SENTINEL}`))
+      .toBe('para one\n\npara two');
+  });
+
+  it('peels a trailing RUN of consecutive sentinels (codex #791 leak edge)', () => {
+    const NEW = BRIDGE_NOTHING_TO_SEND_SENTINEL;
+    const OLD = BRIDGE_NO_REPLY_SENTINEL_LEGACY;
+    // pure repeated token → empty (old gate suppressed the whole turn; a
+    // one-line strip would have left a literal token to leak)
+    expect(stripTrailingBridgeSentinelLine(`${NEW}\n${NEW}`)).toBe('');
+    expect(stripTrailingBridgeSentinelLine(`${NEW}\n\n${NEW}`)).toBe('');
+    // new + legacy mixed in the run → empty
+    expect(stripTrailingBridgeSentinelLine(`${NEW}\n${OLD}`)).toBe('');
+    expect(stripTrailingBridgeSentinelLine(`${OLD}\n\n${NEW}\n${NEW}`)).toBe('');
+    // prose + repeated / mixed tokens → just the prose (all tokens peeled)
+    expect(stripTrailingBridgeSentinelLine(`answer\n${NEW}\n${OLD}`)).toBe('answer');
+    expect(stripTrailingBridgeSentinelLine(`answer\n\n${NEW}\n${NEW}`)).toBe('answer');
+  });
+});
+
+describe('bridgePostText (adopt sentinel contract — codex #791 blocker)', () => {
+  it('non-adopt strips a trailing sentinel line (posts the prose)', () => {
+    expect(bridgePostText(`Here is the answer.\n\n${BRIDGE_NOTHING_TO_SEND_SENTINEL}`, false))
+      .toBe('Here is the answer.');
+    // bare sentinel → empty (caller skips on !adopt empty-guard)
+    expect(bridgePostText(BRIDGE_NOTHING_TO_SEND_SENTINEL, false)).toBe('');
+  });
+
+  it('ADOPT preserves sentinel text verbatim', () => {
+    // The adopted CLI is botmux-unaware; transcript drain is its only channel and
+    // it may output the literal token as content. Stripping here would truncate a
+    // real answer / drop a verbatim-token reply. shouldSuppressBridgeEmit(adopt)
+    // already refuses to interpret the sentinel; this keeps the two consistent.
+    const prose = `Here is the answer.\n\n${BRIDGE_NOTHING_TO_SEND_SENTINEL}`;
+    expect(bridgePostText(prose, true)).toBe(prose);
+    // a pure-token adopt final is returned as-is (NOT emptied)
+    expect(bridgePostText(BRIDGE_NOTHING_TO_SEND_SENTINEL, true)).toBe(BRIDGE_NOTHING_TO_SEND_SENTINEL);
+    // legacy token, verbatim under adopt too
+    expect(bridgePostText(BRIDGE_NO_REPLY_SENTINEL_LEGACY, true)).toBe(BRIDGE_NO_REPLY_SENTINEL_LEGACY);
+  });
+
+  it('leaves ordinary answers untouched in both modes', () => {
+    expect(bridgePostText('a normal reply', false)).toBe('a normal reply');
+    expect(bridgePostText('a normal reply', true)).toBe('a normal reply');
+  });
+
+  it('removes memory citation metadata from fallback output in both modes', () => {
+    const finalText = `Visible fallback.\n\n${memoryCitation()}`;
+    expect(bridgePostText(finalText, false)).toBe('Visible fallback.');
+    expect(bridgePostText(finalText, true)).toBe('Visible fallback.');
+  });
+});
+
+describe('isBridgeNothingToSendFinal', () => {
+  it('true only when the final is empty after stripping a trailing sentinel', () => {
+    expect(isBridgeNothingToSendFinal(BRIDGE_NOTHING_TO_SEND_SENTINEL)).toBe(true);
+    expect(isBridgeNothingToSendFinal(`\n  ${BRIDGE_NO_REPLY_SENTINEL_LEGACY}\n`)).toBe(true);
+    // repeated / mixed tokens with no prose is still pure silence (codex #791)
+    expect(isBridgeNothingToSendFinal(`${BRIDGE_NOTHING_TO_SEND_SENTINEL}\n${BRIDGE_NOTHING_TO_SEND_SENTINEL}`)).toBe(true);
+    expect(isBridgeNothingToSendFinal(`${BRIDGE_NO_REPLY_SENTINEL_LEGACY}\n\n${BRIDGE_NOTHING_TO_SEND_SENTINEL}`)).toBe(true);
+  });
+
+  it('false for prose + sentinel (there is a real answer to forward)', () => {
+    expect(isBridgeNothingToSendFinal(`Here is the answer.\n\n${BRIDGE_NOTHING_TO_SEND_SENTINEL}`)).toBe(false);
+  });
+
+  it('false for finals with no trailing sentinel at all', () => {
+    expect(isBridgeNothingToSendFinal('a normal reply')).toBe(false);
+    expect(isBridgeNothingToSendFinal(undefined)).toBe(false);
+    expect(isBridgeNothingToSendFinal('')).toBe(false);
+  });
+});
 
 describe('buildBridgeSendMarkerContent', () => {
   it('keeps normalized length semantics and a newline-preserving dashboard preview', () => {
@@ -61,31 +245,115 @@ describe('buildBridgeSendMarkerContent', () => {
 });
 
 describe('shouldSuppressBridgeEmit', () => {
-  it('non-adopt: exact no-reply sentinel suppresses without a send marker', () => {
+  it('compares visible marker/final lengths without memory citation metadata', () => {
+    const visible = 'The answer already sent to the user.';
+    const withCitation = `${visible}\n\n${memoryCitation()}`;
+    const marker = markerForContent(150, withCitation);
+    expect(marker.contentLength).toBe(normalise(visible).length);
+    expect(marker.previewText).toBe(visible);
     expect(shouldSuppressBridgeEmit(
-      { ...turn(100), finalText: `  ${BRIDGE_NO_REPLY_SENTINEL}\n` },
+      { ...turn(100), finalText: withCitation },
+      200,
+      [marker],
+      false,
+    )).toBe(true);
+  });
+
+  it('non-adopt: exact nothing-to-send sentinel suppresses without a send marker', () => {
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: `  ${BRIDGE_NOTHING_TO_SEND_SENTINEL}\n` },
       undefined,
       [],
       false,
     )).toBe(true);
   });
 
-  it('non-adopt: prose then a standalone sentinel LINE suppresses the whole turn', () => {
-    // The real-world shape: the model explains the silence, then appends the
-    // token on its own trailing line. Full-string exact match let this leak.
+  it('non-adopt: the legacy no-reply token is still recognized as a pure-silence sentinel', () => {
+    // Rollout / restore safety: sessions spawned before the rename still carry
+    // the old token in their captured system prompt. A BARE legacy token (empty
+    // after stripping) is still genuine silence → suppress, so the literal token
+    // never leaks into Lark. (Prose + legacy token is covered below as the
+    // ghosting/strip-and-forward case.)
     expect(shouldSuppressBridgeEmit(
-      { ...turn(100), finalText: `Codex acknowledged and is reviewing. Nothing for me to do — no reply needed.\n\n${BRIDGE_NO_REPLY_SENTINEL}` },
+      { ...turn(100), finalText: `  ${BRIDGE_NO_REPLY_SENTINEL_LEGACY}\n` },
       undefined,
       [],
       false,
     )).toBe(true);
+  });
+
+  it('non-adopt: prose then a standalone sentinel line is NOT silence (strip-and-forward)', () => {
+    // Behavior change (the ghosting fix): earlier this whole turn was dropped,
+    // which lost the real answer of a model that did work, forgot to `botmux
+    // send`, and ended with the sentinel. Now the prose is a real answer with no
+    // send marker → NOT suppressed; callers strip the sentinel line and post the
+    // prose. (Bare-sentinel silence stays suppressed — see the case above.)
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: `Codex acknowledged and is reviewing. Here is the summary you asked for.\n\n${BRIDGE_NOTHING_TO_SEND_SENTINEL}` },
+      undefined,
+      [],
+      false,
+    )).toBe(false);
+  });
+
+  it('non-adopt: prose + sentinel IS suppressed when the model already sent the same content in-window', () => {
+    // The strip-and-forward path must still honor send markers: if the prose was
+    // already delivered via `botmux send`, forwarding it again would duplicate.
+    // The gate compares the SENTINEL-STRIPPED final against the marker length.
+    const prose = 'Here is the full answer to your question, delivered explicitly.';
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: `${prose}\n\n${BRIDGE_NOTHING_TO_SEND_SENTINEL}` },
+      500,
+      [{ sentAtMs: 200, ...buildBridgeSendMarkerContent(prose) }],
+      false,
+    )).toBe(true);
+  });
+
+  it('non-adopt: trailing sentinel + ANY in-window send suppresses long narration (real-world leak)', () => {
+    // The reported bug: the model `botmux send`s a short message, then writes a
+    // long block of NARRATION/thinking it deliberately keeps out of chat, and
+    // ends the final with the sentinel. The narration is materially LONGER than
+    // the send, so the length heuristic (markerSetCoversFinal) alone judged it a
+    // new substantive answer and RE-POSTED the narration. A trailing sentinel +
+    // any in-window marker now suppresses unconditionally: the sentinel is the
+    // model's explicit "nothing more to send" after it already sent.
+    const shortSend = 'On it.';
+    const longNarration =
+      "The screenshot subagent is running. I'll wait for it to save the file(s), "
+      + 'then send them via botmux send --images and stop the server. No message '
+      + 'needed until I have the files.';
+    expect(longNarration.length).toBeGreaterThan(shortSend.length * 2); // would trip material-longer
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: `${longNarration}\n\n${BRIDGE_NOTHING_TO_SEND_SENTINEL}` },
+      500,
+      [{ sentAtMs: 200, ...buildBridgeSendMarkerContent(shortSend) }],
+      false,
+    )).toBe(true);
+  });
+
+  it('non-adopt: NO trailing sentinel + long final still posts even with a short prior send (unchanged)', () => {
+    // Guard the narrowing: the sentinel is what flips a longer-than-send final to
+    // suppressed. WITHOUT a trailing sentinel, a materially longer final is still
+    // treated as a genuine follow-up answer and posts (preserves the pre-existing
+    // "short progress update then a substantive final" behavior).
+    const shortSend = 'Working on it.';
+    const longFinal = 'Here is the complete, substantive answer that is materially '
+      + 'longer than the short progress note I sent earlier, with real content '
+      + 'that clearly exceeds the material-longer threshold by a wide margin here.';
+    // sanity: this final IS materially longer than the send (would post on its own)
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: longFinal },
+      500,
+      [{ sentAtMs: 200, ...buildBridgeSendMarkerContent(shortSend) }],
+      false,
+    )).toBe(false);
   });
 
   it('non-adopt: token inline in a prose sentence is not guessed away', () => {
     // Last non-empty line is a full sentence (token mid-line), not a bare
     // sentinel — a normal answer that merely mentions the token.
     expect(shouldSuppressBridgeEmit(
-      { ...turn(100), finalText: `I will stay silent instead of replying. ${BRIDGE_NO_REPLY_SENTINEL}` },
+      { ...turn(100), finalText: `I will stay silent instead of replying. ${BRIDGE_NOTHING_TO_SEND_SENTINEL}` },
       undefined,
       [],
       false,
@@ -94,16 +362,16 @@ describe('shouldSuppressBridgeEmit', () => {
 
   it('non-adopt: sentinel followed by more prose still posts (not a terminator)', () => {
     expect(shouldSuppressBridgeEmit(
-      { ...turn(100), finalText: `${BRIDGE_NO_REPLY_SENTINEL}\n\nActually, here is the answer you asked for.` },
+      { ...turn(100), finalText: `${BRIDGE_NOTHING_TO_SEND_SENTINEL}\n\nActually, here is the answer you asked for.` },
       undefined,
       [],
       false,
     )).toBe(false);
   });
 
-  it('adopt mode does not interpret the no-reply sentinel', () => {
+  it('adopt mode does not interpret the nothing-to-send sentinel', () => {
     expect(shouldSuppressBridgeEmit(
-      { ...turn(100), finalText: BRIDGE_NO_REPLY_SENTINEL },
+      { ...turn(100), finalText: BRIDGE_NOTHING_TO_SEND_SENTINEL },
       undefined,
       [],
       true,
@@ -333,5 +601,121 @@ describe('shouldEmitEmptyCompletedBridgeFallback', () => {
       [],
       false,
     )).toBe(false);
+  });
+});
+
+describe('shouldEmitFailedBridgeFallback', () => {
+  it('emits for an empty failed turn with no explicit reply', () => {
+    expect(shouldEmitFailedBridgeFallback(
+      { ...turn(100), finalText: '', terminalStatus: 'failed' },
+      undefined,
+      [],
+      false,
+    )).toBe(true);
+  });
+
+  it('does not duplicate a send or affect completed, local, and adopt turns', () => {
+    expect(shouldEmitFailedBridgeFallback(
+      { ...turn(100), finalText: '', terminalStatus: 'failed' },
+      200,
+      [markerForContent(150, 'already reported')],
+      false,
+    )).toBe(false);
+    expect(shouldEmitFailedBridgeFallback(
+      { ...turn(100), finalText: '', terminalStatus: 'completed' },
+      undefined,
+      [],
+      false,
+    )).toBe(false);
+    expect(shouldEmitFailedBridgeFallback(
+      { ...turn(100, true), finalText: '', terminalStatus: 'failed' },
+      undefined,
+      [],
+      false,
+    )).toBe(false);
+    expect(shouldEmitFailedBridgeFallback(
+      { ...turn(100), finalText: '', terminalStatus: 'failed' },
+      undefined,
+      [],
+      true,
+    )).toBe(false);
+  });
+
+  it('keeps the failure visible when the provider also returned partial text', () => {
+    expect(shouldEmitFailedBridgeFallback(
+      { ...turn(100), finalText: 'partial answer', terminalStatus: 'failed' },
+      undefined,
+      [],
+      false,
+    )).toBe(true);
+  });
+});
+
+describe('structuredFallbackKind', () => {
+  it('TRAE 429 (no dedicated rate-limit chain) falls through to the generic failed fallback', () => {
+    // The regression this guards: TRAE has no structured rate-limit chain, so
+    // skipping the generic failed fallback for codex_rate_limited posted
+    // nothing at all — "misleading but visible" regressed into "silent".
+    expect(structuredFallbackKind(
+      { ...turn(100), finalText: '', terminalStatus: 'failed', terminalErrorCode: CODEX_RATE_LIMIT_ERROR_CODE },
+      undefined,
+      [],
+      false,
+      false, // hasDedicatedRateLimitChain=false (TRAE)
+    )).toBe('failed');
+  });
+
+  it('Codex 429 (dedicated chain) skips the generic failed fallback', () => {
+    // Codex's maybeEmitCodexStructuredRateLimit already surfaces the limit, so
+    // the generic failed fallback must not double-post.
+    expect(structuredFallbackKind(
+      { ...turn(100), finalText: '', terminalStatus: 'failed', terminalErrorCode: CODEX_RATE_LIMIT_ERROR_CODE },
+      undefined,
+      [],
+      false,
+      true, // hasDedicatedRateLimitChain=true (Codex)
+    )).not.toBe('failed');
+  });
+
+  it('a non-rate-limit failure maps to the failed fallback with or without a chain', () => {
+    for (const hasChain of [false, true]) {
+      expect(structuredFallbackKind(
+        { ...turn(100), finalText: '', terminalStatus: 'failed', terminalErrorCode: CODEX_CONNECTION_ERROR_CODE },
+        undefined,
+        [],
+        false,
+        hasChain,
+      )).toBe('failed');
+    }
+  });
+
+  it('a non-empty final maps to final', () => {
+    expect(structuredFallbackKind(
+      { ...turn(100), finalText: 'answer' },
+      undefined,
+      [],
+      false,
+      false,
+    )).toBe('final');
+  });
+
+  it('an empty completed turn with no markers maps to empty_completed', () => {
+    expect(structuredFallbackKind(
+      { ...turn(100), finalText: '' },
+      undefined,
+      [],
+      false,
+      false,
+    )).toBe('empty_completed');
+  });
+
+  it('a turn suppressed by an in-window send marker maps to none', () => {
+    expect(structuredFallbackKind(
+      { ...turn(100), finalText: '' },
+      undefined,
+      [{ sentAtMs: 150 }],
+      false,
+      false,
+    )).toBe('none');
   });
 });

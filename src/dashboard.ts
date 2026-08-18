@@ -11,16 +11,25 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
+import { gracefulProcessExitCode } from './pm2-graceful-exit.js';
 import { config, isWildcardBindHost } from './config.js';
 import { listenWithProbe } from './utils/listen-with-probe.js';
 import {
-  generateToken, parseCookie, buildSetCookie, verifyHmac, cliAuthBind, decideDashboardAuth,
-  loadPersistedToken, loadOrCreatePersistedToken, persistToken,
-  loadDashboardSecret, loadOrCreateDashboardSecret,
+  parseCookie, buildSetCookie, verifyHmac, cliAuthBind, decideDashboardAuth,
+  loadPersistedToken, loadOrCreatePersistedToken, rotatePersistedToken,
+  loadDashboardSecret, loadOrCreateDashboardSecret, describeDashboardTokenError,
 } from './dashboard/auth.js';
 import { DaemonRegistry, botsRosterSignature } from './dashboard/registry.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
+import { reconcileDaemonSnapshot } from './dashboard/daemon-reconcile.js';
 import { createSessionPresentationCoordinator } from './dashboard/session-presentation.js';
+import {
+  compactGroupsMatrix,
+  createGroupsMatrixSnapshot,
+  enrichSessionsWithGroupNames,
+  roleWriteShouldInvalidate,
+  type GroupsMatrix,
+} from './dashboard/groups-matrix-snapshot.js';
 import {
   parseDashboardAskAnswerRequest,
   proxyDashboardAskAnswer,
@@ -47,6 +56,8 @@ import {
   redactSettingsForPublic,
 } from './dashboard/public-redact.js';
 import { handleWebhookRoute } from './dashboard/webhook-routes.js';
+import { handleFeedbackAnalyticsApi } from './dashboard/feedback-analytics-api.js';
+import { FeedbackAnalyticsService } from './services/feedback-analytics.js';
 import { handleFederationApi } from './dashboard/federation-api.js';
 import { buildFederatedRoster } from './services/federation-roster.js';
 import { resolveLiveBotTransport } from './services/team-roster.js';
@@ -72,6 +83,7 @@ import {
   type DashboardUrls,
 } from './core/dashboard-url.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
+import { parseCloseResidual, type ParsedCloseResidual } from './core/close-residual.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { getGitRepoInfo } from './core/session-row-enrichment.js';
 import { deleteWhiteboard, listWhiteboards, readWhiteboard, whiteboardEnabled } from './services/whiteboard-store.js';
@@ -113,6 +125,7 @@ import {
   writeRestartIntent,
 } from './services/restart-intent-store.js';
 import { withFileLock } from './utils/file-lock.js';
+import { evaluateRestartShutdownPreflight } from './cli/restart-shutdown-preflight.js';
 import { spawn } from 'node:child_process';
 import {
   applySettingsWrite,
@@ -132,7 +145,7 @@ import {
 import { createDaemonInternalApi } from './dashboard/daemon-internal-api.js';
 import { listTeamReports, readTeamBoard, setTeamBoardEntry } from './services/team-board-store.js';
 import type { CliId } from './adapters/cli/types.js';
-import { createCliAdapterSync } from './adapters/cli/registry.js';
+import { ALL_CLI_IDS, createCliAdapterSync } from './adapters/cli/registry.js';
 import type { ConnectorDefinition } from './services/connector-store.js';
 import { hd2dAssetPath, hd2dStatus, startHd2dDownload } from './dashboard/hd2d-assets.js';
 import {
@@ -141,10 +154,29 @@ import {
   readSkillRegistry,
   removeInstalledSkill,
   removeInstalledSkills,
+  sweepStoreTrash,
   updateInstalledSkillAsync,
 } from './services/skill-registry-store.js';
+import { readSkillPackRegistry } from './services/skill-pack-store.js';
+import { dashboardSessionActionTimeoutMs, type DashboardSessionAction } from './dashboard/session-action-timeout.js';
+import {
+  cloneSkillPack,
+  createSkillPack,
+  deleteSkillPack,
+  getSkillPack,
+  listSkillPacks,
+  updateSkillPack,
+  SkillPackStoreError,
+} from './services/skill-pack-store.js';
 import { redactGitUrlCredentials } from './core/skills/sources.js';
+import {
+  enrichPackForDashboard,
+  enrichPacksForDashboard,
+  sanitizeSkillForDashboard,
+} from './dashboard/skill-pack-response.js';
 import { effectiveDefaultWorkingDir, getBot, loadBotConfigs, parseBotConfigsFromText, type BotConfig, type VcMeetingAgentConfig } from './bot-registry.js';
+import { addChatToFeedGroup, createFeedGroup, FEED_GROUP_SCOPES, FeedGroupApiError, listFeedGroups } from './dashboard/feed-groups.js';
+import { generateAuthUrl, handleCallbackUrl, isCallbackUrl } from './utils/user-token.js';
 import { findEntryIndex, readRawConfig, requireConfigPath, writeRawConfigAtomic } from './services/config-store.js';
 import {
   emitCodexNotifierOutboxItem,
@@ -157,11 +189,11 @@ import {
   runCodexSideConversationMonitor,
   runCodexNotifierWorkerSupervisor,
 } from './features/codex-notifier/index.js';
-import type { BotSkillPolicy, SkillPackage } from './core/skills/types.js';
+import type { BotSkillPolicy, SkillPack, SkillPackage, SkillSelector } from './core/skills/types.js';
 import { discoverNativeCliSkillGroups } from './core/skills/discovery.js';
-import { analyzeSkillReferences, type SkillReferenceBot, type SkillReferenceSummary } from './core/skills/references.js';
+import { analyzeSkillReferences, packsContainingSkill, type SkillReferenceBot, type SkillReferenceSummary } from './core/skills/references.js';
 import { discoverDashboardSkills, installDashboardSkill, parseDashboardSkillInstallRequest, parseInstallLocalLinksSources, MAX_LOCAL_LINK_SOURCES } from './dashboard/skill-install-request.js';
-import { botDefaultsPayload, botSummaryPayload } from './dashboard/bot-payload.js';
+import { botDefaultsPayload, botSummaryPayload, brandMapByAppId } from './dashboard/bot-payload.js';
 import {
   handleVcMeetingConsumerProfilesGet,
   handleVcMeetingConsumerProfilesPut,
@@ -197,7 +229,7 @@ import { maybeInstallTraexPluginOnSettingsChange, TRAEX_RECOMMENDED_SOURCE, TRAE
 import { deriveCreateGroupName, selectCreateSessionTargets } from './core/session-create.js';
 import { parseDashboardImageUploads } from './core/dashboard-images.js';
 import { checkLarkCliVersion, MIN_LARK_CLI_VERSION_FOR_VC_BOT } from './vc-agent/polling-source.js';
-import { larkHosts } from './im/lark/lark-hosts.js';
+import { larkHosts, normalizeBrand } from './im/lark/lark-hosts.js';
 import { buildResourceMonitorDaemonSeeds, createResourceMonitorService, handleResourceMonitorApi, toResourceMonitorSessionSeed } from './dashboard/resource-monitor-service.js';
 import { readPluginRegistry } from './services/plugin-registry-store.js';
 import { pluginRuntimeDir, resolvePluginPath } from './core/plugins/paths.js';
@@ -209,6 +241,19 @@ import { assertPluginBindingTransition, describePluginDependencyError } from './
 import { inspectGatewayEntry } from './core/plugins/mcp/gateway-installer.js';
 import type { InstalledPluginRecord, PluginDashboardEntry } from './core/plugins/types.js';
 import { fetchDaemonIpc } from './core/daemon-ipc-auth.js';
+import {
+  buildDashboardSummary,
+  parseDashboardSummaryRows,
+} from './dashboard/dashboard-summary.js';
+import { createDashboardSummaryEndpoint } from './dashboard/dashboard-summary-endpoint.js';
+import { scrubWorkflowWorkerEnv } from './utils/child-env.js';
+
+// The dashboard is an independent long-lived PM2 app and can be resurrected
+// from a stale dump.pm2 without passing through cli.ts pm2Env(). Its start/stop
+// and detached-restart children inherit process.env, so a leaked workflow
+// marker would make those CLI commands fail at the workflow safety gate before
+// they can reach their own cleanup boundary.
+scrubWorkflowWorkerEnv(process.env);
 
 const SECRET_PATH = dashboardSecretPath();
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
@@ -219,7 +264,8 @@ const BOTS_JSON_PATH = join(homedir(), '.botmux', 'bots.json');
 const REGISTRY_DIR = join(resolveBotmuxDataDir(), 'dashboard-daemons');
 // The dashboard probes upward if its configured port is busy (e.g. a second
 // botmux instance on this host). The actually-bound port is persisted here so
-// the `botmux dashboard` CLI can reach /__cli/rotate without guessing.
+// the `botmux dashboard` CLI can reach /__cli/current, /__cli/ensure, and
+// /__cli/rotate without guessing.
 const PORT_PATH = join(homedir(), '.botmux', '.dashboard-port');
 
 function loadOrCreateSecret(): string {
@@ -243,16 +289,21 @@ function loadOrCreateSecret(): string {
   }
 }
 
-// The active dashboard token is persisted to disk so a previously-issued
-// dashboard URL survives `botmux restart`. A platform-bound dashboard creates
-// the first token on startup; only `botmux dashboard` (the /__cli/rotate
-// endpoint) replaces it and thereby invalidates the old link.
-// The start/restart hint reads it via the non-rotating /__cli/current endpoint
-// so it can show the live link without invalidating it.
-let activeToken: string | null = loadPersistedToken(TOKEN_PATH);
+// The persisted file is the active-token authority. Reading it at each use
+// keeps multiple dashboard processes coherent: first creation converges under
+// a file lock, and an explicit rotation is observed by every process without a
+// restart. `/__cli/current` remains a strictly read-only probe.
+function currentDashboardToken(): string | null {
+  try {
+    return loadPersistedToken(TOKEN_PATH);
+  } catch (error) {
+    logger.warn(`[dashboard] Failed to read token from ${TOKEN_PATH}: ${(error as Error).message}`);
+    return null;
+  }
+}
 
 // The port we actually bound (may differ from config.dashboard.port after an
-// EADDRINUSE probe). Used for the rotation-URL and persisted for the CLI.
+// EADDRINUSE probe). Used for token-bearing URLs and persisted for the CLI.
 let boundDashboardPort = config.dashboard.port;
 
 const SECRET = loadOrCreateSecret();
@@ -310,6 +361,16 @@ mkdirSync(REGISTRY_DIR, { recursive: true });
 const registry = new DaemonRegistry(REGISTRY_DIR);
 const aggregator = new Aggregator();
 const sessionPresentation = createSessionPresentationCoordinator(aggregator, getGitRepoInfo);
+const groupsMatrixSnapshot = createGroupsMatrixSnapshot(buildGroupsMatrix, {
+  onRefreshError: error => logger.warn(`[dashboard] groups matrix refresh failed: ${String(error)}`),
+});
+let groupsRosterSignature = botsRosterSignature(registry.list());
+registry.on((online) => {
+  const next = botsRosterSignature(online);
+  if (next === groupsRosterSignature) return;
+  groupsRosterSignature = next;
+  groupsMatrixSnapshot.invalidate();
+});
 
 // Keep Git-derived fields in the central read-model so REST snapshots and SSE
 // share one row shape. Idle/limited turn boundaries force a branch refresh
@@ -321,7 +382,7 @@ aggregator.on(sessionPresentation.onEvent);
 // 调试终端（owner-only 裸 bash）。默认工作目录取当前所有 session 的工作目录去重，
 // 让 owner 从熟悉的目录起终端复现问题；都没有时模块内退回 homedir。
 const debugTerminalManager = createDebugTerminalManager({
-  getActiveToken: () => activeToken,
+  getActiveToken: currentDashboardToken,
   defaultWorkingDirs: () => {
     const dirs = new Set<string>();
     for (const s of aggregator.getSessions()) {
@@ -769,7 +830,7 @@ function vcMeetingConsumerProfilesApiDeps(): VcMeetingConsumerProfilesApiDeps {
         return false;
       }
     },
-    managedSideEffectIsolation: bot => evaluateVcMeetingConsumerIsolation({
+    managedSideEffectEligible: bot => evaluateVcMeetingConsumerIsolation({
       sandbox: bot.sandbox,
       platform: process.platform,
       backendType: resolvePairedSpawnBackendType(
@@ -779,6 +840,19 @@ function vcMeetingConsumerProfilesApiDeps(): VcMeetingConsumerProfilesApiDeps {
         config.daemon.backendType,
       ),
     }).ok,
+    sandboxIsolated: bot => {
+      const decision = evaluateVcMeetingConsumerIsolation({
+        sandbox: bot.sandbox,
+        platform: process.platform,
+        backendType: resolvePairedSpawnBackendType(
+          bot.cliId ?? config.daemon.cliId,
+          undefined,
+          bot.backendType,
+          config.daemon.backendType,
+        ),
+      });
+      return decision.ok && decision.isolated;
+    },
     reloadDaemons: reloadVcMeetingBotConfigOnDaemons,
   };
 }
@@ -1217,14 +1291,15 @@ const groupsActionDeps: GroupsActionDeps = {
   proxyToDaemon,
   closeSessionsMatching,
   fetch: fetchDaemonUrl,
+  invalidateGroups: () => groupsMatrixSnapshot.invalidate(),
 };
 
 // ─── PR2 C8: Route B internal API (`/__daemon/*`) ───────────────────────────
 // HMAC + loopback + ts ±60s + nonce TTL, signed-request envelope = full
 // (ts, nonce, method, pathWithQuery, sha256(body)). Reuses `.dashboard-secret`
-// for the HMAC key — the same secret `/__cli/rotate` already uses — but the
-// signing material is wider so a `/__cli/rotate` signature cannot be replayed
-// here and vice versa (different protocols, same secret, no cross-replay).
+// for the HMAC key — the same secret the `/__cli/*` protocol uses — but the
+// signing material is wider so a CLI signature cannot be replayed here and
+// vice versa (different protocols, same secret, no cross-replay).
 //
 // SECRET fail-closed: `loadOrCreateSecret()` returns a 32-byte base64url
 // string and never empty; we still guard below at server-startup time.
@@ -1238,7 +1313,7 @@ const daemonInternalApi = createDaemonInternalApi({
   getSessions: () => aggregator.getSessions(),
   getSchedules: () => aggregator.getSchedules(),
   resolveDashboardSettings,
-  buildGroupsMatrix,
+  buildGroupsMatrix: () => groupsMatrixSnapshot.get(),
   settingsApplierDeps: settingsWriteApplierDeps,
   groupsActionDeps,
   proxyToDaemon,
@@ -1375,19 +1450,34 @@ function runGlobalInstall(plan: GlobalInstallPlan): Promise<void> {
 
 /**
  * Attach to one daemon: hydrate its sessions/schedules into the aggregator,
- * THEN open the SSE subscription. Order matters — hydrating after subscribe
- * would let snapshot data clobber events that arrived between subscribe and
- * the snapshot fetch.
+ * THEN open the SSE subscription.
+ *
+ * The subscription runs a snapshot barrier (subscribeDaemon's `onConnected`):
+ * after every stream establishment — the first included — and BEFORE any
+ * frame is read, we install a fresh authoritative snapshot while incoming
+ * frames stay queued in the stream; frames then apply on top in order. This
+ * gives two guarantees at once:
+ *
+ * 1. No reverse clobber: the barrier snapshot is installed before any frame
+ *    is applied, so a slow snapshot response can never overwrite state that
+ *    a faster SSE event already delivered (a naive post-subscribe hydrate
+ *    would).
+ * 2. No forward gap: events fired between step 1 below and the stream
+ *    handshake are picked up by the barrier snapshot, and events missed
+ *    during a drop are recovered by the barrier re-run on reconnect.
+ *
+ * The blocking hydrate in step 1 still matters: it populates the cache
+ * before the dashboard starts serving, and keeps a daemon's last-known
+ * state visible even if its SSE stream never connects.
  *
  * Idempotent: a second call for the same daemon while one is in flight is a
- * no-op; a call after attach finished re-hydrates (useful when a daemon
- * restarts and we want to refresh its slice of the cache).
+ * no-op; the subscription itself is installed once.
  */
 async function attachDaemon(d: import('./dashboard/registry.js').DaemonInfo): Promise<void> {
   if (attaching.has(d.larkAppId)) return;
   attaching.add(d.larkAppId);
   try {
-    // 1. Hydrate snapshot (blocking — completes before we wire SSE)
+    // 1. Blocking snapshot (see above)
     try {
       const [sRes, schRes] = await Promise.all([
         fetchDaemonIpc(d.ipcPort, '/api/sessions'),
@@ -1400,22 +1490,47 @@ async function attachDaemon(d: import('./dashboard/registry.js').DaemonInfo): Pr
       ));
       aggregator.hydrateSessions(d.larkAppId, rows);
       for (const row of rows) sessionPresentation.schedule(d.larkAppId, row);
-      aggregator.hydrateSchedules(sch.schedules ?? []);
+      aggregator.hydrateSchedules(d.larkAppId, sch.schedules ?? []);
     } catch (e: any) {
       logger.warn(`[dashboard] hydrate ${d.larkAppId}: ${e.message ?? e}`);
     }
-    // 2. Open SSE subscription if not already (idempotent)
+    // 2. Open SSE subscription if not already (idempotent). The barrier
+    //    below runs inside subscribeDaemon, after the stream is established.
     if (!subs.has(d.larkAppId)) {
       subs.set(
         d.larkAppId,
         subscribeDaemon(d, aggregator, e =>
           logger.warn(`[aggregator] ${d.larkAppId}: ${e.message}`),
           (_url, init) => fetchDaemonIpc(d.ipcPort, '/api/events', init),
+          // Snapshot barrier: install an authoritative snapshot before any
+          // frame is read. Frames arriving during this fetch stay queued in
+          // the stream and apply afterwards, so the snapshot can never
+          // clobber fresher SSE state; on reconnect it recovers missed
+          // events. The subscription signal is the generation arbitration:
+          // if aborted mid-flight (daemon offline, newer generation), the
+          // snapshot is discarded instead of clobbering the new generation.
+          signal => reconcileDaemon(d, signal),
         ),
       );
     }
   } finally {
     attaching.delete(d.larkAppId);
+  }
+}
+
+/**
+ * Reconcile one daemon's snapshot into the aggregator (subscribeDaemon
+ * barrier). Thin wrapper over reconcileDaemonSnapshot that also schedules
+ * presentation enrichment for the session rows.
+ */
+async function reconcileDaemon(
+  d: import('./dashboard/registry.js').DaemonInfo,
+  signal: AbortSignal,
+): Promise<void> {
+  const snapshot = await reconcileDaemonSnapshot(d, aggregator, signal);
+  if (!snapshot) return;
+  for (const row of snapshot.sessions) {
+    sessionPresentation.schedule(d.larkAppId, row);
   }
 }
 
@@ -1915,7 +2030,11 @@ async function handlePluginManagementApi(
 
 // ─── HTTP routing ────────────────────────────────────────────────────────────
 
-function authedToken(req: IncomingMessage, url: URL): string | undefined {
+function authedToken(
+  req: IncomingMessage,
+  url: URL,
+  activeToken: string | null,
+): string | undefined {
   const q = url.searchParams.get('t');
   if (q && q === activeToken) return q;
   return parseCookie(req.headers.cookie);
@@ -2030,7 +2149,17 @@ function configuredCliIds(): Map<string, string> {
   }
 }
 
-function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string }> {
+/**
+ * per-bot brand（feishu / lark）按 appId 的映射,供前端派生飞书后台深链 host。
+ * 失败安全逻辑在 brandMapByAppId（返回空 Map,与 configuredCliIds /
+ * configuredBotAgentFields 同款兜底,见其 doc）——冷缓存 /api/groups 与
+ * /api/bots 仍走 DaemonRegistry 降级 roster,前端 normalizeBrand 兜底 feishu。
+ */
+function configuredBrands(): Map<string, string | undefined> {
+  return brandMapByAppId(loadBotConfigs);
+}
+
+function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number }> {
   try {
     return new Map(loadBotConfigs().map(b => [b.larkAppId, {
       cliId: b.cliId,
@@ -2041,18 +2170,20 @@ function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: 
       cliPathOverride: b.cliRuntime ? undefined : b.cliPathOverride,
       wrapperCli: b.wrapperCli,
       model: b.model,
+      reasoningEffort: b.reasoningEffort,
+      turnTimeoutMs: b.turnTimeoutMs,
     }]));
   } catch {
     return new Map();
   }
 }
 
-function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string }>(
+function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number }>(
   bot: T,
   ids: Map<string, string> | Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string }>,
-): T & { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string } {
+): T & { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number } {
   const raw = ids.get(bot.larkAppId);
-  const fallback = typeof raw === 'string' ? { cliId: raw } : raw;
+  const fallback: { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number } | undefined = typeof raw === 'string' ? { cliId: raw } : raw;
   return {
     ...bot,
     cliId: bot.cliId || fallback?.cliId,
@@ -2060,6 +2191,8 @@ function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliR
     cliPathOverride: bot.cliPathOverride || fallback?.cliPathOverride,
     wrapperCli: bot.wrapperCli || fallback?.wrapperCli,
     model: bot.model || fallback?.model,
+    reasoningEffort: bot.reasoningEffort || fallback?.reasoningEffort,
+    turnTimeoutMs: bot.turnTimeoutMs ?? fallback?.turnTimeoutMs,
   };
 }
 
@@ -2149,6 +2282,7 @@ async function createTeamGroup(args: { name: string; larkAppIds: string[]; userO
     if (!upstream.ok || !parsed?.ok || typeof parsed.chatId !== 'string') {
       return { ok: false, error: parsed?.error ?? `group_create_http_${upstream.status}` };
     }
+    groupsMatrixSnapshot.invalidate();
     return {
       ok: true,
       chatId: parsed.chatId,
@@ -2186,6 +2320,7 @@ async function transferTeamGroupOwner(args: {
         transferError: parsed?.error ?? `owner_transfer_http_${upstream.status}`,
       };
     }
+    groupsMatrixSnapshot.invalidate();
     return {
       ownerTransferredTo: parsed.ownerTransferredTo ?? null,
       transferError: parsed.transferError ?? null,
@@ -2243,6 +2378,7 @@ async function createLifecycleGroupForWebhook(
   if (!upstream.ok || !parsed?.ok || typeof parsed.chatId !== 'string') {
     throw new Error(parsed?.error ?? `group_create_http_${upstream.status}`);
   }
+  groupsMatrixSnapshot.invalidate();
   return { chatId: parsed.chatId, creatorLarkAppId: parsed.creator ?? pick.creatorLarkAppId };
 }
 
@@ -2252,7 +2388,7 @@ async function createLifecycleGroupForWebhook(
  * always returns the raw (unscrubbed) view — the browser route applies its
  * `redactGroupsForPublic` scrub on top when the caller is unauthed.
  */
-async function buildGroupsMatrix(): Promise<{ chats: any[]; bots: any[] }> {
+async function buildGroupsMatrix(): Promise<GroupsMatrix> {
   const out = new Map<string, any>();
   const cliIds = configuredCliIds();
   const onlineBots = [...registry.list()]
@@ -2308,7 +2444,11 @@ async function buildGroupsMatrix(): Promise<{ chats: any[]; bots: any[] }> {
       return (a.name ?? a.chatId).localeCompare(b.name ?? b.chatId);
     })
     .map(({ _firstSeenAt, ...rest }) => rest);
-  const bots = onlineBots.map(botSummaryPayload);
+  // brand 是 bots.json 的 per-bot 字段（DaemonRegistry 的心跳态不带它），
+  // 从 configuredBrands（失败安全,返空 Map）按 appId 补进 summary,供前端
+  // 派生飞书后台深链 host；冷缓存 / 缺配置时前端 normalizeBrand 兜底 feishu。
+  const brandByAppId = configuredBrands();
+  const bots = onlineBots.map(d => botSummaryPayload({ ...d, brand: brandByAppId.get(d.larkAppId) }));
   return { chats, bots };
 }
 
@@ -2320,7 +2460,7 @@ async function buildGroupsMatrix(): Promise<{ chats: any[]; bots: any[] }> {
  */
 async function closeSessionsMatching(
   pred: (s: any) => boolean,
-): Promise<{ sessionId: string; ok: boolean; error?: string }[]> {
+): Promise<{ sessionId: string; ok: boolean; error?: string; residual?: ParsedCloseResidual }[]> {
   const matching = aggregator.getSessions().filter(s => s.status !== 'closed' && pred(s));
   return Promise.all(matching.map(async s => {
     try {
@@ -2332,9 +2472,11 @@ async function closeSessionsMatching(
       const text = await upstream.text();
       let body: any = null;
       try { body = JSON.parse(text); } catch { /* tolerate */ }
+      const residual = body?.ok ? parseCloseResidual(body) : undefined;
       return {
         sessionId: s.sessionId as string,
         ok: !!body?.ok,
+        ...(residual ? { residual } : {}),
         error: body?.ok ? undefined : (body?.error ?? `http_${upstream.status}`),
       };
     } catch (e: any) {
@@ -2468,16 +2610,13 @@ function startSkillJob(type: SkillJob['type'], run: () => Promise<SkillPackage |
   return job;
 }
 
-function sanitizeSkillForDashboard(skill: SkillPackage): SkillPackage {
-  if (skill.source.type !== 'git') return skill;
-  return {
-    ...skill,
-    source: { ...skill.source, url: redactGitUrlCredentials(skill.source.url) },
-  };
-}
-
 function dashboardSkillCliIds(): CliId[] {
   const ids = new Set<CliId>();
+  // Always scan all known CLI skill dirs, not just configured bots — users may
+  // want to discover codex/trae/... skills even before creating a bot for them.
+  // Derived from the closed Record<CliId,…> in the registry — a hand-typed
+  // literal here silently omitted reasonix and mojo, hiding their skill dirs.
+  for (const cliId of ALL_CLI_IDS) ids.add(cliId);
   try {
     for (const cliId of configuredCliIds().values()) ids.add(cliId as CliId);
   } catch {
@@ -2506,6 +2645,73 @@ function dashboardSkillsPayload(): Record<string, unknown> {
   };
 }
 
+// --- Skill pack dashboard helpers ------------------------------------------
+
+function loadBotConfigsSafe(): BotConfig[] {
+  try { return loadBotConfigs(); } catch { return []; }
+}
+
+function botsReferencingPack(packId: string, bots: BotConfig[]): Array<{ larkAppId: string; botName: string }> {
+  const selector = `pack:${packId}`;
+  return bots
+    .filter((bot) => Array.isArray(bot.skills?.include) && bot.skills!.include!.includes(selector as SkillSelector))
+    .map((bot) => ({ larkAppId: bot.larkAppId, botName: bot.name ?? bot.larkAppId }))
+    .sort((a, b) => a.botName.localeCompare(b.botName));
+}
+
+function parsePackInput(body: unknown): { id: string; name: string; description?: string; tags?: string[]; include: Array<`skill:${string}`> } {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw new SkillPackStoreError({ code: 'SKILL_PACK_INVALID', reason: 'body must be an object' });
+  const b = body as Record<string, unknown>;
+  return {
+    id: typeof b.id === 'string' ? b.id : '',
+    name: typeof b.name === 'string' ? b.name : '',
+    description: typeof b.description === 'string' ? b.description : undefined,
+    tags: Array.isArray(b.tags) ? b.tags as string[] : undefined,
+    include: Array.isArray(b.include) ? b.include as Array<`skill:${string}`> : [],
+  };
+}
+
+function parsePackUpdate(body: unknown): { name?: string; description?: string | null; tags?: string[] | null; include?: Array<`skill:${string}`>; expectedRevision?: number } {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw new SkillPackStoreError({ code: 'SKILL_PACK_INVALID', reason: 'body must be an object' });
+  const b = body as Record<string, unknown>;
+  return {
+    name: typeof b.name === 'string' ? b.name : undefined,
+    description: b.description === null ? null : typeof b.description === 'string' ? b.description : undefined,
+    tags: b.tags === null ? null : Array.isArray(b.tags) ? b.tags as string[] : undefined,
+    include: Array.isArray(b.include) ? b.include as Array<`skill:${string}`> : undefined,
+    expectedRevision: typeof b.expectedRevision === 'number' ? b.expectedRevision : undefined,
+  };
+}
+
+function packErrorStatus(err: unknown): number {
+  if (err instanceof SkillPackStoreError) {
+    switch (err.detail.code) {
+      case 'SKILL_PACK_NOT_FOUND': return 404;
+      case 'SKILL_PACK_ID_CONFLICT': return 409;
+      case 'SKILL_PACK_REVISION_CONFLICT': return 409;
+      case 'SKILL_PACK_IN_USE': return 409;
+      default: return 400;
+    }
+  }
+  return 400;
+}
+
+function packErrorBody(err: unknown): { ok: false; error: string; [key: string]: unknown } {
+  if (err instanceof SkillPackStoreError) {
+    const d = err.detail;
+    const body: { ok: false; error: string; [key: string]: unknown } = { ok: false, error: d.code };
+    if (d.code === 'SKILL_PACK_REVISION_CONFLICT') body.current = d.current;
+    if (d.code === 'SKILL_PACK_INVALID') body.reason = d.reason;
+    if (d.code === 'SKILL_PACK_INVALID_SELECTOR') body.selector = d.selector;
+    return body;
+  }
+  return {
+    ok: false,
+    error: 'internal_error',
+    detail: redactGitUrlCredentials(err instanceof Error ? err.message : String(err)),
+  };
+}
+
 function mergeSkillReferenceBot(refs: Map<string, SkillReferenceBot>, ref: SkillReferenceBot): void {
   const current = refs.get(ref.larkAppId);
   if (!current) {
@@ -2518,11 +2724,17 @@ function mergeSkillReferenceBot(refs: Map<string, SkillReferenceBot>, ref: Skill
 async function dashboardSkillReferencesMany(skillNames: readonly string[]): Promise<Map<string, SkillReferenceSummary>> {
   const uniqueNames = [...new Set(skillNames)];
   const refsBySkill = new Map(uniqueNames.map(name => [name, new Map<string, SkillReferenceBot>()]));
+  let packs: Record<string, SkillPack> | undefined;
+  try {
+    packs = readSkillPackRegistry().packs;
+  } catch {
+    // packs.json may be absent; fall back to direct-only analysis.
+  }
   try {
     const configuredBots = loadBotConfigs();
     for (const name of uniqueNames) {
       const refs = refsBySkill.get(name)!;
-      for (const ref of analyzeSkillReferences(name, { bots: configuredBots }).bots) mergeSkillReferenceBot(refs, ref);
+      for (const ref of analyzeSkillReferences(name, { bots: configuredBots, packs }).bots) mergeSkillReferenceBot(refs, ref);
     }
   } catch {
     // Fall back to online daemon data below when the dashboard process cannot
@@ -2545,15 +2757,16 @@ async function dashboardSkillReferencesMany(skillNames: readonly string[]): Prom
   const availableOnlineConfigs = onlineConfigs.filter(config => config !== null);
   for (const name of uniqueNames) {
     const refs = refsBySkill.get(name)!;
-    for (const ref of analyzeSkillReferences(name, { bots: availableOnlineConfigs }).bots) mergeSkillReferenceBot(refs, ref);
+    for (const ref of analyzeSkillReferences(name, { bots: availableOnlineConfigs, packs }).bots) mergeSkillReferenceBot(refs, ref);
   }
   return new Map([...refsBySkill].map(([name, refs]) => [name, {
     bots: [...refs.values()].sort((a, b) => a.botName.localeCompare(b.botName)),
+    packs: packsContainingSkill(name, packs),
   }]));
 }
 
 async function dashboardSkillReferences(skillName: string): Promise<SkillReferenceSummary> {
-  return (await dashboardSkillReferencesMany([skillName])).get(skillName) ?? { bots: [] };
+  return (await dashboardSkillReferencesMany([skillName])).get(skillName) ?? { bots: [], packs: [] };
 }
 
 /** Extract the sessionId from a terminal path `/s/<sessionId>[/...]`. Returns
@@ -2563,6 +2776,59 @@ function parseTerminalSessionId(pathname: string): string | undefined {
   if (!pathname.startsWith('/s/')) return undefined;
   const seg = pathname.slice(3).split('/')[0];
   return seg || undefined;
+}
+
+/**
+ * Read every currently-online daemon directly for the public dashboard
+ * summary. The regular aggregator intentionally retains offline
+ * rows for operator history, so using it here would make an offline bot's old
+ * sessions or schedules look live. A failed or malformed daemon snapshot
+ * rejects the whole projection instead of silently turning missing data into
+ * zeroes.
+ */
+async function liveDashboardSummary(): Promise<ReturnType<typeof buildDashboardSummary>> {
+  const daemons = registry.list();
+  const configuredBots = loadBotConfigs();
+  const snapshots = await Promise.all(daemons.map(async daemon => {
+    const [sessionsResponse, schedulesResponse] = await Promise.all([
+      fetchDaemonIpc(daemon.ipcPort, '/api/sessions', {
+        signal: AbortSignal.timeout(2_000),
+      }),
+      fetchDaemonIpc(daemon.ipcPort, '/api/schedules', {
+        signal: AbortSignal.timeout(2_000),
+      }),
+    ]);
+    if (!sessionsResponse.ok || !schedulesResponse.ok) {
+      throw new Error('daemon_snapshot_http_error');
+    }
+    const [sessionsBody, schedulesBody] = await Promise.all([
+      sessionsResponse.json() as Promise<{ sessions?: unknown }>,
+      schedulesResponse.json() as Promise<{ schedules?: unknown }>,
+    ]);
+    return parseDashboardSummaryRows({
+      sessions: sessionsBody.sessions,
+      schedules: schedulesBody.schedules,
+    });
+  }));
+
+  return buildDashboardSummary({
+    generatedAt: new Date(),
+    configuredBotAppIds: configuredBots.map(bot => bot.larkAppId),
+    onlineBotAppIds: daemons.map(daemon => daemon.larkAppId),
+    sessions: snapshots.flatMap(snapshot => snapshot.sessions),
+    schedules: snapshots.flatMap(snapshot => snapshot.schedules),
+  });
+}
+
+const dashboardSummaryEndpoint = createDashboardSummaryEndpoint({
+  load: liveDashboardSummary,
+  onError: error => {
+    logger.warn(`[dashboard-summary] live snapshot unavailable: ${error instanceof Error ? error.message : String(error)}`);
+  },
+});
+let feedbackAnalyticsService: FeedbackAnalyticsService | undefined;
+function analyticsService(): FeedbackAnalyticsService {
+  return feedbackAnalyticsService ??= new FeedbackAnalyticsService(config.session.dataDir);
 }
 
 const server = createServer(async (req, res) => {
@@ -2586,7 +2852,8 @@ const server = createServer(async (req, res) => {
     // outside the browser auth gate so packaged desktop apps can decide whether
     // this runtime speaks their dashboard protocol before loading the SPA.
     if (req.method === 'GET' && url.pathname === '/__desktop/compat') {
-      const presentedToken = authedToken(req, url);
+      const activeToken = currentDashboardToken();
+      const presentedToken = authedToken(req, url, activeToken);
       const boundMachineId = activeToken && presentedToken === activeToken
         ? readPlatformBinding()?.machineId
         : null;
@@ -2660,29 +2927,88 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // CLI rotate (HMAC + loopback only) — for `botmux dashboard`. Mints a fresh
-    // token, invalidating any previously-issued link.
+    // OAuth 回调接收页（/oauth/callback）— 也在 cookie/token gate 之前：飞书
+    // authorize 跳回来的浏览器请求不带 dashboard token（redirect_uri 固定），
+    // 挡在门外用户就只能回到人肉贴 URL 的旧流程。安全面：URL 里只有一次性
+    // code + 随机 state；处理方仍要求 state 命中某个 daemon 进程的 pending
+    // 表（5 分钟过期、一次即焚）并用 app_secret 换 token——本页面自身不持有
+    // 任何敏感能力，等价于把「用户手工回贴」自动化。
+    if (req.method === 'GET' && url.pathname === '/oauth/callback') {
+      const page = (title: string, body: string, ok: boolean) => {
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+        res.end(`<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title><body style="font-family:system-ui;display:flex;align-items:center;justify-content:center;min-height:90vh;background:#f5f6f8"><div style="text-align:center;padding:32px 40px;background:#fff;border-radius:16px;box-shadow:0 4px 24px rgba(0,0,0,.08)"><div style="font-size:56px">${ok ? '✅' : '❌'}</div><h2 style="margin:12px 0 8px">${title}</h2><p style="color:#666;max-width:420px">${body}</p></div></body>`);
+      };
+      if (!url.searchParams.get('code') || !url.searchParams.get('state')) {
+        page('回调参数缺失', '未收到授权码。请回到 Dashboard 重新发起授权。', false);
+        return;
+      }
+      // state 只在生成链接的那个 daemon 进程内存里，逐个询问在线 daemon。
+      let outcome: { ok: boolean; message: string } | null = null;
+      for (const d of registry.list()) {
+        try {
+          const r = await fetchDaemonIpc(d.ipcPort, '/api/oauth-callback', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ url: url.toString() }),
+          });
+          const j: any = await r.json().catch(() => null);
+          if (j?.matched) { outcome = { ok: !!j.ok, message: String(j.message ?? '') }; break; }
+        } catch { /* daemon offline mid-iteration — try the next */ }
+      }
+      if (!outcome) {
+        page('授权未完成', '没有找到等待中的授权请求（可能已超时，链接有效期 5 分钟）。请回到 Dashboard 重新点击授权。', false);
+        return;
+      }
+      page(
+        outcome.ok ? '授权完成' : '授权失败',
+        outcome.ok ? '已完成授权，本页可以关闭。回到 Dashboard 即可看到状态更新。' : outcome.message,
+        outcome.ok,
+      );
+      return;
+    }
+
+    // CLI rotate (HMAC + loopback only) — for `botmux dashboard rotate`.
+    // Publish the new token only after a durable write succeeds.
     if (req.method === 'POST' && url.pathname === '/__cli/rotate') {
       const gate = verifyCliRequest(req, url.pathname);
       if (!gate.ok) return jsonRes(res, gate.status, gate.body);
-      activeToken = generateToken();
       try {
-        persistToken(TOKEN_PATH, activeToken);
+        const token = rotatePersistedToken(TOKEN_PATH);
+        return jsonRes(res, 200, dashboardUrlsFor(token));
       } catch (e) {
         logger.warn(`[dashboard] Failed to persist token to ${TOKEN_PATH}: ${(e as Error).message}`);
+        return jsonRes(res, 500, describeDashboardTokenError('token_persist_failed', e, TOKEN_PATH));
       }
-      return jsonRes(res, 200, dashboardUrlsFor(activeToken));
     }
 
-    // CLI read current URL (HMAC + loopback only) — for the start/restart hint.
-    // Unlike /__cli/rotate this does NOT mint a token, so an already-issued
-    // dashboard link survives restart untouched. 404 → no token has ever been
-    // minted (caller falls back to suggesting `botmux dashboard`).
+    // CLI get-or-create URL (HMAC + loopback only). Existing links survive
+    // untouched; the first caller atomically creates and persists a token.
+    if (req.method === 'POST' && url.pathname === '/__cli/ensure') {
+      const gate = verifyCliRequest(req, url.pathname);
+      if (!gate.ok) return jsonRes(res, gate.status, gate.body);
+      try {
+        const token = loadOrCreatePersistedToken(TOKEN_PATH);
+        return jsonRes(res, 200, dashboardUrlsFor(token));
+      } catch (e) {
+        logger.warn(`[dashboard] Failed to ensure token at ${TOKEN_PATH}: ${(e as Error).message}`);
+        return jsonRes(res, 500, describeDashboardTokenError('token_persist_failed', e, TOKEN_PATH));
+      }
+    }
+
+    // CLI read current URL (HMAC + loopback only) — for start/restart hints and
+    // safe port discovery. This never mints a token.
     if (req.method === 'POST' && url.pathname === '/__cli/current') {
       const gate = verifyCliRequest(req, url.pathname);
       if (!gate.ok) return jsonRes(res, gate.status, gate.body);
-      if (!activeToken) return jsonRes(res, 404, { error: 'no_active_token' });
-      return jsonRes(res, 200, dashboardUrlsFor(activeToken));
+      let token: string | null;
+      try {
+        token = loadPersistedToken(TOKEN_PATH);
+      } catch (e) {
+        logger.warn(`[dashboard] Failed to read token from ${TOKEN_PATH}: ${(e as Error).message}`);
+        return jsonRes(res, 500, describeDashboardTokenError('token_unavailable', e, TOKEN_PATH));
+      }
+      if (!token) return jsonRes(res, 404, { error: 'no_active_token' });
+      return jsonRes(res, 200, dashboardUrlsFor(token));
     }
 
     // CLI 通知绑定变化（HMAC + loopback）——`botmux bind` 写完绑定后捅一下，立即重连平台，
@@ -2705,7 +3031,8 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, 200, { ok: true });
     }
 
-    const presentedToken = authedToken(req, url);
+    const activeToken = currentDashboardToken();
+    const presentedToken = authedToken(req, url, activeToken);
     const globalDashboardConfig = readGlobalConfig().dashboard;
     const decision = decideDashboardAuth({
       method: req.method ?? 'GET',
@@ -2746,6 +3073,11 @@ const server = createServer(async (req, res) => {
         error: 'legacy_workflow_retired',
         message: 'v2 workflow dashboard APIs are retired; use /api/v3/runs for v3 run visibility',
       });
+    }
+
+    if (url.pathname.startsWith('/api/feedback/analytics/')) {
+      await handleFeedbackAnalyticsApi(req, res, url, { service: analyticsService() });
+      return;
     }
 
     if (req.method === 'GET' && url.pathname === '/__dev/reload') {
@@ -2845,6 +3177,12 @@ const server = createServer(async (req, res) => {
 
     // ─── Public API (cookie/token already validated above) ──────────────────
 
+    if (req.method === 'GET' && url.pathname === '/api/dashboard/v1/summary') {
+      const result = await dashboardSummaryEndpoint.get({ authenticated: authed });
+      for (const [name, value] of Object.entries(result.headers)) res.setHeader(name, value);
+      return jsonRes(res, result.status, result.body);
+    }
+
     if (await handleResourceMonitorApi(req, res, url, resourceMonitor)) {
       return;
     }
@@ -2854,12 +3192,13 @@ const server = createServer(async (req, res) => {
       // raw appId as botName — resolve through the live registry so consumers
       // (dashboard, HD2D office tab) always see the human-facing name.
       const names = new Map([...registry.list()].map(d => [d.larkAppId, d.botName] as const));
-      const sessions = aggregator.getSessions().map(s => {
+      groupsMatrixSnapshot.warm();
+      const sessions = enrichSessionsWithGroupNames(aggregator.getSessions().map(s => {
         const n = names.get(s.larkAppId);
         return n && n !== s.larkAppId && (!s.botName || s.botName === s.larkAppId)
           ? { ...s, botName: n }
           : s;
-      });
+      }), groupsMatrixSnapshot.peekPresentation());
       return jsonRes(res, 200, {
         sessions: authed ? sessions : redactSessionsForPublic(sessions),
       });
@@ -2943,9 +3282,14 @@ const server = createServer(async (req, res) => {
           // else (incl. an unparseable/missing body) as a failure rather than a
           // silent success.
           const ok = upstream.ok && parsed?.ok === true;
+          // A residual is NOT a failure (the row closed) but must not be counted
+          // as a clean close either: an idle/workerless mojo row can carry a
+          // parked lineage, so this path really does produce them.
+          const residual = ok ? parseCloseResidual(parsed) : undefined;
           return {
             sessionId: s.sessionId,
             ok,
+            ...(residual ? { residual } : {}),
             error: ok ? undefined : (parsed?.error ?? `http_${upstream.status}`),
           };
         } catch (e: any) {
@@ -3330,6 +3674,25 @@ const server = createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/update/restart') {
       if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
       if (updateInFlight) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+      // The real restart runs in a detached `botmux restart` child, whose
+      // shutdown-capability throw would only reach the maintenance-restart log
+      // — the UI would then poll a reconnect that never happens and mislabel it
+      // as "restart is slow". Detect that fail-closed boundary synchronously so
+      // we can return a precise, actionable error instead of firing a restart
+      // that is guaranteed to die silently. A read failure is non-authoritative
+      // and falls through to the existing behavior (never fabricate a block).
+      try {
+        const preflight = evaluateRestartShutdownPreflight();
+        if (preflight.bootstrapRequired) {
+          return jsonRes(res, 409, {
+            ok: false,
+            error: 'bootstrap_shutdown_protocol_required',
+            unsafeDaemons: preflight.unsafeDaemonNames,
+          });
+        }
+      } catch (error) {
+        logger.warn(`[dashboard] restart shutdown-capability preflight unavailable: ${error instanceof Error ? error.message : error}`);
+      }
       let body: Record<string, unknown> = {};
       try {
         const parsed = await readJsonBody(req);
@@ -3403,7 +3766,14 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, 200, dashboardSkillsPayload());
     }
 
-    if (req.method === 'DELETE' && url.pathname === '/api/skills') {
+    // Batch skill removal. POST /api/skills/remove is the canonical route the
+    // dashboard UI calls: the payload (names[], force) must travel in the body,
+    // and DELETE bodies are dropped by the platform dashboard proxy (it assumes
+    // DELETE carries no body, forwards content-length but never pipes the bytes,
+    // so readJsonBody hangs until the outer gateway returns 504). DELETE
+    // /api/skills stays as an alias for direct/scripted callers.
+    if ((req.method === 'DELETE' && url.pathname === '/api/skills')
+      || (req.method === 'POST' && url.pathname === '/api/skills/remove')) {
       let parsed: unknown;
       try {
         parsed = await readJsonBody(req);
@@ -3421,10 +3791,14 @@ const server = createServer(async (req, res) => {
       if (missing.length > 0) return jsonRes(res, 400, { ok: false, error: 'skill_not_installed', missing });
 
       const referencesBySkill = await dashboardSkillReferencesMany(names);
-      const references = names.map(name => ({ name, refs: referencesBySkill.get(name) ?? { bots: [] } }));
+      const references = names.map(name => ({ name, refs: referencesBySkill.get(name) ?? { bots: [], packs: [] } }));
       const affectedSkills = references
-        .filter(item => item.refs.bots.length > 0)
-        .map(item => ({ name: item.name, affectedBots: item.refs.bots }));
+        .filter(item => item.refs.bots.length > 0 || item.refs.packs.length > 0)
+        .map(item => ({
+          name: item.name,
+          affectedBots: item.refs.bots,
+          affectedPacks: item.refs.packs,
+        }));
       if (body.force !== true && affectedSkills.length > 0) {
         return jsonRes(res, 409, {
           ok: false,
@@ -3548,11 +3922,12 @@ const server = createServer(async (req, res) => {
       const force = url.searchParams.get('force') === '1';
       if (!readSkillRegistry().skills[name]) return jsonRes(res, 400, { ok: false, error: 'skill_not_installed' });
       const refs = await dashboardSkillReferences(name);
-      if (!force && refs.bots.length > 0) {
+      if (!force && (refs.bots.length > 0 || refs.packs.length > 0)) {
         return jsonRes(res, 409, {
           ok: false,
           error: 'skill_in_use',
           affectedBots: refs.bots,
+          affectedPacks: refs.packs,
         });
       }
       const r = removeInstalledSkill(name);
@@ -3560,8 +3935,91 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, 200, {
         ok: true,
         affectedBots: refs.bots,
+        affectedPacks: refs.packs,
         ...dashboardSkillsPayload(),
       });
+    }
+
+    // --- Skill pack CRUD ---------------------------------------------------
+
+    if (req.method === 'GET' && url.pathname === '/api/skill-packs') {
+      const registrySkills = readSkillRegistry().skills;
+      const bots = loadBotConfigsSafe();
+      const packs = enrichPacksForDashboard(
+        listSkillPacks(),
+        registrySkills,
+        (packId) => botsReferencingPack(packId, bots),
+      );
+      return jsonRes(res, 200, { ok: true, packs });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/skill-packs') {
+      let body: unknown;
+      try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+      try {
+        const input = parsePackInput(body);
+        const pack = createSkillPack(input);
+        return jsonRes(res, 201, { ok: true, pack });
+      } catch (err) {
+        return jsonRes(res, packErrorStatus(err), packErrorBody(err));
+      }
+    }
+
+    let mPack: RegExpMatchArray | null;
+    if (req.method === 'GET' && (mPack = url.pathname.match(/^\/api\/skill-packs\/([^/]+)$/))) {
+      const id = decodeURIComponent(mPack[1]);
+      const pack = getSkillPack(id);
+      if (!pack) return jsonRes(res, 404, { ok: false, error: 'SKILL_PACK_NOT_FOUND' });
+      const registrySkills = readSkillRegistry().skills;
+      const bots = loadBotConfigsSafe();
+      return jsonRes(res, 200, {
+        ok: true,
+        pack: enrichPackForDashboard(pack, registrySkills, botsReferencingPack(pack.id, bots)),
+      });
+    }
+
+    if (req.method === 'PUT' && (mPack = url.pathname.match(/^\/api\/skill-packs\/([^/]+)$/))) {
+      const id = decodeURIComponent(mPack[1]);
+      let body: unknown;
+      try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+      try {
+        const input = parsePackUpdate(body);
+        const pack = updateSkillPack(id, input);
+        return jsonRes(res, 200, { ok: true, pack });
+      } catch (err) {
+        return jsonRes(res, packErrorStatus(err), packErrorBody(err));
+      }
+    }
+
+    if (req.method === 'DELETE' && (mPack = url.pathname.match(/^\/api\/skill-packs\/([^/]+)$/))) {
+      const id = decodeURIComponent(mPack[1]);
+      const force = url.searchParams.get('force') === '1';
+      const pack = getSkillPack(id);
+      if (!pack) return jsonRes(res, 404, { ok: false, error: 'SKILL_PACK_NOT_FOUND' });
+      const refs = botsReferencingPack(id, loadBotConfigsSafe());
+      if (!force && refs.length > 0) {
+        return jsonRes(res, 409, { ok: false, error: 'SKILL_PACK_IN_USE', references: refs });
+      }
+      try {
+        deleteSkillPack(id);
+        return jsonRes(res, 200, { ok: true, references: refs });
+      } catch (err) {
+        return jsonRes(res, packErrorStatus(err), packErrorBody(err));
+      }
+    }
+
+    if (req.method === 'POST' && (mPack = url.pathname.match(/^\/api\/skill-packs\/([^/]+)\/clone$/))) {
+      const id = decodeURIComponent(mPack[1]);
+      let body: unknown;
+      try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+      const newId = typeof (body as any)?.id === 'string' ? (body as any).id.trim() : '';
+      if (!newId) return jsonRes(res, 400, { ok: false, error: 'id_required' });
+      try {
+        const pack = cloneSkillPack(id, newId);
+        return jsonRes(res, 201, { ok: true, pack });
+      } catch (err) {
+        return jsonRes(res, packErrorStatus(err), packErrorBody(err));
+      }
     }
 
     if (req.method === 'GET' && url.pathname === '/api/whiteboards') {
@@ -3876,10 +4334,27 @@ const server = createServer(async (req, res) => {
 
     let m: RegExpMatchArray | null;
     if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(close|locate|resume|restart|start)$/))) {
-      const sid = decodeURIComponent(m[1]); const op = m[2];
+      const sid = decodeURIComponent(m[1]); const op = m[2] as DashboardSessionAction;
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
-      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/${op}`, { method: 'POST' });
+      // Defensive client-side deadline: the daemon side of every op here replies
+      // promptly (close resolves its fence on the worker's flushed ACK; restart/
+      // resume/start return after a fire-and-forget IPC). Close gets a separate
+      // 60s budget because Riff's 23s remote-cancel prepare and 29s worker-kill
+      // backstop are serialized; all other actions stay bounded at 15s.
+      let upstream: Response;
+      try {
+        upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/${op}`, {
+          method: 'POST',
+          signal: AbortSignal.timeout(dashboardSessionActionTimeoutMs(op)),
+        });
+      } catch (err: any) {
+        const timedOut = err?.name === 'TimeoutError' || err?.name === 'AbortError';
+        return jsonRes(res, timedOut ? 504 : 502, {
+          ok: false,
+          error: timedOut ? 'daemon_timeout' : (err?.message ?? String(err)),
+        });
+      }
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
       return;
@@ -4112,7 +4587,12 @@ const server = createServer(async (req, res) => {
       // route and the Route B `/__daemon/groups-matrix` endpoint return the
       // same matrix shape. Public-read carve-out: oncall bindings carry
       // workingDir (repo/customer paths) so we scrub when unauthed.
-      const matrix = await buildGroupsMatrix();
+      const matrix = await groupsMatrixSnapshot.get({
+        force: authed && url.searchParams.get('refresh') === '1',
+      });
+      if (url.searchParams.get('view') === 'compact') {
+        return jsonRes(res, 200, compactGroupsMatrix(matrix));
+      }
       return jsonRes(res, 200, {
         chats: authed ? matrix.chats : redactGroupsForPublic(matrix.chats),
         bots: matrix.bots,
@@ -4154,14 +4634,25 @@ const server = createServer(async (req, res) => {
           headers: { 'content-type': 'application/json' },
           body: raw,
         });
+        const upstreamText = await upstream.text();
+        let upstreamJson: any = null;
+        try { upstreamJson = JSON.parse(upstreamText); } catch { /* leave null */ }
+        // 写角色会翻转群矩阵里的 hasRole → 失效快照，避免 roles 页「已配置」
+        // 徽标最多陈旧 30s（对齐 oncall bind/unbind、建群/加 bot 的失效）。
+        if (roleWriteShouldInvalidate(upstream.ok, upstreamJson)) groupsMatrixSnapshot.invalidate();
         res.writeHead(upstream.status, { 'content-type': 'application/json' });
-        res.end(await upstream.text());
+        res.end(upstreamText);
         return;
       }
       if (req.method === 'DELETE') {
         const upstream = await proxyToDaemon(larkAppId, `/api/roles/${encodeURIComponent(chatId)}`, { method: 'DELETE' });
+        const upstreamText = await upstream.text();
+        let upstreamJson: any = null;
+        try { upstreamJson = JSON.parse(upstreamText); } catch { /* leave null */ }
+        // 删角色会把 hasRole 翻回 false — 失效快照让徽标立即刷新，不等 30s TTL。
+        if (roleWriteShouldInvalidate(upstream.ok, upstreamJson)) groupsMatrixSnapshot.invalidate();
         res.writeHead(upstream.status, { 'content-type': 'application/json' });
-        res.end(await upstream.text());
+        res.end(upstreamText);
         return;
       }
     }
@@ -4326,8 +4817,15 @@ const server = createServer(async (req, res) => {
         headers: { 'content-type': 'application/json' },
         body: raw,
       });
+      const upstreamText = await upstream.text();
+      let upstreamJson: any = null;
+      try { upstreamJson = JSON.parse(upstreamText); } catch { /* leave null */ }
+      // 只有真正改写了角色文件（changed:true）才失效缓存：preview、被拒
+      // （chat_role_exists）、missing_entry 都不动 hasRole，跟着失效只会白白
+      // 打穿 30s 快照、把 PR 的 fan-out 优化抵消掉（判定在 roleWriteShouldInvalidate）。
+      if (roleWriteShouldInvalidate(upstream.ok, upstreamJson)) groupsMatrixSnapshot.invalidate();
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
+      res.end(upstreamText);
       return;
     }
 
@@ -4474,7 +4972,14 @@ const server = createServer(async (req, res) => {
 
     if (req.method === 'GET' && url.pathname === '/api/bots') {
       const agentFields = configuredBotAgentFields();
-      const onlineBots = [...registry.list()].map(b => withConfiguredCliId(b, agentFields)).sort((a, b) => a.botIndex - b.botIndex);
+      // brand 是 bots.json 的 per-bot 字段（DaemonRegistry 心跳态不带它），
+      // 从 configuredBrands（失败安全,返空 Map）按 appId 补进每个 descriptor,
+      // 供前端派生飞书后台深链 host;缺配置时前端 normalizeBrand 兜底 feishu。
+      const brandByAppId = configuredBrands();
+      const onlineBots = [...registry.list()]
+        .map(b => withConfiguredCliId(b, agentFields))
+        .map(b => ({ ...b, brand: brandByAppId.get(b.larkAppId) }))
+        .sort((a, b) => a.botIndex - b.botIndex);
       const out = await Promise.all(onlineBots.map(async d => {
         try {
           const r = await fetchDaemonIpc(d.ipcPort, '/api/bot-default-oncall');
@@ -4497,6 +5002,8 @@ const server = createServer(async (req, res) => {
               : d.cliPathOverride,
             wrapperCli: j.wrapperCli || d.wrapperCli,
             model: j.model || d.model,
+            reasoningEffort: j.reasoningEffort || d.reasoningEffort,
+            turnTimeoutMs: typeof j.turnTimeoutMs === 'number' ? j.turnTimeoutMs : d.turnTimeoutMs,
           }, j);
         } catch (e: any) {
           return botDefaultsPayload(d, undefined, e?.message ?? String(e));
@@ -4664,6 +5171,30 @@ const server = createServer(async (req, res) => {
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
       return;
+    }
+
+    let mBotFeedback: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotFeedback = url.pathname.match(/^\/api\/bots\/([^/]+)\/feedback$/))) {
+      const appId = decodeURIComponent(mBotFeedback[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-feedback`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: raw });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    const mChatFeedback = url.pathname.match(/^\/api\/bots\/([^/]+)\/chats\/([^/]+)\/feedback$/);
+    if (req.method === 'PUT' && mChatFeedback) {
+      const chunks: Buffer[] = []; for await (const c of req) chunks.push(c as Buffer);
+      const upstream = await proxyToDaemon(decodeURIComponent(mChatFeedback[1]), `/api/chat-feedback/${encodeURIComponent(decodeURIComponent(mChatFeedback[2]))}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: Buffer.concat(chunks).toString('utf8') || '{}' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' }); res.end(await upstream.text()); return;
+    }
+    const mEffectiveFeedback = url.pathname.match(/^\/api\/bots\/([^/]+)\/feedback\/effective$/);
+    if (req.method === 'GET' && mEffectiveFeedback) {
+      const upstream = await proxyToDaemon(decodeURIComponent(mEffectiveFeedback[1]), `/api/feedback-effective${url.search}`, { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' }); res.end(await upstream.text()); return;
     }
 
     // PUT /api/bots/:appId/env — proxy to that bot's daemon. Body
@@ -4871,9 +5402,37 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // 会话群标签授权（Dashboard 一站式）：GET status / POST auth-link，
+    // 均代理到对应 bot 的 daemon（state 必须驻留在生成链接的进程内）。
+    let mBotTagAuth: RegExpMatchArray | null;
+    if (mBotTagAuth = url.pathname.match(/^\/api\/bots\/([^/]+)\/session-group-tag-(status|auth|config)$/)) {
+      const appId = decodeURIComponent(mBotTagAuth[1]);
+      const kind = mBotTagAuth[2];
+      const methodOk = (kind === 'status' && req.method === 'GET')
+        || (kind === 'auth' && req.method === 'POST')
+        || (kind === 'config' && req.method === 'PUT');
+      if (methodOk) {
+        let body: string | undefined;
+        if (req.method !== 'GET') {
+          const chunks: Buffer[] = [];
+          for await (const c of req) chunks.push(c as Buffer);
+          body = Buffer.concat(chunks).toString('utf8') || '{}';
+        }
+        const upstream = await proxyToDaemon(appId, `/api/session-group-tag-${kind}`, {
+          method: req.method,
+          headers: { 'content-type': 'application/json' },
+          ...(body !== undefined ? { body } : {}),
+        });
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+    }
+
     // PUT /api/bots/:appId/p2p-mode — proxy to that bot's daemon. Body
-    // `{ p2pMode: 'chat' | 'thread' }` ('thread' = per-message DM session;
-    // anything else clears back to the flat continuous chat default).
+    // `{ p2pMode: 'chat' | 'thread' | 'group' }` ('thread' = per-message DM
+    // session; 'group' = per-message dedicated session group; anything else
+    // clears back to the flat continuous chat default).
     let mBotP2pMode: RegExpMatchArray | null;
     if (req.method === 'PUT' && (mBotP2pMode = url.pathname.match(/^\/api\/bots\/([^/]+)\/p2p-mode$/))) {
       const appId = decodeURIComponent(mBotP2pMode[1]);
@@ -4881,6 +5440,25 @@ const server = createServer(async (req, res) => {
       for await (const c of req) chunks.push(c as Buffer);
       const raw = Buffer.concat(chunks).toString('utf8') || '{}';
       const upstream = await proxyToDaemon(appId, `/api/bot-p2p-mode`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // PUT /api/bots/:appId/envelope-injection — proxy to that bot's daemon.
+    // Body `{ envelopeInjection: 'auto'|'off'|'' }` (''/other clears back to
+    // the inline default). #794: hook 注入 per-turn 上下文的 per-bot 开关。
+    let mBotEnvelopeInjection: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotEnvelopeInjection = url.pathname.match(/^\/api\/bots\/([^/]+)\/envelope-injection$/))) {
+      const appId = decodeURIComponent(mBotEnvelopeInjection[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-envelope-injection`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: raw,
@@ -4912,7 +5490,8 @@ const server = createServer(async (req, res) => {
 
     // PUT /api/bots/:appId/grant-prefs — proxy to that bot's daemon. Body carries
     // any subset of `{ restrictGrantCommands?: boolean, autoGrantRequestCards?: boolean,
-    // messageQuotaDefaultLimit?: number|null }`.
+    // p2pOpen?: boolean, messageQuotaDefaultLimit?: number|null,
+    // grantDefaultDurationMs?: number|null }`.
     let mBotGrantPrefs: RegExpMatchArray | null;
     if (req.method === 'PUT' && (mBotGrantPrefs = url.pathname.match(/^\/api\/bots\/([^/]+)\/grant-prefs$/))) {
       const appId = decodeURIComponent(mBotGrantPrefs[1]);
@@ -4999,6 +5578,63 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // Native Feishu/Lark conversation labels (feed groups). These APIs are
+    // user-token-only, so the frontend pins subsequent create/assign calls to
+    // the same app whose OAuth token produced this list.
+    if (req.method === 'GET' && url.pathname === '/api/feed-groups/auth-url') {
+      const appId = url.searchParams.get('larkAppId') ?? '';
+      let bot: BotConfig | undefined;
+      try { bot = loadBotConfigs().find(item => !item.apiOnly && (!appId || item.larkAppId === appId)); }
+      catch { /* handled below */ }
+      if (!bot) return jsonRes(res, 404, { ok: false, error: 'bot_not_found' });
+      const { authUrl } = generateAuthUrl(bot.larkAppId, bot.larkAppSecret, normalizeBrand(bot.brand), [...FEED_GROUP_SCOPES]);
+      return jsonRes(res, 200, { ok: true, larkAppId: bot.larkAppId, authUrl });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/feed-groups/oauth-callback') {
+      let body: { callbackUrl?: unknown };
+      try { body = await readJsonBody(req) as { callbackUrl?: unknown }; }
+      catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+      const callbackUrl = typeof body.callbackUrl === 'string' ? body.callbackUrl.trim() : '';
+      if (!isCallbackUrl(callbackUrl)) {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_callback_url', message: '请粘贴完整的 127.0.0.1 OAuth 回调 URL。' });
+      }
+      const message = await handleCallbackUrl(callbackUrl);
+      const ok = typeof message === 'string' && message.startsWith('✅');
+      return jsonRes(res, ok ? 200 : 400, { ok, error: ok ? undefined : 'oauth_exchange_failed', message });
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/feed-groups') {
+      const requestedAppId = url.searchParams.get('larkAppId') ?? '';
+      let bots: BotConfig[];
+      try { bots = loadBotConfigs().filter(bot => !bot.apiOnly); }
+      catch { return jsonRes(res, 500, { ok: false, error: 'bot_config_unavailable' }); }
+      const ordered = requestedAppId
+        ? [...bots.filter(bot => bot.larkAppId === requestedAppId), ...bots.filter(bot => bot.larkAppId !== requestedAppId)]
+        : bots;
+      let loginRequired = false;
+      for (const bot of ordered) {
+        try {
+          const groups = await listFeedGroups(bot);
+          return jsonRes(res, 200, { ok: true, larkAppId: bot.larkAppId, groups });
+        } catch (error) {
+          if (error instanceof FeedGroupApiError && error.code === 'user_login_required') {
+            loginRequired = true;
+            continue;
+          }
+          if (requestedAppId && bot.larkAppId === requestedAppId) {
+            const e = error as FeedGroupApiError;
+            return jsonRes(res, e.status ?? 502, { ok: false, error: e.code ?? 'feed_group_list_failed', message: e.message });
+          }
+        }
+      }
+      return jsonRes(res, loginRequired ? 401 : 503, {
+        ok: false,
+        error: loginRequired ? 'user_login_required' : 'feed_group_api_unavailable',
+        message: loginRequired ? '尚未获得飞书标签权限，请点击「立即授权」按钮进行授权。' : '没有可用于读取标签的飞书机器人。',
+      });
+    }
+
     // Create a new chat — pick a creator from the user-selected larkAppIds
     // (Feishu makes the calling bot the implicit first member, so picking
     // anything else would silently add an unwanted bot). Auto-invite the
@@ -5006,7 +5642,7 @@ const server = createServer(async (req, res) => {
     // are app-scoped, so creator daemon and operator open_id come from the
     // SAME bot by construction. See dashboard/operator-selector.ts.
     if (req.method === 'POST' && url.pathname === '/api/groups/create') {
-      let parsed: { name?: unknown; larkAppIds?: unknown; userOpenIds?: unknown; ownerUnionIds?: unknown; bindWorkingDir?: unknown; roleProfileId?: unknown };
+      let parsed: { name?: unknown; larkAppIds?: unknown; userOpenIds?: unknown; ownerUnionIds?: unknown; bindWorkingDir?: unknown; roleProfileId?: unknown; feedGroupId?: unknown; newFeedGroupName?: unknown; feedGroupAppId?: unknown };
       try {
         const chunks: Buffer[] = [];
         for await (const c of req) chunks.push(c as Buffer);
@@ -5092,7 +5728,26 @@ const server = createServer(async (req, res) => {
         } else {
           upstreamJson.autoInvitedOpenId = autoInvited;
         }
+        const existingFeedGroupId = typeof parsed.feedGroupId === 'string' ? parsed.feedGroupId.trim() : '';
+        const newFeedGroupName = typeof parsed.newFeedGroupName === 'string' ? parsed.newFeedGroupName.trim() : '';
+        const feedGroupAppId = typeof parsed.feedGroupAppId === 'string' ? parsed.feedGroupAppId.trim() : '';
+        if (upstream.ok && upstreamJson.ok && typeof upstreamJson.chatId === 'string' && (existingFeedGroupId || newFeedGroupName)) {
+          try {
+            const feedBot = loadBotConfigs().find(bot => bot.larkAppId === feedGroupAppId && !bot.apiOnly);
+            if (!feedBot) {
+              upstreamJson.feedGroupError = '读取标签所用的机器人当前不可用。群聊已创建，但未加入标签。';
+            } else {
+              const targetId = existingFeedGroupId || await createFeedGroup(feedBot, newFeedGroupName);
+              await addChatToFeedGroup(feedBot, targetId, upstreamJson.chatId);
+              upstreamJson.feedGroupId = targetId;
+              upstreamJson.feedGroupName = newFeedGroupName || undefined;
+            }
+          } catch (error) {
+            upstreamJson.feedGroupError = error instanceof Error ? error.message : String(error);
+          }
+        }
       }
+      if (upstream.ok && upstreamJson?.ok) groupsMatrixSnapshot.invalidate();
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(upstreamJson ? JSON.stringify(upstreamJson) : upstreamText);
       return;
@@ -5105,6 +5760,7 @@ const server = createServer(async (req, res) => {
       let parsed: {
         content?: unknown; larkAppIds?: unknown; mode?: unknown; column?: unknown;
         leadLarkAppId?: unknown; name?: unknown; bindWorkingDir?: unknown; images?: unknown;
+        feedGroupId?: unknown; newFeedGroupName?: unknown; feedGroupAppId?: unknown;
       };
       try {
         const chunks: Buffer[] = [];
@@ -5176,17 +5832,36 @@ const server = createServer(async (req, res) => {
         if (!groupUpstream.ok || !groupResp?.ok || typeof groupResp.chatId !== 'string') {
           return jsonRes(res, 502, { ok: false, error: groupResp?.error ?? `group_create_http_${groupUpstream.status}` });
         }
+        groupsMatrixSnapshot.invalidate();
       } catch {
         return jsonRes(res, 502, { ok: false, error: 'group_create_proxy_failed' });
       }
       const chatId: string = groupResp.chatId;
       const invalidBotIds: string[] = Array.isArray(groupResp.invalidBotIds) ? groupResp.invalidBotIds : [];
+      const existingFeedGroupId = typeof parsed.feedGroupId === 'string' ? parsed.feedGroupId.trim() : '';
+      const newFeedGroupName = typeof parsed.newFeedGroupName === 'string' ? parsed.newFeedGroupName.trim() : '';
+      let feedGroupId = '';
+      let feedGroupError = '';
+      if (existingFeedGroupId || newFeedGroupName) {
+        const feedGroupAppId = typeof parsed.feedGroupAppId === 'string' ? parsed.feedGroupAppId.trim() : '';
+        try {
+          const feedBot = loadBotConfigs().find(bot => bot.larkAppId === feedGroupAppId && !bot.apiOnly);
+          if (!feedBot) {
+            feedGroupError = '读取标签所用的机器人当前不可用。';
+          } else {
+            feedGroupId = existingFeedGroupId || await createFeedGroup(feedBot, newFeedGroupName);
+            await addChatToFeedGroup(feedBot, feedGroupId, chatId);
+          }
+        } catch (error) {
+          feedGroupError = error instanceof Error ? error.message : String(error);
+        }
+      }
 
       // spawn 目标：lead 模式只有 lead；一起开工是所有成功入群的选中 bot。
       const joinedIds = selectedIds.filter(id => !invalidBotIds.includes(id) && !!registry.getByAppId(id));
       const targets = selectCreateSessionTargets(mode, joinedIds, creatorLarkAppId);
       if (targets.length === 0) {
-        return jsonRes(res, 200, { ok: true, chatId, shareLink: groupResp.shareLink, spawned: [], failed: [], warning: 'no_spawn_target' });
+        return jsonRes(res, 200, { ok: true, chatId, shareLink: groupResp.shareLink, spawned: [], failed: [], warning: 'no_spawn_target', feedGroupId, feedGroupError });
       }
 
       const bots = liveBots();
@@ -5217,7 +5892,7 @@ const server = createServer(async (req, res) => {
       }));
 
       return jsonRes(res, 200, {
-        ok: true, chatId, shareLink: groupResp.shareLink, mode, column, spawned, failed,
+        ok: true, chatId, shareLink: groupResp.shareLink, mode, column, spawned, failed, feedGroupId, feedGroupError,
       });
     }
 
@@ -5272,6 +5947,41 @@ const server = createServer(async (req, res) => {
     logger.error('[dashboard] handler error', err);
     if (!res.headersSent) jsonRes(res, 500, { error: String(err) });
   }
+});
+
+// OAuth loopback callback for browsers running on the same machine as BotMux.
+// Remote-browser deployments cannot reach this loopback listener; their
+// Dashboard keeps the manual callback-URL paste flow as a fallback.
+const oauthCallbackServer = createServer(async (req, res) => {
+  const url = new URL(req.url ?? '/', 'http://127.0.0.1:9768');
+  if (req.method !== 'GET' || url.pathname !== '/callback') {
+    res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+    return res.end('Not found');
+  }
+  let ok = false;
+  try {
+    const message = await handleCallbackUrl(url.toString());
+    ok = typeof message === 'string' && message.startsWith('✅');
+  } catch (error) {
+    logger.warn(`[dashboard] OAuth loopback callback failed: ${(error as Error).message}`);
+  }
+  res.writeHead(ok ? 200 : 400, {
+    'content-type': 'text/html; charset=utf-8',
+    'cache-control': 'no-store',
+  });
+  return res.end(`<!doctype html><meta charset="utf-8"><title>${ok ? '授权成功' : '授权失败'}</title><style>body{font-family:system-ui,sans-serif;max-width:560px;margin:80px auto;padding:24px;color:#111827}h1{font-size:28px}</style><h1>${ok ? '授权成功' : '授权失败'}</h1><p>${ok ? 'BotMux 已完成授权。你可以关闭此页面并返回 Dashboard。' : '授权链接无效或已过期。请返回 Dashboard 后重新发起授权。'}</p>`);
+});
+
+oauthCallbackServer.on('error', error => {
+  const code = (error as NodeJS.ErrnoException).code;
+  if (code === 'EADDRINUSE') {
+    logger.warn('[dashboard] OAuth loopback port 127.0.0.1:9768 is already in use; remote/manual callback fallback remains available');
+  } else {
+    logger.warn(`[dashboard] OAuth loopback server error: ${(error as Error).message}`);
+  }
+});
+oauthCallbackServer.listen(9768, '127.0.0.1', () => {
+  logger.info('[dashboard] OAuth loopback callback listening on 127.0.0.1:9768');
 });
 
 // Web terminal WebSocket reverse-proxy: bridge `/s/*` upgrade requests through to
@@ -5344,6 +6054,9 @@ listenWithProbe({
     logger.warn(`[dashboard] Failed to persist port to ${PORT_PATH}: ${(e as Error).message}`);
   }
   logger.info(`[dashboard] listening on ${config.dashboard.host}:${port}`);
+  // Reclaim any `.trash-*` skill trees left by an interrupted background unlink
+  // (crash/restart mid-delete). Best-effort and fire-and-forget.
+  sweepStoreTrash();
   startPlatformTunnelIfBound();
 }).catch((err) => {
   logger.error(`[dashboard] could not bind near ${config.dashboard.host}:${config.dashboard.port} after probing — set BOTMUX_DASHBOARD_PORT to a free port. ${(err as Error).message}`);
@@ -5446,15 +6159,22 @@ function startPlatformTunnelIfBound(): void {
   try {
     const binding = readPlatformBinding();
     if (!binding) return;
-    if (!activeToken) {
-      activeToken = loadOrCreatePersistedToken(TOKEN_PATH);
+    const existingToken = currentDashboardToken();
+    // An already-materialized dashboard token is sufficient to start the
+    // tunnel. Avoid re-validating its path via secureHostFilePath(): on Linux
+    // the request-time read is descriptor-pinned, while deployments whose HOME
+    // is a root-owned symlink (common on managed dev hosts) can make the
+    // path-returning helper fail even though the 0600 file is safely readable.
+    // Only the first token creation needs the path+lock helper.
+    if (!existingToken) {
+      loadOrCreatePersistedToken(TOKEN_PATH);
       logger.info('[platform-tunnel] 已初始化 dashboard token');
     }
     const version = readBotmuxVersion();
     platformTunnel = startPlatformTunnelClient({
       binding,
       getDashboardPort: () => boundDashboardPort,
-      getDashboardToken: () => activeToken,
+      getDashboardToken: currentDashboardToken,
       getVersion: () => version,
       getBots: () => readPlatformBotsInfo(),
       getTeamSyncRev: () => getPlatformTeamSyncRev(config.session.dataDir),
@@ -5585,9 +6305,11 @@ function shutdown(): void {
   resourceMonitor.stop();
   platformTunnel?.stop();
   debugTerminalManager.shutdown();
-  server.close(() => process.exit(0));
+  feedbackAnalyticsService?.close();
+  if (oauthCallbackServer.listening) oauthCallbackServer.close();
+  server.close(() => process.exit(gracefulProcessExitCode()));
   // Hard-exit fallback after 5s
-  setTimeout(() => process.exit(0), 5_000).unref();
+  setTimeout(() => process.exit(gracefulProcessExitCode()), 5_000).unref();
 }
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);

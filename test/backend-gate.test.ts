@@ -305,7 +305,9 @@ describe('live-only observer screen rebase', () => {
 
   it('shares update and trust dialog handling with incremental PTY output', () => {
     const helperStart = workerSource.indexOf('function handleVisibleStartupInteraction(');
-    const helperEnd = workerSource.indexOf('// Codex App runner sends', helperStart);
+    // Use the next stable declaration as the end delimiter (not a comment,
+    // which changes when runner CLIs are added to the OSC set).
+    const helperEnd = workerSource.indexOf('const APP_RUNNER_OSC_CLI_IDS', helperStart);
     const helper = workerSource.slice(helperStart, helperEnd);
     const ptyStart = workerSource.indexOf('function onPtyData(');
     const ptyEnd = workerSource.indexOf('function onBackendScreenResync(', ptyStart);

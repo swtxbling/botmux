@@ -18,6 +18,7 @@
  * daemon-side watcher re-executes the send OUTSIDE the sandbox with real
  * credentials. No Feishu credential ever enters the sandbox.
  */
+import { isMojoFullyRemote } from './mojo-types.js';
 import { mkdirSync, existsSync, writeFileSync, chmodSync, readdirSync, readFileSync, rmSync, rmdirSync, unlinkSync, statSync, lstatSync, readlinkSync, realpathSync, openSync, fstatSync, readSync, writeSync, closeSync, constants as fsConstants } from 'node:fs';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
@@ -72,6 +73,7 @@ export function buildCredentialOnlySandboxArgs(input: {
   hideDirectories: string[];
   hideFiles: string[];
   readonlyPaths?: string[];
+  privateReadonlyDirectories?: Array<{ parent: string; directory: string }>;
   workingDir: string;
   cliBin: string;
   cliArgs: string[];
@@ -91,6 +93,20 @@ export function buildCredentialOnlySandboxArgs(input: {
     '--bind', '/', '/',
     '--proc', '/proc',
   ];
+  for (const entry of input.privateReadonlyDirectories ?? []) {
+    const parent = assertCredentialIsolationPath(entry.parent, 'private readonly parent');
+    const directory = assertCredentialIsolationPath(
+      entry.directory,
+      'private readonly directory',
+    );
+    if (!directory.startsWith(`${parent}/`)) {
+      throw new Error(`private readonly directory must be below its parent: ${directory}`);
+    }
+    // Hide every sibling channel first, then expose only the owning directory.
+    // A directory bind (rather than a file bind) observes the worker's atomic
+    // rename-based capability rotations without pinning the old inode.
+    args.push('--tmpfs', parent, '--ro-bind', directory, directory);
+  }
   for (const path of [...new Set(input.readonlyPaths ?? [])].sort()) {
     const normalized = assertCredentialIsolationPath(path, 'readonly path');
     args.push('--ro-bind', normalized, normalized);
@@ -186,6 +202,7 @@ export function prepareCredentialOnlySandbox(input: {
   hideDirectories: string[];
   hideFiles: string[];
   readonlyPaths?: string[];
+  privateReadonlyDirectories?: Array<{ parent: string; directory: string }>;
   workingDir: string;
   cliBin: string;
   cliArgs: string[];
@@ -348,15 +365,42 @@ export function coreOnlyPidNamespaceDegrade(): boolean {
 }
 
 /**
- * Whether a LOCAL sandbox engine applies to this backend at all. riff has NO
- * local CLI process to wrap (execution happens in riff's own remote sandbox);
- * without this bypass the worker's fail-safe "backend not sandboxable" hard
- * error would brick every sandbox-enabled bot the moment it switches to riff.
- * Platform is no longer a factor — fs-policy sandboxes darwin AND linux.
+ * Whether a LOCAL sandbox engine applies to this backend at all.
+ *
+ * riff has NO local CLI process to wrap — execution happens entirely in riff's
+ * own remote sandbox. Without that bypass the worker's fail-safe "backend not
+ * sandboxable" hard error would brick every sandbox-enabled bot the moment it
+ * switches to riff. Platform is no longer a factor — fs-policy sandboxes darwin
+ * AND linux.
+ *
+ * mojo is NOT unconditionally remote, and this is the important asymmetry:
+ * MojoBackend spawns the `mojo` binary locally on every turn. Only with
+ * `cloud: true` do the agent's TOOLS run off-box; `cloud` is optional, and
+ * `localDaemon: true` explicitly opts INTO local execution. Treating mojo as
+ * remote regardless would silently skip the local sandbox for a bot that asked
+ * for `sandbox: true` — a fail-OPEN. So a mojo bypass requires proof of remote
+ * execution, and anything else keeps the local sandbox engaged (fail closed).
  */
-export function localSandboxApplies(backendType: string): boolean {
-  return backendType !== 'riff';
+export function localSandboxApplies(
+  backendType: string,
+  // `jwtEnv` / `env` are part of the proof: the launcher env decides which binary
+  // the next turn actually executes (see mojoUnprovableEnvKeys). A narrower type
+  // here silently DROPPED a caller's env and re-opened the bypass.
+  remoteExecution?: {
+    cloud?: boolean;
+    localDaemon?: boolean;
+    wrapperCli?: string;
+    jwtEnv?: string;
+    env?: Record<string, string>;
+  },
+): boolean {
+  if (backendType === 'riff') return false;
+  if (backendType === 'mojo') {
+    return !isMojoFullyRemote(remoteExecution);
+  }
+  return true;
 }
+
 
 /** Top-level dirs that are symlinks on usrmerge distros (/bin → usr/bin …) —
  *  replicated inside the tmpfs root so `#!/bin/sh` etc. resolve. */
@@ -835,8 +879,8 @@ export interface RelayRequest {
 // (--chat-id/--into/--top-level), and --session-id are NOT allowlisted:
 // content/attachments come from validated outbox files, and session-id is
 // forced by the worker.
-const RELAY_FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice']);
-const RELAY_FLAGS_VAL = new Set(['--mention', '--quote']);
+const RELAY_FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash']);
+const RELAY_FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind']);
 
 export interface ValidatedRelay {
   contentName: string;
@@ -908,6 +952,9 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
       // ['--mention','--session-id'] and have --session-id swallowed as the
       // value, corrupting the worker-forced session-id (self-DoS).
       if (v.startsWith('--')) return { ok: false, error: `flag ${f} value must not be a flag` };
+      if (f === '--response-kind' && !['progress', 'final', 'auxiliary'].includes(v)) {
+        return { ok: false, error: 'flag --response-kind must be progress, final, or auxiliary' };
+      }
       flags.push(f, v); i++; continue;
     }
     return { ok: false, error: `flag not allowed: ${f}` };
@@ -1000,6 +1047,7 @@ export function buildRelayHostEnv(
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   delete env.BOTMUX_SEND_RELAY;
   delete env.BOTMUX_CARD_PREPARED_CONTENT_FILE;
+  delete env.BOTMUX_HOST_RELAY_REQUIRES_CODEX_APP_LEDGER;
   if (preparedContentFile) {
     env.BOTMUX_CARD_LOCAL_LINK_MODE = 'disabled';
     env.BOTMUX_CARD_PREPARED_CONTENT_FILE = preparedContentFile;
@@ -1021,7 +1069,19 @@ export function startOutboxWatcher(
      *  absent the relay still runs, but carries NO durable origin — a missing
      *  hook must never let the sandbox promote its own origin fields. */
     authorize?: (claim: { capability?: string }) =>
-      | { ok: true; origin: { turnId?: string; dispatchAttempt?: number } }
+      | {
+          ok: true;
+          origin: {
+            turnId?: string;
+            dispatchAttempt?: number;
+            /** The worker matched an unsettled Codex App ledger entry. The
+             * host child must still find that exact entry before any provider
+             * side effect; terminal settlement/revocation between authorize
+             * and re-exec therefore fails closed instead of degrading to an
+             * ordinary mutable-session send. */
+            requiresCodexAppLedger?: boolean;
+          };
+        }
       | { ok: false; error: string };
     cliPath?: string;
   } = {},
@@ -1145,6 +1205,11 @@ export function startOutboxWatcher(
       if (trustedOrigin?.dispatchAttempt !== undefined) {
         requestEnv.BOTMUX_DISPATCH_ATTEMPT = String(trustedOrigin.dispatchAttempt);
       }
+      if (trustedOrigin?.requiresCodexAppLedger) {
+        requestEnv.BOTMUX_HOST_RELAY_REQUIRES_CODEX_APP_LEDGER = '1';
+      } else {
+        delete requestEnv.BOTMUX_HOST_RELAY_REQUIRES_CODEX_APP_LEDGER;
+      }
       const child = spawn(process.execPath, [cli, 'send', ...hostArgs], { env: requestEnv });
       let out = '', err = '';
       child.stdout.on('data', d => { out += d; });
@@ -1157,3 +1222,7 @@ export function startOutboxWatcher(
   timer.unref?.();
   return () => clearInterval(timer);
 }
+
+// Single definition, re-exported for the callers that historically imported it
+// from here. See mojo-types.ts for why a wrapperCli voids the proof.
+export { isMojoFullyRemote };

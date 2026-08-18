@@ -10,13 +10,31 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 // Mock @larksuiteoapi/node-sdk — we don't want real Lark connections.
 // The Client constructor just stores whatever it receives.
 vi.mock('@larksuiteoapi/node-sdk', () => {
+  // Mirror the real SDK's separable http instance so the upload-client path is
+  // exercised (create() → own instance + copyable interceptor registry).
+  const makeInstance = (): any => ({
+    defaults: { timeout: 0 },
+    create: (cfg: { timeout?: number }) => {
+      const inst = makeInstance();
+      if (cfg?.timeout !== undefined) inst.defaults.timeout = cfg.timeout;
+      return inst;
+    },
+    interceptors: {
+      request: { handlers: [], use(this: any, f: any, r: any) { this.handlers.push({ fulfilled: f, rejected: r }); } },
+      response: { handlers: [], use(this: any, f: any, r: any) { this.handlers.push({ fulfilled: f, rejected: r }); } },
+    },
+  });
+  const sharedDefault = makeInstance();
   class FakeClient {
     opts: Record<string, unknown>;
+    httpInstance: any;
     constructor(opts: Record<string, unknown>) {
       this.opts = opts;
+      // Real Client: `params.httpInstance || defaultHttpInstance`.
+      this.httpInstance = (opts?.httpInstance as any) ?? sharedDefault;
     }
   }
-  return { Client: FakeClient };
+  return { Client: FakeClient, defaultHttpInstance: sharedDefault };
 });
 
 // Mock node:fs so loadBotConfigs doesn't touch real disk.
@@ -70,6 +88,25 @@ describe('registerBot', () => {
     const client = state.client as unknown as { opts: Record<string, unknown> };
     expect(client.opts.appId).toBe('app_test_001');
     expect(client.opts.appSecret).toBe('secret_001');
+  });
+
+  it('bounds the SDK HTTP transport timeout when the client exposes axios defaults', () => {
+    const client = { httpInstance: { defaults: { timeout: 0 } } };
+    mod.configureLarkClientHttpTimeout(client);
+    expect(client.httpInstance.defaults.timeout).toBe(mod.LARK_REQUEST_TIMEOUT_MS);
+  });
+
+  it('gives media uploads a dedicated http instance with the looser upload timeout', () => {
+    const state = mod.registerBot(makeCfg());
+    const interactive = state.client as unknown as { httpInstance?: { defaults?: { timeout?: number } } };
+    const upload = state.uploadClient as unknown as { httpInstance?: { defaults?: { timeout?: number } } };
+    // Interactive client keeps the tight bound; upload client is separate + looser.
+    expect(interactive.httpInstance?.defaults?.timeout).toBe(mod.LARK_REQUEST_TIMEOUT_MS);
+    expect(upload.httpInstance?.defaults?.timeout).toBe(mod.LARK_UPLOAD_TIMEOUT_MS);
+    expect(state.uploadClient).not.toBe(state.client);
+    expect(mod.getBotUploadClient('app_test_001')).toBe(state.uploadClient);
+    // The shared SDK default must NOT be mutated to the upload bound.
+    expect(mod.LARK_UPLOAD_TIMEOUT_MS).toBeGreaterThan(mod.LARK_REQUEST_TIMEOUT_MS);
   });
 
   it('does NOT construct a Lark Client for an apiOnly bot (empty secret would throw in the real SDK)', () => {
@@ -1791,5 +1828,42 @@ describe('loadBotConfigs when bots.json exists but is unreadable', () => {
       throw Object.assign(new Error('EIO: i/o error'), { code: 'EIO' });
     });
     expect(() => mod.loadBotConfigs()).toThrow(/EIO/);
+  });
+});
+
+describe('normalizeTurnTimeoutMs / MAX_TURN_TIMEOUT_MS', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+
+  beforeEach(async () => {
+    mod = await freshImport();
+  });
+
+  it('keeps positive integers within the arm-able bound and rejects everything else', () => {
+    expect(mod.normalizeTurnTimeoutMs(1_800_000)).toBe(1_800_000);
+    expect(mod.normalizeTurnTimeoutMs(90_001)).toBe(90_001); // legal non-whole-minute value
+    expect(mod.normalizeTurnTimeoutMs(mod.MAX_TURN_TIMEOUT_MS)).toBe(mod.MAX_TURN_TIMEOUT_MS);
+    // Rejected: non-positive, non-integer, over-bound, non-number, absent.
+    expect(mod.normalizeTurnTimeoutMs(0)).toBeUndefined();
+    expect(mod.normalizeTurnTimeoutMs(-5)).toBeUndefined();
+    expect(mod.normalizeTurnTimeoutMs(1.5)).toBeUndefined();
+    expect(mod.normalizeTurnTimeoutMs(mod.MAX_TURN_TIMEOUT_MS + 1)).toBeUndefined();
+    expect(mod.normalizeTurnTimeoutMs('1800000')).toBeUndefined();
+    expect(mod.normalizeTurnTimeoutMs(undefined)).toBeUndefined();
+  });
+
+  it('parseBotConfigsFromText drops an over-bound turnTimeoutMs', () => {
+    const [ok] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', cliId: 'dsh', turnTimeoutMs: 90_001 },
+    ]));
+    expect(ok.turnTimeoutMs).toBe(90_001);
+    const [over] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'b', larkAppSecret: 's', cliId: 'dsh', turnTimeoutMs: mod.MAX_TURN_TIMEOUT_MS + 1 },
+    ]));
+    expect(over.turnTimeoutMs).toBeUndefined();
+  });
+
+  it('the dashboard UI mirror of the bound stays equal to the shared constant', async () => {
+    const { DASHBOARD_MAX_TURN_TIMEOUT_MS } = await import('../src/dashboard/web/bot-defaults-page.js');
+    expect(DASHBOARD_MAX_TURN_TIMEOUT_MS).toBe(mod.MAX_TURN_TIMEOUT_MS);
   });
 });
