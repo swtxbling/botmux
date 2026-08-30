@@ -131,6 +131,16 @@ describe('bot defaults focused layout', () => {
     }
   });
 
+  it('distinguishes manual topics from automatic per-task topics in regular groups', () => {
+    expect(i18n).toContain("'botDefaults.regularGroupModeChat': 'chat（全群共用上下文，话题内外混在一起）'");
+    expect(i18n).toContain("'botDefaults.regularGroupModeChatTopic': 'chat-topic（群里共用，手动话题各自独立 · 默认）'");
+    expect(i18n).toContain("'botDefaults.regularGroupModeNewTopic': 'new-topic（直接在群里 @ 就开独立话题 · 推荐）'");
+    expect(i18n).toContain("'botDefaults.regularGroupModeShared': 'shared（看着分话题，实际共用上下文，容易串台）'");
+    expect(i18n).toContain('它不会自动开话题');
+    expect(i18n).toContain('请选 new-topic');
+    expect(i18n).toContain('某个群用 /reply-mode 单独设置过，就以那个群为准');
+  });
+
   it('places the Feishu description editor inside the profile header main column', () => {
     const profileStart = page.indexOf('<BotProfileIdentity');
     const tabsStart = page.indexOf('<BotDefaultsTabs', profileStart);
