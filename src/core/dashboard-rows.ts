@@ -319,6 +319,13 @@ export interface DashboardRowOptions {
    * on-demand usage.
    */
   includeTokenUsage?: boolean;
+  /**
+   * Open-todo scan, which also resolves the session transcript path (and thus
+   * reads the working directory) on every call. Startup restore announces rows
+   * before the Feishu dispatchers are up, so it leaves both scans off and lets
+   * the dashboard fill them in later.
+   */
+  includeOpenTodos?: boolean;
 }
 
 function maybeSessionRowUsage(
@@ -328,7 +335,11 @@ function maybeSessionRowUsage(
   opts2?: { usePersistedSnapshot?: boolean },
 ): SessionRowUsage {
   if (opts2?.usePersistedSnapshot && s.tokenUsage !== undefined) return { tokenUsage: s.tokenUsage };
-  return opts?.includeTokenUsage === false ? { tokenUsage: null } : readSessionRowUsage(s, workingDir);
+  // A row whose boot-time cwd probe timed out must never run the synchronous
+  // transcript resolution: `realpathSync(workingDir)` on an unresponsive mount
+  // blocks the whole daemon (dashboard polls included).
+  if (opts?.includeTokenUsage === false || s.restoreCwdUnverifiedAt) return { tokenUsage: null };
+  return readSessionRowUsage(s, workingDir);
 }
 
 export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptions): SessionRow {
@@ -406,7 +417,9 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
       ? { kind: ds.agentAttention.kind, reason: ds.agentAttention.reason, at: ds.agentAttention.at }
       : undefined,
     ...maybeSessionRowUsage(ds.session, ds.workingDir, opts),
-    openTodos: sessionOpenTodos(ds.session, ds.workingDir, opts?.fresh),
+    openTodos: opts?.includeOpenTodos === false || ds.session.restoreCwdUnverifiedAt
+      ? undefined
+      : sessionOpenTodos(ds.session, ds.workingDir, opts?.fresh),
     ...(ds.worker?.pid !== undefined ? { workerPid: ds.worker.pid } : {}),
     ...(ds.adoptedFrom?.originalCliPid !== undefined ? { adoptCliPid: ds.adoptedFrom.originalCliPid } : {}),
     ...sandboxDriftField(ds.session),

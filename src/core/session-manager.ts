@@ -56,6 +56,8 @@ import type { CliLaunchMode } from './cli-launch-mode.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { clearSessionPreviewTarget } from './session-preview-registry.js';
 import { composeRowFromActive, composeRowFromPersistedActive } from './dashboard-rows.js';
+import type { DashboardRowOptions } from './dashboard-rows.js';
+import { probeRestoreSessionCwds, type RestoreCwdProbe } from './restore-cwd-probe.js';
 import {
   composeSpawnCodexAppContext,
   composeSpawnUserContent,
@@ -311,7 +313,11 @@ function clearRestoredPreviewTarget(session: Session): void {
   );
 }
 
-function quarantineUnregisteredRestoreSession(session: Session, reason: string): void {
+function quarantineUnregisteredRestoreSession(
+  session: Session,
+  reason: string,
+  rowOpts?: DashboardRowOptions,
+): void {
   session.restoreQuarantinedAt ??= new Date().toISOString();
   try {
     sessionStore.updateSession(session);
@@ -327,7 +333,7 @@ function quarantineUnregisteredRestoreSession(session: Session, reason: string):
   try {
     dashboardEventBus.publish({
       type: 'session.spawned',
-      body: { session: composeRowFromPersistedActive(session) },
+      body: { session: composeRowFromPersistedActive(session, rowOpts) },
     });
   } catch (err) {
     // Visibility projection is best-effort; it must never turn one isolated
@@ -591,7 +597,9 @@ export async function closeCliMismatchedSessionsForBot(
 
 export { expandHome };
 
-export function getSessionWorkingDir(ds?: DaemonSession): string {
+export function getSessionWorkingDir(
+  ds?: { workingDir?: string; larkAppId?: string },
+): string {
   if (ds?.workingDir) return expandHome(ds.workingDir);
   if (ds?.larkAppId) {
     const bot = getBot(ds.larkAppId);
@@ -2515,7 +2523,12 @@ export async function staggeredRecoveryFork(
 export async function restoreActiveSessions(
   activeSessions: Map<string, DaemonSession>,
   quarantinedSessionIds: ReadonlySet<string> = new Set(),
-  options: { prepareTurn?: (ds: DaemonSession, turnId: string) => Promise<void> | undefined } = {},
+  options: {
+    prepareTurn?: (ds: DaemonSession, turnId: string) => Promise<void> | undefined;
+    /** Test seam for the bounded per-session working-directory probe. */
+    cwdProbe?: RestoreCwdProbe;
+    cwdProbeTimeoutMs?: number;
+  } = {},
 ): Promise<Array<XpiSharedCwdStartupNotice | PrincipalLaneStartupNotice> | undefined> {
   const sessions = sessionStore.listSessions();
   const restorePriority = (session: Session): number => {
@@ -2727,6 +2740,73 @@ export async function restoreActiveSessions(
   killStalePids(active, activeSessions);
 
   logger.info(`Registering ${active.length} active session(s) (no CLI spawn until new messages arrive)...`);
+  // Bounded, concurrent directory check BEFORE any per-row filesystem work.
+  // Restore finishes before the Feishu dispatchers start, so an unresponsive
+  // working directory (privacy prompt pending, disk unplugged, dead mount) must
+  // not reach a synchronous realpath/stat on the event loop — that froze every
+  // bot offline. All rows stay registered below; a timeout only defers that
+  // row's eager startup work to its next message.
+  const restoreCwdProbes = await probeRestoreSessionCwds(
+    active.flatMap(session => {
+      // Resolve the SAME directory the fork paths will touch: `~/x` must be
+      // expanded and an unpinned row must be probed at its bot-default cwd, or
+      // the timeout gate would miss exactly the rows whose fork does a blocking
+      // `existsSync` on that directory. A row whose bot is no longer configured
+      // has no resolvable cwd; the probe must never turn that into a startup
+      // failure — leave it to the per-row restore path as before.
+      try {
+        const cwd = session.adoptedFrom?.cwd
+          ? expandHome(session.adoptedFrom.cwd)
+          : getSessionWorkingDir({
+              workingDir: session.workingDir,
+              larkAppId: session.larkAppId,
+            });
+        return cwd ? [{ sessionId: session.sessionId, cwd }] : [];
+      } catch {
+        return [];
+      }
+    }),
+    options.cwdProbe,
+    options.cwdProbeTimeoutMs,
+  );
+  // Only a probe that never answered defers eager work. A clean 'missing' /
+  // 'unreadable' answer is cheap and the restore branches below already handle
+  // a deleted or unreadable directory on purpose (e.g. a live backend is
+  // re-attached even when its cwd is gone).
+  const cwdProbeTimedOut = (session: Session): boolean =>
+    restoreCwdProbes.get(session.sessionId)?.status === 'timeout';
+  // Persist the verdict on the row so EVERY later dashboard read (list, detail,
+  // SSE replay, insights) also skips transcript scans for it — those endpoints
+  // recompose rows outside restore, and their synchronous realpath against the
+  // same unresponsive directory would freeze the daemon just the same. A later
+  // boot re-probes and clears the flag, so this is boot-scoped, not a permanent
+  // downgrade. Nothing is written when the verdict is unchanged.
+  for (const session of active) {
+    const unverified = cwdProbeTimedOut(session);
+    if (unverified === !!session.restoreCwdUnverifiedAt) continue;
+    session.restoreCwdUnverifiedAt = unverified ? new Date().toISOString() : undefined;
+    try {
+      sessionStore.updateSession(session);
+    } catch (err) {
+      logger.warn(
+        `[${session.sessionId.substring(0, 8)}] Could not persist working-directory probe verdict: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+  // Rows announced/quarantined during restore must not resolve transcripts:
+  // that scan reads the working directory synchronously and is exactly what the
+  // probe above exists to keep off the startup path.
+  const restoreAnnounceOpts: DashboardRowOptions = {
+    includeTokenUsage: false,
+    includeOpenTodos: false,
+  };
+  const quarantineRestoredSession = (session: Session, reason: string): void =>
+    quarantineUnregisteredRestoreSession(
+      session,
+      reason,
+      cwdProbeTimedOut(session) ? restoreAnnounceOpts : undefined,
+    );
   const runtimeWinnerFor = (sessionId: string, candidate?: DaemonSession): DaemonSession | undefined =>
     [...activeSessions.values()].find(ds => ds !== candidate && ds.session.sessionId === sessionId);
   // Persistent recovery below must only inspect rows registered by THIS
@@ -2759,6 +2839,20 @@ export async function restoreActiveSessions(
     // and sibling lanes as apparent same-key duplicates.
     let restoredRuntimeRoutingAnchor: string | undefined;
     if (session.principalLane) {
+      if (cwdProbeTimedOut(session)) {
+        // Hydration canonicalizes the lane cwd with a synchronous realpath and
+        // then runs git carrier probes; against an unresponsive directory it
+        // would stall every bot's websocket. Keep the durable row (quarantined,
+        // never dropped) and let the next restart retry once the directory is
+        // reachable again.
+        logger.warn(
+          `[${session.sessionId.substring(0, 8)}] Principal-lane working directory did not answer `
+          + 'the startup probe; skipping lane hydration this boot to keep other sessions online. '
+          + 'The durable row is kept untransformed; fix the directory and restart, or close it.',
+        );
+        quarantineRestoredSession(session, 'principal_lane_restore_cwd_timeout');
+        continue;
+      }
       const hydrated = await sessionStore.hydratePrincipalLaneForIngress(
         session.principalLane.sourceSessionId,
         session.principalLane.laneId,
@@ -2771,7 +2865,7 @@ export async function restoreActiveSessions(
             ? 'session_identity_mismatch'
             : `${hydrated.status}:${hydrated.reason}`})`,
         );
-        quarantineUnregisteredRestoreSession(session, 'principal_lane_restore_authority_invalid');
+        quarantineRestoredSession(session, 'principal_lane_restore_authority_invalid');
         continue;
       }
       restoredRuntimeRoutingAnchor = hydrated.runtimeRoutingAnchor;
@@ -2818,7 +2912,7 @@ export async function restoreActiveSessions(
       // Session JSON is a runtime boundary. A forged/truncated `prepared` object
       // must not become proof that cancellation happened merely because the TS
       // interface says its fields exist.
-      quarantineUnregisteredRestoreSession(session, 'mojo_close_journal_malformed');
+      quarantineRestoredSession(session, 'mojo_close_journal_malformed');
       continue;
     }
     if (session.mojoCloseJournal && session.backendType !== 'mojo') {
@@ -2838,7 +2932,7 @@ export async function restoreActiveSessions(
         admission: 'fenced',
         updatedAt: new Date().toISOString(),
       };
-      quarantineUnregisteredRestoreSession(session, 'mojo_close_journal_backend_mismatch');
+      quarantineRestoredSession(session, 'mojo_close_journal_backend_mismatch');
       continue;
     }
     // ORDER IS LOAD-BEARING: this branch must stay ABOVE the catch-all below,
@@ -2856,7 +2950,7 @@ export async function restoreActiveSessions(
         // has no reply surface and would strand the pending notice on a row that
         // can never accept another turn. Keep the prepared row quarantined until
         // an explicit close can return closed_with_residual to its caller.
-        quarantineUnregisteredRestoreSession(session, 'mojo_prepared_close_has_residual');
+        quarantineRestoredSession(session, 'mojo_prepared_close_has_residual');
         continue;
       }
       // The previous daemon durably recorded irreversible cancellation before it
@@ -2892,7 +2986,7 @@ export async function restoreActiveSessions(
           + `${err instanceof Error ? err.message : String(err)}`,
         );
       }
-      quarantineUnregisteredRestoreSession(session, 'mojo_prepared_close_commit_failed');
+      quarantineRestoredSession(session, 'mojo_prepared_close_commit_failed');
       continue;
     }
     if (session.mojoCloseJournal
@@ -2933,7 +3027,7 @@ export async function restoreActiveSessions(
         admission: 'fenced',
         updatedAt: new Date().toISOString(),
       };
-      quarantineUnregisteredRestoreSession(session, 'mojo_close_reconciliation_required');
+      quarantineRestoredSession(session, 'mojo_close_reconciliation_required');
       continue;
     }
 
@@ -2989,7 +3083,7 @@ export async function restoreActiveSessions(
         }
         if (validation === 'unknown') {
           logger.warn(`Keeping adopt session ${session.sessionId} active but quarantined until the target can be verified (target validation failed: ${adoptTargetLabel(adopted)})`);
-          quarantineUnregisteredRestoreSession(session, 'adopt_target_validation_unknown');
+          quarantineRestoredSession(session, 'adopt_target_validation_unknown');
           continue;
         }
         // Original CLI still alive — re-register and fork adopt worker
@@ -3065,8 +3159,21 @@ export async function restoreActiveSessions(
           continue;
         }
         restoredByThisInvocation.push(ds);
-        announceSessionRow(ds);
-        forkAdoptWorker(ds, { restoredFromMetadata: true });
+        announceSessionRow(ds, restoreAnnounceOpts);
+        if (cwdProbeTimedOut(session)) {
+          // forkAdoptWorker checks the adopted cwd synchronously; doing it here
+          // would re-block startup. The row is registered, so the next message
+          // retries the attach and reports a clear error if the directory is
+          // still unavailable.
+          logger.warn(
+            `[${session.sessionId.substring(0, 8)}] Adopt target directory did not answer the `
+            + 'startup probe; row registered without attaching. The next message retries the '
+            + 'attach. If the directory is gone, /close this row and re-adopt from the right '
+            + 'project instead of reviving it in the wrong place.',
+          );
+        } else {
+          forkAdoptWorker(ds, { restoredFromMetadata: true });
+        }
         logger.info(`[${session.sessionId.substring(0, 8)}] Restored adopt session (target: ${adoptTargetLabel(adopted)}, scope: ${scope})`);
         continue;
       }
@@ -3172,19 +3279,33 @@ export async function restoreActiveSessions(
       restoredByThisInvocation.push(ds);
       // 重启后把待办池卡片重新广播给 dashboard，否则会从看板消失（#277 同款修复，
       // 我这条 queued 分支提前 continue 绕过了下面的 announceSessionRow，要自己补）。
-      announceSessionRow(ds);
+      announceSessionRow(ds, restoreAnnounceOpts);
       if (restoredPendingRepo) {
-        try {
-          await resumeRestoredPendingRepoSetup(ds, activeSessions, options.prepareTurn);
-        } catch (err) {
-          // One unavailable scan/Lark send/worktree import must not abort the
-          // entire daemon restore. Rebuild volatile buffers from the retained
-          // setup journal so a later retry/card action remains lossless.
-          restorePendingRepoRuntime(ds);
-          logger.error(
-            `[${session.sessionId.substring(0, 8)}] Pending-repo restore failed; `
-            + `durable setup retained for retry: ${err instanceof Error ? err.message : String(err)}`,
+        if (cwdProbeTimedOut(session)) {
+          // Resume scans the cwd (missingStartDir + getProjectScanDirs) and
+          // would stall startup on an unresponsive directory. The durable setup
+          // journal stays untouched, so the picker is replayed on a later boot
+          // (or replaced via `/repo <path>`); activating this parked row is a
+          // no-op while it is still waiting for a repo pick.
+          logger.warn(
+            `[${session.sessionId.substring(0, 8)}] Pending-repo working directory did not answer `
+            + 'the startup probe; the durable setup is retained but the picker cannot be '
+            + 'republished this boot. Use /repo <path> to pick a directory now, or restart once '
+            + 'the directory is readable again.',
           );
+        } else {
+          try {
+            await resumeRestoredPendingRepoSetup(ds, activeSessions, options.prepareTurn);
+          } catch (err) {
+            // One unavailable scan/Lark send/worktree import must not abort the
+            // entire daemon restore. Rebuild volatile buffers from the retained
+            // setup journal so a later retry/card action remains lossless.
+            restorePendingRepoRuntime(ds);
+            logger.error(
+              `[${session.sessionId.substring(0, 8)}] Pending-repo restore failed; `
+              + `durable setup retained for retry: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
         }
       }
       logger.info(
@@ -3262,7 +3383,7 @@ export async function restoreActiveSessions(
               `[${session.sessionId.substring(0, 8)}] Could not tear down unmaterialized deferred run; keeping active row: `
               + `${err instanceof Error ? err.message : String(err)}`,
             );
-            quarantineUnregisteredRestoreSession(session, 'deferred_run_teardown_unverified');
+            quarantineRestoredSession(session, 'deferred_run_teardown_unverified');
             continue;
           }
         }
@@ -3314,9 +3435,9 @@ export async function restoreActiveSessions(
         // after which a later inbound on the same anchor mints a second session
         // while the old remote one is still running.
         if (mismatchClose === 'teardown_failed') {
-          quarantineUnregisteredRestoreSession(session, 'cli_mismatch_teardown_unverified');
+          quarantineRestoredSession(session, 'cli_mismatch_teardown_unverified');
         } else if (mismatchClose === 'close_failed') {
-          quarantineUnregisteredRestoreSession(session, 'cli_mismatch_close_failed');
+          quarantineRestoredSession(session, 'cli_mismatch_close_failed');
         }
         continue;
       }
@@ -3325,7 +3446,7 @@ export async function restoreActiveSessions(
         `[${session.sessionId.substring(0, 8)}] CLI mismatch close failed during restore; keeping active row: `
         + `${err instanceof Error ? err.message : String(err)}`,
       );
-      quarantineUnregisteredRestoreSession(session, 'cli_mismatch_close_failed');
+      quarantineRestoredSession(session, 'cli_mismatch_close_failed');
       continue;
     }
     if (!ds.session.queuedActivationPending
@@ -3399,7 +3520,7 @@ export async function restoreActiveSessions(
         // Master's reboot-resume visibility fix: this row stays active-on-disk
         // but was never registered into activeSessions, so upsert a dormant
         // persisted projection lest an already-open dashboard drop it.
-        quarantineUnregisteredRestoreSession(session, 'restore_collision_close_failed');
+        quarantineRestoredSession(session, 'restore_collision_close_failed');
         continue;
       }
       // Ordinary collision: a higher-priority row (real/adopt over queued over
@@ -3418,12 +3539,12 @@ export async function restoreActiveSessions(
           `[${session.sessionId.substring(0, 8)}] Could not close restore collision loser; keeping active row: `
           + `${err instanceof Error ? err.message : String(err)}`,
         );
-        quarantineUnregisteredRestoreSession(session, 'restore_collision_close_failed');
+        quarantineRestoredSession(session, 'restore_collision_close_failed');
       }
       continue;
     }
     restoredByThisInvocation.push(ds);
-    announceSessionRow(ds);
+    announceSessionRow(ds, restoreAnnounceOpts);
 
     if (session.initialUserTurnPending) {
       // `hasHistory: true` above means "there may be a CLI process/transcript to
@@ -3453,6 +3574,20 @@ export async function restoreActiveSessions(
   // not wake while a later row is still competing for the same route.
   for (const ds of restoredByThisInvocation) {
     if (!stillOwnsRestoreRegistration(ds)) continue;
+    // Re-arming a persisted backoff restores its timer, and an OVERDUE backoff
+    // deliberately fires on the next tick with a fresh `forkWorker` — which does
+    // the same synchronous cwd check the probe just timed out on. Leaving it
+    // armed would turn the deferral below into a lie within one tick. The
+    // durable recovery row is untouched, so the next inbound message (or a
+    // later boot) resumes it.
+    if (cwdProbeTimedOut(ds.session)) {
+      logger.warn(
+        `[${ds.session.sessionId.substring(0, 8)}] Working directory did not answer the startup `
+        + 'probe; persisted turn recovery stays paused until the next message (or a later boot '
+        + 'that can read the directory).',
+      );
+      continue;
+    }
     try {
       ensureOrdinaryTurnRecoveryAttached(ds);
       const restoredLeaseId = interruptedReadonlyContinuationLeaseIds.get(ds.session.sessionId);
@@ -3498,6 +3633,21 @@ export async function restoreActiveSessions(
     // Queued（待办池）会话从没起过 CLI，没有任何后端会话——别去探它，否则 tmux 后端
     // 会把「找不到 backing」误判成僵尸而关掉它。
     if (ds.session.queued) continue;
+    // Eager recovery (probe, mismatch close, re-attach fork) touches the working
+    // directory synchronously inside forkWorker. When the bounded startup probe
+    // got no answer, keep the durable registered row exactly as-is and let the
+    // next inbound message run the ordinary fork path, which reports a clear
+    // error if the directory is still unavailable. Registration above is what
+    // keeps this a deferral (and keeps /close reachable), never a drop.
+    if (cwdProbeTimedOut(ds.session)) {
+      logger.warn(
+        `[${ds.session.sessionId.substring(0, 8)}] Working directory did not answer the startup `
+        + 'probe; skipping eager recovery so other sessions can start. Send a message to retry '
+        + '(it fails with a clear missing-directory error while the directory is unavailable), '
+        + 'or /close the row.',
+      );
+      continue;
+    }
     const backendType = getSessionPersistentBackendType(ds);
     if (!backendType) {
       if (hasProtectedSessionMutationOwnership(ds)) {

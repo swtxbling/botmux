@@ -139,6 +139,8 @@ vi.mock('../src/core/worker-pool.js', () => ({
 }));
 
 vi.mock('../src/bot-registry.js', () => ({
+  effectiveDefaultWorkingDir: vi.fn(() => undefined),
+  botAutoWorktreeEnabled: vi.fn(() => false),
   getBot: vi.fn(() => ({
     config: {
       larkAppId: 'app_test',
