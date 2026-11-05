@@ -4,6 +4,7 @@ import {
   diagnoseSubmitFailure,
   diagnoseBackendSubmitFailure,
   SUBMIT_FAILURE_ACTIVE_WINDOW_MS,
+  shouldAutoSubmitParkedDraft,
   shouldWaitThroughBusyTurn,
 } from '../src/services/submit-failure-diagnosis.js';
 import { messages as enMessages } from '../src/i18n/en.js';
@@ -432,5 +433,50 @@ describe('shouldWaitThroughBusyTurn', () => {
     expect(shouldWaitThroughBusyTurn({ ...base, waitsSoFar: 11, maxWaits: 12 })).toBe(true);
     expect(shouldWaitThroughBusyTurn({ ...base, waitsSoFar: 12, maxWaits: 12 })).toBe(false);
     expect(shouldWaitThroughBusyTurn({ ...base, waitsSoFar: 99 })).toBe(false);
+  });
+});
+
+
+/**
+ * submit_unconfirmed 的自愈边界：只有「正文确实停在输入框」这一种情况可以由
+ * BotMux 自己补按一次 Enter 完成；其余诊断（登录门、菜单、仍在活动、未知）都
+ * 必须交给人。一次提交链最多按一次，且 ZMX 屏幕历史不是实时视图，永不按键。
+ */
+describe('shouldAutoSubmitParkedDraft', () => {
+  const base = {
+    diagnosisReason: 'draft_parked' as const,
+    matched: 'draft_parked:claude_composer',
+    backendType: 'tmux',
+    alreadyAutoSubmitted: false,
+  };
+
+  it('submits a parked draft exactly once when the payload is still in the composer', () => {
+    expect(shouldAutoSubmitParkedDraft(base)).toBe(true);
+  });
+
+  it('never presses a second Enter in the same submit chain', () => {
+    expect(shouldAutoSubmitParkedDraft({ ...base, alreadyAutoSubmitted: true })).toBe(false);
+  });
+
+  it('never presses Enter for an outcome that is not a parked draft', () => {
+    for (const diagnosisReason of ['logged_out', 'interactive_menu', 'still_active', 'unknown'] as const) {
+      expect(shouldAutoSubmitParkedDraft({ ...base, diagnosisReason })).toBe(false);
+    }
+  });
+
+  it('never presses Enter on a ZMX backend, whose screen is not a live view', () => {
+    expect(shouldAutoSubmitParkedDraft({ ...base, backendType: 'zmx' })).toBe(false);
+  });
+
+  it('refuses screen-wide draft evidence that may come from a transcript or a human draft', () => {
+    // `[Pasted Content N chars]` is matched across the whole screen, so it can
+    // describe a finished turn's transcript or someone else's draft.
+    expect(shouldAutoSubmitParkedDraft({ ...base, matched: 'draft_parked:pasted_content' })).toBe(false);
+    expect(shouldAutoSubmitParkedDraft({ ...base, matched: undefined })).toBe(false);
+  });
+
+  it('lets only one chain press Enter per pane within the cooldown', () => {
+    expect(shouldAutoSubmitParkedDraft({ ...base, msSinceLastAutoSubmit: 1_000 })).toBe(false);
+    expect(shouldAutoSubmitParkedDraft({ ...base, msSinceLastAutoSubmit: 60_000 })).toBe(true);
   });
 });

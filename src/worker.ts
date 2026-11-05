@@ -655,7 +655,13 @@ import {
   type SubmitFailureChainKey,
 } from './services/submit-failure-chain.js';
 import { createQueuedActivationReceiptObserver } from './services/queued-activation-receipts.js';
-import { decideSessionStartGatedSubmitWarning, diagnoseBackendSubmitFailure, shouldWaitThroughBusyTurn } from './services/submit-failure-diagnosis.js';
+import {
+  decideSessionStartGatedSubmitWarning,
+  diagnoseBackendSubmitFailure,
+  shouldAutoSubmitParkedDraft,
+  SUBMIT_DRAFT_AUTO_SUBMIT_RECHECK_MS,
+  shouldWaitThroughBusyTurn,
+} from './services/submit-failure-diagnosis.js';
 import {
   runAdoptQueuedWriteSequence,
   runAdoptRawInputSequence,
@@ -18701,7 +18707,50 @@ let unscopedSubmitFailureChainSequence = 0;
  *  cliGeneration). Scheduling the same key again replaces the existing timer
  *  instead of stacking a second one, so a logical submission/attempt can never
  *  produce two overlapping chains (and thus two submit_unconfirmed warnings). */
+type DraftAutoSubmitStepResult = 'sent' | 'refused' | 'skipped';
+
+/** The one automatic Enter for a parked draft, extracted so the action itself
+ *  is unit-testable (the submit-failure chain lives in a closure). The caller
+ *  owns the per-chain flag, the pane cooldown registry and the recheck arming;
+ *  this function only decides and presses.
+ *
+ *  `refused` still means the one Enter was SPENT: the per-chain flag must flip
+ *  regardless, so a second blind keypress can never happen. */
+function autoSubmitParkedDraftStep(state: {
+  diagnosis: { reason: string; matched?: string };
+  backendType?: string;
+  backend: { sendSpecialKeys?: (...keys: string[]) => boolean; write?: (data: string) => void } | undefined;
+  alreadyAutoSubmitted: boolean;
+  msSinceLastAutoSubmit?: number;
+}): DraftAutoSubmitStepResult {
+  if (!shouldAutoSubmitParkedDraft({
+    diagnosisReason: state.diagnosis.reason as Parameters<typeof shouldAutoSubmitParkedDraft>[0]['diagnosisReason'],
+    matched: state.diagnosis.matched,
+    backendType: state.backendType,
+    alreadyAutoSubmitted: state.alreadyAutoSubmitted,
+    msSinceLastAutoSubmit: state.msSinceLastAutoSubmit,
+  })) {
+    return 'skipped';
+  }
+  try {
+    if (state.backend && typeof state.backend.sendSpecialKeys === 'function') {
+      return state.backend.sendSpecialKeys('Enter') === false ? 'refused' : 'sent';
+    }
+    if (state.backend && typeof state.backend.write === 'function') {
+      state.backend.write('\r');
+      return 'sent';
+    }
+  } catch {
+    return 'refused';
+  }
+  return 'refused';
+}
+
 const submitFailureChains = createSubmitFailureChainController();
+/** When this pane last received an automatic Enter for a parked draft. Shared
+ *  across submit chains because back-to-back writes may each own a chain, and
+ *  two chains must not both press Enter on the same composer. */
+const draftAutoSubmitAt = new WeakMap<object, number>();
 /** Structured-bridge turns whose ordinary write threw. The throw path already
  *  tells the user (submit failure / ambiguous recovery / ZMX hold), and the
  *  bytes may never have reached the CLI, so their later lease expiry must not
@@ -18835,6 +18884,10 @@ function scheduleSubmitFailureNotify(
   let deferredRecheckAttempts = 0;
   let activeSilenceExtra = 0;
   let busySilenceExtra = 0;
+  // One Enter at most per submit chain: a parked draft can be finished without
+  // the user, but a second blind Enter into a composer we no longer classify as
+  // parked is forbidden.
+  let draftAutoSubmitted = false;
   // With botmux's SessionStart hook armed, that signal and the transcript are
   // the only arbiters (see decideSessionStartGatedSubmitWarning).
   const sessionStartGated = readyGate.isArmed;
@@ -18996,6 +19049,41 @@ function scheduleSubmitFailureNotify(
     }
     log(`Submit failure diagnosis: ${submitDiagnosis.reason} (${submitDiagnosis.evidence})${submitDiagnosis.matched ? ` match=${submitDiagnosis.matched}` : ''} preview="${preview}"`);
 
+    const backendAtAction = backend;
+    const generationAtAction = cliSpawnGeneration;
+    const draftStep = chainIsCurrent()
+      ? autoSubmitParkedDraftStep({
+        diagnosis: submitDiagnosis,
+        backendType: effectiveBackendType,
+        backend: backendAtAction as any,
+        alreadyAutoSubmitted: draftAutoSubmitted,
+        msSinceLastAutoSubmit: backendAtAction && draftAutoSubmitAt.has(backendAtAction)
+          ? Date.now() - (draftAutoSubmitAt.get(backendAtAction) as number)
+          : undefined,
+      })
+      : 'skipped';
+    if (draftStep !== 'skipped') {
+      // The exact message is still visible in the composer, so pressing Enter
+      // submits that same text once — no human needed, and no risk of a second
+      // execution. Then re-check once: if the receipt arrives, the warning is
+      // suppressed instead of asking the user anything.
+      //
+      // Spend the one Enter even if the backend refuses it: this flag exists to
+      // forbid a second blind keypress, so it must not depend on the outcome of
+      // the first one. A refusal just falls through to the warning.
+      draftAutoSubmitted = true;
+      if (backendAtAction) draftAutoSubmitAt.set(backendAtAction, Date.now());
+      if (draftStep === 'sent' && backend === backendAtAction
+        && cliSpawnGeneration === generationAtAction && chainIsCurrent()) {
+        log(
+          `Deferred recheck: draft still parked in the ${cliName()} composer — sent one Enter `
+          + `and rechecking in ${Math.round(SUBMIT_DRAFT_AUTO_SUBMIT_RECHECK_MS / 1000)}s. preview="${preview}"`,
+        );
+        armDeferredRecheck(SUBMIT_DRAFT_AUTO_SUBMIT_RECHECK_MS);
+        return;
+      }
+    }
+
     dropFailedBridgeMark(bridgeTurnId, turnIdentity?.dispatchAttempt);
     redriveRejectedStructuredReady();
     log(`Deferred recheck still missing — notifying user. preview="${preview}"`);
@@ -19027,15 +19115,15 @@ function scheduleSubmitFailureNotify(
       });
     }
   };
-  const armDeferredRecheck = (): void => {
+  const armDeferredRecheck = (delayMs = SUBMIT_DEFERRED_RECHECK_MS): void => {
     deferredRecheckAttempts++;
     const { armed, replaced } = submitFailureChains.schedule(
       chainKey,
-      SUBMIT_DEFERRED_RECHECK_MS,
+      delayMs,
       runDeferredRecheck,
     );
     if (armed) {
-      log(`writeInput: submit not confirmed after retries — deferred ${SUBMIT_DEFERRED_RECHECK_MS}ms recheck queued. preview="${preview}"`);
+      log(`writeInput: submit not confirmed after retries — deferred ${delayMs}ms recheck queued. preview="${preview}"`);
     }
     if (replaced) {
       log(`Deferred recheck already live for this attempt — replaced timer instead of stacking. preview="${preview}"`);

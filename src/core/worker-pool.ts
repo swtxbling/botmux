@@ -750,6 +750,10 @@ import {
   type OrdinaryTurnRetryInput,
 } from '../services/ordinary-turn-recovery.js';
 import {
+  decideOrdinaryImRedelivery,
+  isProvablyUndeliveredOrdinaryIm,
+} from '../services/ordinary-im-redelivery.js';
+import {
   isRecoveryRetryTurnId,
   recordAndDeliverOrdinaryRecoveryNotice,
   recoveryCauseI18nKey,
@@ -11210,6 +11214,12 @@ const transferInputGates = new WeakMap<DaemonSession, TransferInputGate>();
 const transferReplacementForkBypass = new WeakSet<DaemonSession>();
 
 const ORDINARY_IM_TRANSPORT_TIMEOUT_MS = 2_000;
+/** Grace before the deferred replay runs. `exit` is emitted before the child's
+ * last IPC frames are necessarily dispatched, so a `child.send` success
+ * callback or the worker's own `turn_input_received` ACK can still arrive after
+ * the exit handler returned. Waiting lets those drain (and the timer re-checks
+ * them again) instead of replaying a turn the worker may already have read. */
+const ORDINARY_IM_AUTO_REPLAY_DELAY_MS = 300;
 const ORDINARY_IM_MAX_ATTEMPTS = 2;
 
 type OrdinaryImDelivery = {
@@ -11222,6 +11232,12 @@ type OrdinaryImDelivery = {
   attempt: number;
   received: boolean;
   transportConfirmed: boolean;
+  /** Sticky across same-worker retries. `transportConfirmed` is reset when a
+   * later attempt starts, but an EARLIER attempt's successful `child.send`
+   * already put those bytes in the worker's IPC channel. Forgetting that would
+   * let the replay path conclude "provably never delivered" after a timeout
+   * retry, replaying a turn the dead worker may have read. */
+  transportEverConfirmed: boolean;
   /** At most one daemon ownership handoff may run for a logical delivery.
    * Duplicate worker reject events join this promise instead of creating a
    * second durable record. */
@@ -11268,27 +11284,289 @@ function clearOrdinaryImDeliveryTimer(record: OrdinaryImDelivery): void {
  * key instead of being described as ambiguous. */
 type OrdinaryImFailureMessageKey =
   | 'worker.input_delivery_failed'
+  | 'worker.input_not_delivered'
   | 'worker.input_retired_unconfirmed'
   | 'worker.input_rejected_before_admission';
 
-function failOrdinaryImDelivery(
+/** Outcome of attempting the replay. `deferred` is NOT success: the fork
+ * accepted the turn behind a gate (queued activation ACK, memory reclaim,
+ * device isolation) and may still drop it — telling the user "did not run,
+ * resend" would risk a double execution, while saying nothing could lose the
+ * turn. It therefore gets the "could not confirm" notice. */
+/** `already-reported`: the replay could not start because a working-dir error
+ * was raised, and `forkWorker`/the repo picker has ALREADY told the chat what to
+ * do. Sending the generic "resend it" notice on top would contradict that
+ * guidance (the repo picker says the opposite: do not resend). */
+export type OrdinaryImReplayOutcome = 'started' | 'deferred' | 'failed' | 'already-reported';
+
+/** Production respawn-and-replay for a turn proven never delivered. Kept as a
+ * module seam so the settlement path can be exercised without spawning a real
+ * worker; the default implementation is the only production one. */
+type OrdinaryImAutoRedeliver = (record: OrdinaryImDelivery) => OrdinaryImReplayOutcome;
+
+function redeliverOrdinaryImOnFreshWorker(record: OrdinaryImDelivery): OrdinaryImReplayOutcome {
+  const ds = record.ds;
+  const message = record.message;
+  const opening = message.type === 'init';
+  const payload: CliTurnPayload = opening
+    ? {
+        content: message.prompt,
+        ...(message.promptCodexAppInput ? { codexAppInput: message.promptCodexAppInput } : {}),
+      }
+    : {
+        content: message.content,
+        ...(message.codexAppInput ? { codexAppInput: message.codexAppInput } : {}),
+        ...(message.rerouteEnvelope ? { rerouteEnvelope: message.rerouteEnvelope } : {}),
+      };
+  const trustedCaller = message.trustedCaller;
+  const trustedController = message.trustedController;
+  if (trustedCaller) payload.trustedCaller = trustedCaller;
+  if (trustedController) payload.trustedController = trustedController;
+  try {
+    // `forkWorker` reports an explicit rejection for fences it cannot cross
+    // (remote retirement, duplicate-fork guard, quarantine) in some paths by
+    // returning TRUE after punting the input to a fence. Do not read that as a
+    // successful replay: the turn would then vanish without a notice.
+    let admission: WorkerForkAdmission | undefined;
+    const forked = replayForkWorker(ds, payload, {
+      turnId: record.turnId,
+      // An opening turn has no CLI history to resume; a follow-up must resume
+      // the same native conversation the dead worker owned.
+      resume: opening ? false : ds.hasHistory,
+      ...(trustedCaller ? { trustedCaller } : {}),
+    }, { onAdmission: value => { admission = value; } });
+    if (!forked || admission === 'rejected') return 'failed';
+    if (admission === 'deferred') return 'deferred';
+    logger.warn(
+      `[${tag(ds)}] Ordinary IM turn ${record.turnId.substring(0, 16)} was provably never `
+      + 'delivered to the dead worker; respawned it and replayed that exact turn once',
+    );
+    return 'started';
+  } catch (err) {
+    if (err instanceof MissingWorkingDirError) {
+      // forkWorker already answered the chat (repo picker "no need to resend"
+      // or the unverified-dir notice); a second "resend it" notice would
+      // contradict it. UnverifiedWorkingDirError extends this class.
+      logger.warn(
+        `[${tag(ds)}] Automatic replay of ordinary IM turn ${record.turnId.substring(0, 16)} `
+        + `refused by the working-dir gate (${err.name}); the fork entry already told the chat`,
+      );
+      return 'already-reported';
+    }
+    logger.error(
+      `[${tag(ds)}] Automatic replay of ordinary IM turn ${record.turnId.substring(0, 16)} `
+      + `failed to start a worker: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return 'failed';
+  }
+}
+
+/** Fork seam for the replay action's own tests: the real replay function is
+ * otherwise only reachable by spawning a child. Production never overrides it. */
+let replayForkWorker: typeof forkWorker = forkWorker;
+
+export function __testOnly_setReplayForkWorker(
+  impl: typeof forkWorker | undefined,
+): void {
+  replayForkWorker = impl ?? forkWorker;
+}
+
+/** Drive the REAL replay action (not the module seam) from tests. */
+export function __testOnly_redeliverOrdinaryImOnFreshWorker(
+  record: OrdinaryImDelivery,
+): OrdinaryImReplayOutcome {
+  return redeliverOrdinaryImOnFreshWorker(record);
+}
+
+let ordinaryImAutoRedeliver: OrdinaryImAutoRedeliver = redeliverOrdinaryImOnFreshWorker;
+
+/** Test seam: replace (or restore) the replay action without forking. */
+export function __testOnly_setOrdinaryImAutoRedeliver(
+  impl: OrdinaryImAutoRedeliver | undefined,
+): void {
+  ordinaryImAutoRedeliver = impl ?? redeliverOrdinaryImOnFreshWorker;
+}
+
+/** How many spent turn ids the persisted mark keeps. One dead worker can settle
+ * several ordinary turns in the same pass; the list must cover that burst so a
+ * later turn cannot overwrite an earlier one's mark and re-open its retry. */
+export const ORDINARY_IM_AUTO_REDELIVERY_MARK_LIMIT = 10;
+
+/** Persist the one-retry mark before the replay starts. Writing first is the
+ * loop guard: a daemon restart, a second exit, or a replay that itself fails
+ * must observe the mark and stop, never replay again. Swallowing a persist
+ * failure would be worse than the replay: it would let the process retry the
+ * same turn after a restart. */
+function markOrdinaryImAutoRedelivery(ds: DaemonSession, turnId: string): boolean {
+  const prior = ds.session.ordinaryImAutoRedelivery?.turnIds ?? [];
+  const turnIds = [...prior.filter(id => id !== turnId), turnId].slice(
+    -ORDINARY_IM_AUTO_REDELIVERY_MARK_LIMIT,
+  );
+  ds.session.ordinaryImAutoRedelivery = {
+    turnIds,
+    attemptedAt: new Date().toISOString(),
+  };
+  try {
+    sessionStore.updateSession(ds.session);
+    return true;
+  } catch (err) {
+    logger.error(
+      `[${tag(ds)}] Failed to persist ordinary IM auto-replay mark for `
+      + `${turnId.substring(0, 16)}; not replaying: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return false;
+  }
+}
+
+/** Re-evaluate the replay decision from the record's CURRENT facts. Called
+ * when settlement is settled (a decision, not yet an action) and again inside
+ * the deferred timer: a late `child.send` success callback or the worker's
+ * `turn_input_received` ACK can land after `exit`, and replaying then would
+ * execute a turn the dead worker may already have read.
+ *
+ * `priorTurnIds` is the mark snapshot taken BEFORE this attempt wrote its own
+ * mark. Passing it (instead of reading the session again) keeps the
+ * "already retried" guard referring to earlier attempts only, while still
+ * honouring a mark a previous daemon process left for this same turn. */
+function ordinaryImReplayDecision(
   record: OrdinaryImDelivery,
   reason: string,
-  messageKey: OrdinaryImFailureMessageKey = 'worker.input_delivery_failed',
-): void {
-  if (pendingOrdinaryImDeliveries.get(record.key) !== record) return;
-  clearOrdinaryImDelivery(record);
-  logger.error(
-    `[${tag(record.ds)}] Ordinary IM worker delivery failed `
-    + `turn=${record.turnId.substring(0, 16)} generation=${record.workerGeneration} `
-    + `attempts=${record.attempt} reason=${reason}`,
+  priorTurnIds: readonly string[] | undefined,
+): ReturnType<typeof decideOrdinaryImRedelivery> {
+  const ds = record.ds;
+  const content = record.message.type === 'init'
+    ? record.message.prompt
+    : record.message.content;
+  return decideOrdinaryImRedelivery({
+    turnId: record.turnId,
+    reason,
+    received: record.received,
+    transportConfirmed: record.transportConfirmed || record.transportEverConfirmed,
+    sessionStatus: ds.session.status,
+    contentEmpty: content.trim().length === 0,
+    attempt: record.attempt,
+    priorAutoRedeliveryTurnIds: priorTurnIds,
+  });
+}
+
+/** True when the turn still provably never reached the worker. Drives which
+ * notice is honest: "did not run, resend" vs "could not confirm, check first". */
+function isRecordProvablyUndelivered(record: OrdinaryImDelivery): boolean {
+  return isProvablyUndeliveredOrdinaryIm({
+    received: record.received,
+    transportConfirmed: record.transportConfirmed || record.transportEverConfirmed,
+  });
+}
+
+/** The replay door: decide, mark, then schedule the respawn. The respawn must
+ * wait until the exit handler has finished clearing `ds.worker` and fencing the
+ * generation, so it runs from a timer rather than inline. Returns true when
+ * this record is being recovered automatically and no notice is owed now. */
+function maybeAutoRedeliverOrdinaryImDelivery(
+  record: OrdinaryImDelivery,
+  reason: string,
+): boolean {
+  const ds = record.ds;
+  // Snapshot before writing this attempt's own mark; reused by the timer.
+  const priorTurnIds = ds.session.ordinaryImAutoRedelivery?.turnIds?.slice();
+  const decision = ordinaryImReplayDecision(record, reason, priorTurnIds);
+  if (decision !== 'auto-redeliver') return false;
+  if (!markOrdinaryImAutoRedelivery(ds, record.turnId)) return false;
+  // The canonical "Ordinary IM worker delivery failed ..." line is already
+  // logged by failOrdinaryImDelivery; this line only records the decision.
+  logger.warn(
+    `[${tag(ds)}] Ordinary IM turn ${record.turnId.substring(0, 16)} is provably `
+    + 'undelivered (worker never confirmed IPC transport); replaying it once on a fresh worker',
   );
-  if (record.turnId.startsWith('bmx-recovery-')
-    && (!isRecoveryRetryTurnId(record.turnId)
-      || record.ds.session.ordinaryTurnRecovery?.currentTurnId === record.turnId)) {
+  const timer = setTimeout(() => {
+    // This body runs outside the event handler that used to call the notice
+    // synchronously: an exception here would be an uncaught daemon error, so
+    // every step is contained and a failed replay always ends in a notice.
+    try {
+      // Re-decide from current facts: late IPC callbacks / ACKs, a session that
+      // stopped being active, or a mark written meanwhile all disqualify the
+      // replay and must not be seen as "already done".
+      const lateDecision = ordinaryImReplayDecision(record, reason, priorTurnIds);
+      if (lateDecision !== 'auto-redeliver') {
+        const noticeKey = isRecordProvablyUndelivered(record)
+          ? 'worker.input_not_delivered'
+          : 'worker.input_delivery_failed';
+        logger.warn(
+          `[${tag(ds)}] Not replaying ordinary IM turn ${record.turnId.substring(0, 16)}: `
+          + `state changed before the replay (received=${record.received} `
+          + `transportConfirmed=${record.transportConfirmed} `
+          + `transportEverConfirmed=${record.transportEverConfirmed} `
+          + `status=${ds.session.status})`,
+        );
+        reportOrdinaryImDeliveryFailure(ds, record.turnId, reason, noticeKey);
+        return;
+      }
+      if (ds.session.status !== 'active') {
+        logger.warn(
+          `[${tag(ds)}] Not replaying ordinary IM turn ${record.turnId.substring(0, 16)}: `
+          + `session became ${ds.session.status}`,
+        );
+        reportOrdinaryImDeliveryFailure(ds, record.turnId, reason, 'worker.input_not_delivered');
+        return;
+      }
+      if (isSessionTransferring(ds) || (ds.worker && !ds.worker.killed)) {
+        // Another path already produced a live worker (a later user message, a
+        // restore, a routing transfer). Sending this older turn now could invert
+        // the user's own ordering, so leave the resend to the human.
+        logger.warn(
+          `[${tag(ds)}] Not replaying ordinary IM turn ${record.turnId.substring(0, 16)}: `
+          + 'a live worker or transfer gate appeared first',
+        );
+        reportOrdinaryImDeliveryFailure(ds, record.turnId, reason, 'worker.input_not_delivered');
+        return;
+      }
+      const outcome = ordinaryImAutoRedeliver(record);
+      if (outcome === 'already-reported') {
+        // The fork entry (repo picker / unverified working dir) already replied.
+        return;
+      }
+      if (outcome === 'failed') {
+        reportOrdinaryImDeliveryFailure(ds, record.turnId, reason, 'worker.input_not_delivered');
+      } else if (outcome === 'deferred') {
+        // The fork is parked behind a gate and may still drop the turn. Only
+        // the ambiguous wording is safe here: it must not invite a resend.
+        reportOrdinaryImDeliveryFailure(ds, record.turnId, reason, 'worker.input_delivery_failed');
+      }
+    } catch (err) {
+      logger.error(
+        `[${tag(ds)}] Deferred replay of ordinary IM turn ${record.turnId.substring(0, 16)} `
+        + `threw: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      try {
+        reportOrdinaryImDeliveryFailure(ds, record.turnId, reason, 'worker.input_not_delivered');
+      } catch (noticeErr) {
+        logger.error(
+          `[${tag(ds)}] Failed to report ordinary IM replay failure: `
+          + `${noticeErr instanceof Error ? noticeErr.message : String(noticeErr)}`,
+        );
+      }
+    }
+  }, ORDINARY_IM_AUTO_REPLAY_DELAY_MS);
+  timer.unref?.();
+  return true;
+}
+
+/** Deliver the terminal user-facing notice for one failed ordinary-IM turn.
+ * Shared by the direct failure path and the deferred auto-replay path (the
+ * pending record is already settled by then). */
+function reportOrdinaryImDeliveryFailure(
+  ds: DaemonSession,
+  turnId: string,
+  reason: string,
+  messageKey: OrdinaryImFailureMessageKey,
+): void {
+  if (turnId.startsWith('bmx-recovery-')
+    && (!isRecoveryRetryTurnId(turnId)
+      || ds.session.ordinaryTurnRecovery?.currentTurnId === turnId)) {
     requireOrdinaryTurnRecoveryAttention(
-      record.ds.session,
-      record.turnId,
+      ds.session,
+      turnId,
       'recovery_delivery_failed',
     );
     return;
@@ -11299,18 +11577,18 @@ function failOrdinaryImDelivery(
   // 决策看板批次（board:<app>:<batchId>）是 owner 在看板前触发的后台投递，不是群里
   // 等来的真人消息：失败不往管家群贴卡片（owner 看不到，横幅还会造成困惑），交给
   // daemon 的回调把批次退回 failed——Dashboard 批次行显示原因并用同一稳定 turnId 重投。
-  if (record.turnId.startsWith('board:')) {
+  if (turnId.startsWith('board:')) {
     try {
       const handled = requireCallbacks().onBoardTurnDeliveryFailed?.(
-        record.ds,
-        { turnId: record.turnId, reason, messageKey },
+        ds,
+        { turnId, reason, messageKey },
       );
       void Promise.resolve(handled).catch(err => logger.error(
-        `[${tag(record.ds)}] board delivery failure callback errored: ${err instanceof Error ? err.message : String(err)}`,
+        `[${tag(ds)}] board delivery failure callback errored: ${err instanceof Error ? err.message : String(err)}`,
       ));
     } catch (err) {
       logger.error(
-        `[${tag(record.ds)}] board delivery failure callback threw: ${err instanceof Error ? err.message : String(err)}`,
+        `[${tag(ds)}] board delivery failure callback threw: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
     return;
@@ -11322,18 +11600,44 @@ function failOrdinaryImDelivery(
   // stamped meeting @mention follow-up stays fenced (isMeetingDrivenTurn); a
   // silent scheduled turn stays suppressed as before. (isMeetingDrivenTurn
   // supersedes the pre-Plan-B `vcMeetingReceiver` blanket check.)
-  if (isMeetingDrivenTurn(record.ds, record.turnId) || isSilentScheduledTurn(record.ds, record.turnId)) return;
-  const loc = botLocale(getBot(record.ds.larkAppId).config);
+  if (isMeetingDrivenTurn(ds, turnId) || isSilentScheduledTurn(ds, turnId)) return;
+  const loc = botLocale(getBot(ds.larkAppId).config);
   void requireCallbacks().sessionReply(
-    sessionAnchorId(record.ds),
-    tr(messageKey, { turnId: record.turnId.substring(0, 16), reason }, loc),
+    sessionAnchorId(ds),
+    tr(messageKey, { turnId: turnId.substring(0, 16), reason }, loc),
     'text',
-    record.ds.larkAppId,
-    record.turnId,
+    ds.larkAppId,
+    turnId,
   ).catch(err => logger.error(
-    `[${tag(record.ds)}] Failed to report ordinary IM worker delivery failure: `
+    `[${tag(ds)}] Failed to report ordinary IM worker delivery failure: `
     + `${err instanceof Error ? err.message : String(err)}`,
   ));
+}
+
+function failOrdinaryImDelivery(
+  record: OrdinaryImDelivery,
+  reason: string,
+  messageKey?: OrdinaryImFailureMessageKey,
+): void {
+  if (pendingOrdinaryImDeliveries.get(record.key) !== record) return;
+  clearOrdinaryImDelivery(record);
+  logger.error(
+    `[${tag(record.ds)}] Ordinary IM worker delivery failed `
+    + `turn=${record.turnId.substring(0, 16)} generation=${record.workerGeneration} `
+    + `attempts=${record.attempt} reason=${reason}`,
+  );
+  if (maybeAutoRedeliverOrdinaryImDelivery(record, reason)) return;
+  // Proof that nothing ran changes what the user may safely do: a turn that
+  // never left the daemon can simply be sent again, while an ambiguous one must
+  // be checked in the session first.
+  const key = messageKey
+    ?? (isProvablyUndeliveredOrdinaryIm({
+      received: record.received,
+      transportConfirmed: record.transportConfirmed || record.transportEverConfirmed,
+    })
+      ? 'worker.input_not_delivered'
+      : 'worker.input_delivery_failed');
+  reportOrdinaryImDeliveryFailure(record.ds, record.turnId, reason, key);
 }
 
 function retryOrFailOrdinaryImDelivery(
@@ -11387,6 +11691,13 @@ function sendOrdinaryImDeliveryAttempt(record: OrdinaryImDelivery): boolean {
   record.timer.unref?.();
   try {
     record.worker.send(record.message, (err) => {
+      // Sticky BEFORE the attempt guard: a success callback for an EARLIER
+      // attempt still proves those bytes entered the worker's IPC channel.
+      // Attempt 1's callback can land after the 2s timeout already started
+      // attempt 2 (and reset the per-attempt flags); recording it only on the
+      // current attempt would forget that and let the replay path call a
+      // possibly-read turn "provably never delivered".
+      if (!err) record.transportEverConfirmed = true;
       if (pendingOrdinaryImDeliveries.get(record.key) !== record || record.attempt !== attempt) return;
       if (record.received) return;
       if (err) {
@@ -11394,6 +11705,7 @@ function sendOrdinaryImDeliveryAttempt(record: OrdinaryImDelivery): boolean {
         return;
       }
       record.transportConfirmed = true;
+      record.transportEverConfirmed = true;
       clearOrdinaryImDeliveryTimer(record);
       logger.info(
         `[${tag(record.ds)}] Ordinary IM input enqueued to worker IPC `
@@ -11472,6 +11784,7 @@ function sendOrdinaryImDeliveryTracked(
     attempt: 0,
     received: false,
     transportConfirmed: false,
+    transportEverConfirmed: false,
   };
   pendingOrdinaryImDeliveries.set(key, record);
   onIpcDispatchAttempted?.();
@@ -11634,9 +11947,13 @@ function settleOrdinaryImDeliveriesForWorker(
       clearOrdinaryImDelivery(record);
       continue;
     }
+    // Use the sticky transport flag: a retry resets the per-attempt
+    // `transportConfirmed`, but an earlier attempt's bytes may already be in
+    // the channel. The logged reason must match the replay decision, since this
+    // line is the only way to diagnose a skipped replay later.
     const reason = record.received
       ? 'worker_exited_after_receipt'
-      : record.transportConfirmed
+      : record.transportConfirmed || record.transportEverConfirmed
         ? 'worker_exited_after_ipc_enqueue'
         : 'worker_exited_before_ipc_enqueue';
     failOrdinaryImDelivery(record, reason);
