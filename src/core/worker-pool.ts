@@ -11293,7 +11293,11 @@ type OrdinaryImFailureMessageKey =
  * device isolation) and may still drop it — telling the user "did not run,
  * resend" would risk a double execution, while saying nothing could lose the
  * turn. It therefore gets the "could not confirm" notice. */
-export type OrdinaryImReplayOutcome = 'started' | 'deferred' | 'failed';
+/** `already-reported`: the replay could not start because a working-dir error
+ * was raised, and `forkWorker`/the repo picker has ALREADY told the chat what to
+ * do. Sending the generic "resend it" notice on top would contradict that
+ * guidance (the repo picker says the opposite: do not resend). */
+export type OrdinaryImReplayOutcome = 'started' | 'deferred' | 'failed' | 'already-reported';
 
 /** Production respawn-and-replay for a turn proven never delivered. Kept as a
  * module seam so the settlement path can be exercised without spawning a real
@@ -11324,7 +11328,7 @@ function redeliverOrdinaryImOnFreshWorker(record: OrdinaryImDelivery): OrdinaryI
     // returning TRUE after punting the input to a fence. Do not read that as a
     // successful replay: the turn would then vanish without a notice.
     let admission: WorkerForkAdmission | undefined;
-    const forked = forkWorker(ds, payload, {
+    const forked = replayForkWorker(ds, payload, {
       turnId: record.turnId,
       // An opening turn has no CLI history to resume; a follow-up must resume
       // the same native conversation the dead worker owned.
@@ -11339,12 +11343,39 @@ function redeliverOrdinaryImOnFreshWorker(record: OrdinaryImDelivery): OrdinaryI
     );
     return 'started';
   } catch (err) {
+    if (err instanceof MissingWorkingDirError) {
+      // forkWorker already answered the chat (repo picker "no need to resend"
+      // or the unverified-dir notice); a second "resend it" notice would
+      // contradict it. UnverifiedWorkingDirError extends this class.
+      logger.warn(
+        `[${tag(ds)}] Automatic replay of ordinary IM turn ${record.turnId.substring(0, 16)} `
+        + `refused by the working-dir gate (${err.name}); the fork entry already told the chat`,
+      );
+      return 'already-reported';
+    }
     logger.error(
       `[${tag(ds)}] Automatic replay of ordinary IM turn ${record.turnId.substring(0, 16)} `
       + `failed to start a worker: ${err instanceof Error ? err.message : String(err)}`,
     );
     return 'failed';
   }
+}
+
+/** Fork seam for the replay action's own tests: the real replay function is
+ * otherwise only reachable by spawning a child. Production never overrides it. */
+let replayForkWorker: typeof forkWorker = forkWorker;
+
+export function __testOnly_setReplayForkWorker(
+  impl: typeof forkWorker | undefined,
+): void {
+  replayForkWorker = impl ?? forkWorker;
+}
+
+/** Drive the REAL replay action (not the module seam) from tests. */
+export function __testOnly_redeliverOrdinaryImOnFreshWorker(
+  record: OrdinaryImDelivery,
+): OrdinaryImReplayOutcome {
+  return redeliverOrdinaryImOnFreshWorker(record);
 }
 
 let ordinaryImAutoRedeliver: OrdinaryImAutoRedeliver = redeliverOrdinaryImOnFreshWorker;
@@ -11491,6 +11522,10 @@ function maybeAutoRedeliverOrdinaryImDelivery(
         return;
       }
       const outcome = ordinaryImAutoRedeliver(record);
+      if (outcome === 'already-reported') {
+        // The fork entry (repo picker / unverified working dir) already replied.
+        return;
+      }
       if (outcome === 'failed') {
         reportOrdinaryImDeliveryFailure(ds, record.turnId, reason, 'worker.input_not_delivered');
       } else if (outcome === 'deferred') {

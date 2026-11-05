@@ -111,13 +111,20 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 }));
 
 import {
+  __testOnly_redeliverOrdinaryImOnFreshWorker,
   __testOnly_resetOrdinaryImDeliveries,
   __testOnly_setOrdinaryImAutoRedeliver,
+  __testOnly_setReplayForkWorker,
   __testOnly_setupWorkerHandlers,
   initWorkerPool,
+  ORDINARY_IM_AUTO_REDELIVERY_MARK_LIMIT,
   restartCounts,
   sendWorkerInput,
 } from '../src/core/worker-pool.js';
+import {
+  MissingWorkingDirError,
+  UnverifiedWorkingDirError,
+} from '../src/core/working-dir-recovery.js';
 import type { DaemonSession } from '../src/core/types.js';
 import {
   decideOrdinaryImRedelivery,
@@ -231,8 +238,15 @@ describe('ordinary IM auto-redelivery (worker exit settlement)', () => {
     expect(replay).toHaveBeenCalledTimes(1);
     expect(replay.mock.calls[0][0].turnId).toBe('om_lost_1');
     expect(replay.mock.calls[0][0].message).toMatchObject({ type: 'message', content: 'hello' });
+    // The mark must already be on the session when the replay runs: this is
+    // what stops a daemon restart or a second exit from replaying again.
     expect(ds.session.ordinaryImAutoRedelivery?.turnIds).toEqual(['om_lost_1']);
-    expect(updateSessionMock).toHaveBeenCalled();
+    expect(updateSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      ordinaryImAutoRedelivery: {
+        turnIds: ['om_lost_1'],
+        attemptedAt: expect.any(String),
+      },
+    }));
     expect(deliveryNotices()).toEqual([]);
   });
 
@@ -338,6 +352,29 @@ describe('ordinary IM auto-redelivery (worker exit settlement)', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('does not replay when the one-retry mark cannot be persisted', async () => {
+    // Writing the mark BEFORE the replay is the loop guard. If the write fails
+    // and the replay still ran, a daemon restart would have no record that the
+    // retry was spent and could replay the same turn again.
+    updateSessionMock.mockImplementation((session: any) => {
+      if (session?.ordinaryImAutoRedelivery?.turnIds?.includes('om_mark_fail_1')) {
+        throw new Error('disk full');
+      }
+    });
+    const worker = makeFakeWorker();
+    const ds = makeDs(worker, 'sid-mark-fail');
+    __testOnly_setupWorkerHandlers(ds, worker);
+    expect(sendWorkerInput(ds, { content: 'mark fails' }, 'om_mark_fail_1')).toBe(true);
+
+    worker.emit('exit', 1, null);
+    await flush();
+
+    expect(replay).not.toHaveBeenCalled();
+    const notices = deliveryNotices();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatch(/did not run|没有执行/);
   });
 
   it('does not replay when transport confirmation arrives after exit but before the timer', async () => {
@@ -548,5 +585,124 @@ describe('delivery-failure notices are actionable in both locales', () => {
       const text = messages['worker.input_delivery_failed'];
       expect(text).toMatch(/下一步|Next step/);
     }
+  });
+});
+
+describe('the real replay action (redeliverOrdinaryImOnFreshWorker)', () => {
+  let forkSpy: ReturnType<typeof vi.fn>;
+  let admission: 'accepted' | 'deferred' | 'rejected' | undefined;
+  let forkResult: boolean;
+
+  const makeRecord = (
+    message: any,
+    overrides: Record<string, unknown> = {},
+  ) => ({
+    key: 'k',
+    ds: makeDs(makeFakeWorker(), 'sid-real-replay'),
+    worker: makeFakeWorker(),
+    workerGeneration: 1,
+    message,
+    turnId: 'om_real_1',
+    attempt: 1,
+    received: false,
+    transportConfirmed: false,
+    transportEverConfirmed: false,
+    ...overrides,
+  }) as any;
+
+  beforeEach(() => {
+    admission = 'accepted';
+    forkResult = true;
+    forkSpy = vi.fn(((ds: any, _payload: any, _resume: any, opts: any) => {
+      opts?.onAdmission?.(admission);
+      return forkResult;
+    }) as any);
+    __testOnly_setReplayForkWorker(forkSpy as any);
+  });
+
+  afterEach(() => {
+    __testOnly_setReplayForkWorker(undefined);
+  });
+
+  it('replays a follow-up turn with its exact payload and resumes the conversation', () => {
+    const codexAppInput = { text: 'typed' };
+    const rerouteEnvelope = { kind: 'reroute' };
+    const record = makeRecord({
+      type: 'message',
+      content: 'follow up',
+      codexAppInput,
+      rerouteEnvelope,
+      trustedCaller: 'ou_caller',
+      trustedController: 'ou_controller',
+    });
+
+    expect(__testOnly_redeliverOrdinaryImOnFreshWorker(record)).toBe('started');
+    expect(forkSpy).toHaveBeenCalledTimes(1);
+    const [forkedDs, payload, resume, opts] = forkSpy.mock.calls[0];
+    expect(forkedDs).toBe(record.ds);
+    expect(payload).toEqual({
+      content: 'follow up',
+      codexAppInput,
+      rerouteEnvelope,
+      trustedCaller: 'ou_caller',
+      trustedController: 'ou_controller',
+    });
+    expect(resume).toEqual({ turnId: 'om_real_1', resume: true, trustedCaller: 'ou_caller' });
+    expect(typeof opts.onAdmission).toBe('function');
+  });
+
+  it('replays an opening turn as a fresh spawn with the init prompt', () => {
+    const record = makeRecord({
+      type: 'init',
+      prompt: 'opening',
+      promptCodexAppInput: { text: 'opening typed' },
+    });
+
+    expect(__testOnly_redeliverOrdinaryImOnFreshWorker(record)).toBe('started');
+    const [, payload, resume] = forkSpy.mock.calls[0];
+    expect(payload).toEqual({ content: 'opening', codexAppInput: { text: 'opening typed' } });
+    // An opening turn has no conversation to resume, even with history.
+    expect(resume).toEqual({ turnId: 'om_real_1', resume: false });
+  });
+
+  it('maps an admission rejection or an immediate false return to a failed replay', () => {
+    admission = 'rejected';
+    expect(__testOnly_redeliverOrdinaryImOnFreshWorker(makeRecord({
+      type: 'message', content: 'x',
+    }))).toBe('failed');
+
+    admission = 'accepted';
+    forkResult = false;
+    expect(__testOnly_redeliverOrdinaryImOnFreshWorker(makeRecord({
+      type: 'message', content: 'x',
+    }))).toBe('failed');
+  });
+
+  it('reports a deferred admission as deferred rather than started', () => {
+    admission = 'deferred';
+    expect(__testOnly_redeliverOrdinaryImOnFreshWorker(makeRecord({
+      type: 'message', content: 'x',
+    }))).toBe('deferred');
+  });
+
+  it('stays silent when the fork entry already answered a working-dir error', () => {
+    // forkWorker's repo picker says "no need to resend" (and the unverified-dir
+    // notice says the same): a "resend it" notice on top would contradict it.
+    forkSpy.mockImplementation(() => { throw new MissingWorkingDirError('/gone'); });
+    expect(__testOnly_redeliverOrdinaryImOnFreshWorker(makeRecord({
+      type: 'message', content: 'x',
+    }))).toBe('already-reported');
+
+    forkSpy.mockImplementation(() => { throw new UnverifiedWorkingDirError('/gone', 'probe failed'); });
+    expect(__testOnly_redeliverOrdinaryImOnFreshWorker(makeRecord({
+      type: 'message', content: 'x',
+    }))).toBe('already-reported');
+  });
+
+  it('still reports any other fork failure as failed', () => {
+    forkSpy.mockImplementation(() => { throw new Error('spawn exploded'); });
+    expect(__testOnly_redeliverOrdinaryImOnFreshWorker(makeRecord({
+      type: 'message', content: 'x',
+    }))).toBe('failed');
   });
 });
