@@ -49,8 +49,11 @@ import {
   clearRestoreCwdUnverified,
   guardFlaggedSessionTurn,
   markRestoreCwdUnverified,
-  verifyRestoreCwdBeforeUse,
 } from '../src/core/restore-cwd-flag.js';
+import {
+  __resetFlaggedCwdProbeCacheForTests,
+  probeFlaggedCwd,
+} from '../src/core/restore-cwd-recovery.js';
 import { logger } from '../src/utils/logger.js';
 
 const hangingProbe = (): Promise<void> => new Promise<void>(() => {});
@@ -62,6 +65,7 @@ function makeSession(): sessionStore.Session {
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), 'botmux-restore-cwd-flag-'));
   sessionStore.init('app_test');
+  __resetFlaggedCwdProbeCacheForTests();
   tokenSnapshots.count = 0;
   vi.mocked(logger.warn).mockClear();
 });
@@ -135,19 +139,57 @@ describe('guardFlaggedSessionTurn', () => {
   });
 });
 
-describe('verifyRestoreCwdBeforeUse / clearRestoreCwdUnverified', () => {
-  it('reports a missing directory without clearing the flag', async () => {
-    const session = makeSession();
-    markRestoreCwdUnverified(session);
-    const result = await verifyRestoreCwdBeforeUse(session, '/gone', {
-      probe: async () => {
+describe('probeFlaggedCwd cache / clearRestoreCwdUnverified', () => {
+  it('shares one probe between concurrent callers', async () => {
+    const probe = vi.fn(hangingProbe);
+    const [a, b, c] = await Promise.all([
+      probeFlaggedCwd('/shared/hung', { probe, timeoutMs: 20 }),
+      probeFlaggedCwd('/shared/hung', { probe, timeoutMs: 20 }),
+      probeFlaggedCwd('/shared/hung', { probe, timeoutMs: 20 }),
+    ]);
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect([a.status, b.status, c.status]).toEqual(['timeout', 'timeout', 'timeout']);
+  });
+
+  it('answers from the cached timeout during the cooldown, then probes again after it', async () => {
+    let clock = 1_000;
+    const now = (): number => clock;
+    const probe = vi.fn(hangingProbe);
+    const first = await probeFlaggedCwd('/cooldown/hung', { probe, timeoutMs: 20, now });
+    expect(first.status).toBe('timeout');
+    expect(probe).toHaveBeenCalledTimes(1);
+
+    clock += 1_000;
+    const cached = await probeFlaggedCwd('/cooldown/hung', { probe, timeoutMs: 20, now });
+    expect(cached.status).toBe('timeout');
+    expect(probe).toHaveBeenCalledTimes(1);
+
+    clock += 31_000;
+    await probeFlaggedCwd('/cooldown/hung', { probe, timeoutMs: 20, now });
+    expect(probe).toHaveBeenCalledTimes(2);
+  });
+
+  it('reuses a positive verdict so the next fork can proceed immediately', async () => {
+    const probe = vi.fn(async () => {});
+    await probeFlaggedCwd('/cooldown/good', { probe });
+    const cached = await probeFlaggedCwd('/cooldown/good', { probe });
+    expect(cached.status).toBe('ok');
+    expect(probe).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not cache a missing directory, so a recreated one is detected at once', async () => {
+    let missing = true;
+    const probe = vi.fn(async () => {
+      if (missing) {
         const error = new Error('no such directory') as NodeJS.ErrnoException;
         error.code = 'ENOENT';
         throw error;
-      },
+      }
     });
-    expect(result.ok).toBe(false);
-    expect(session.restoreCwdUnverifiedAt).toBeDefined();
+    expect((await probeFlaggedCwd('/gone/then/back', { probe })).status).toBe('missing');
+    missing = false;
+    expect((await probeFlaggedCwd('/gone/then/back', { probe })).status).toBe('ok');
+    expect(probe).toHaveBeenCalledTimes(2);
   });
 
   it('clears the flag exactly once when the directory is verified', async () => {

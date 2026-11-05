@@ -14,6 +14,24 @@
 //      that deadline no matter how many directories hang.
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { readFile } from 'node:fs/promises';
+import { readFileSync, unlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+// Records child-process creation so a test can prove the production probe
+// really answers from a separate process (an in-process stat/access would not
+// spawn anything and would reintroduce the libuv thread-pool starvation bug).
+const spawnCalls = vi.hoisted(() => [] as { command: string; args: string[] }[]);
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  return {
+    ...actual,
+    spawn: vi.fn((command: any, args: any, options: any) => {
+      spawnCalls.push({ command: String(command), args: [...((args as string[] | undefined) ?? [])] });
+      return actual.spawn(command, args, options);
+    }),
+  };
+});
 import {
   createSubprocessCwdProbe,
   defaultRestoreCwdProbe,
@@ -181,6 +199,49 @@ describe('probeRestoreSessionCwds', () => {
     expect(probe).toHaveBeenCalledTimes(1);
     expect([...results.values()].every(result => result.status === 'ok')).toBe(true);
     expect([...results.keys()].sort()).toEqual(['sess-1', 'sess-2', 'sess-3']);
+  });
+
+  it('runs the production default probe out of process', async () => {
+    vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    spawnCalls.length = 0;
+
+    await expect(defaultRestoreCwdProbe('/tmp')).resolves.toBeUndefined();
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0]!.command).toBe('/bin/sh');
+    expect(spawnCalls[0]!.args).toContain('/tmp');
+
+    await expect(defaultRestoreCwdProbe('/nonexistent-default-probe-check'))
+      .rejects.toMatchObject({ code: 'ENOENT' });
+    expect(spawnCalls).toHaveLength(2);
+  });
+
+  it('SIGKILLs a probe child that ignores SIGTERM instead of leaving it stuck', async () => {
+    vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    const pidFile = join(tmpdir(), `botmux-probe-pid-${process.pid}-${Date.now()}`);
+    const probe = createSubprocessCwdProbe({
+      // The child ignores SIGTERM; only the hard kill can stop it.
+      args: () => ['-c', `echo $$ > "${pidFile}"; trap '' TERM; exec sleep 30`],
+      timeoutMs: 150,
+    });
+    try {
+      await expect(probe('/tmp')).rejects.toThrow(/no answer/);
+      const pid = Number(readFileSync(pidFile, 'utf8').trim());
+      expect(pid).toBeGreaterThan(0);
+      let alive = true;
+      for (let attempt = 0; attempt < 50; attempt += 1) {
+        try {
+          process.kill(pid, 0);
+        } catch {
+          alive = false;
+          break;
+        }
+        await sleep(20);
+      }
+      expect(alive).toBe(false);
+      try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+    } finally {
+      try { unlinkSync(pidFile); } catch { /* child never wrote it */ }
+    }
   });
 
   it('exposes a finite default deadline so a hung probe cannot stall boot forever', () => {

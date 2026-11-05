@@ -158,7 +158,7 @@ export function createSubprocessCwdProbe(
 /** Default probe: out-of-process, killable, never touches the daemon pool. */
 export const defaultRestoreCwdProbe: RestoreCwdProbe = createSubprocessCwdProbe();
 
-function classifyProbeError(error: unknown, timeoutMs: number): RestoreCwdProbeResult {
+function classifyProbeError(error: unknown): RestoreCwdProbeResult {
   if (error instanceof RestoreCwdProbeTimeoutError) {
     return {
       status: 'timeout',
@@ -173,7 +173,6 @@ function classifyProbeError(error: unknown, timeoutMs: number): RestoreCwdProbeR
   if (code === 'EACCES' || code === 'EPERM') {
     return { status: 'unreadable', detail: `permission denied (${code})` };
   }
-  void timeoutMs;
   return { status: 'unreadable', detail: message };
 }
 
@@ -195,7 +194,7 @@ async function probeOne(
     ]);
     return { status: 'ok' };
   } catch (error) {
-    return classifyProbeError(error, timeoutMs);
+    return classifyProbeError(error);
   } finally {
     if (timer) clearTimeout(timer);
   }
@@ -207,6 +206,8 @@ export interface ProbeRestoreCwdsOptions {
   timeoutMs?: number;
   /** Max concurrent probes. */
   concurrency?: number;
+  /** Skip the per-target warn lines (recovery probes run on every message). */
+  silent?: boolean;
 }
 
 /**
@@ -252,7 +253,7 @@ export async function probeRestoreSessionCwds(
   for (const target of targets) {
     const result = byCwd.get(target.cwd) ?? { status: 'unreadable', detail: 'probe result lost' };
     results.set(target.sessionId, result);
-    if (result.status === 'ok') continue;
+    if (result.status === 'ok' || options.silent) continue;
     logger.warn(
       `[restore] working directory check ${result.status} for session ${target.sessionId}: `
       + `${target.cwd} — ${result.detail ?? 'unknown reason'}. `

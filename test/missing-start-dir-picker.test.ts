@@ -142,6 +142,10 @@ import {
 } from '../src/daemon.js';
 import { handleCardAction } from '../src/im/lark/card-handler.js';
 import { restoreActiveSessions } from '../src/core/session-manager.js';
+import {
+  __resetFlaggedCwdProbeCacheForTests,
+  probeFlaggedCwd,
+} from '../src/core/restore-cwd-recovery.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 const APP = 'missing_start_dir_app';
@@ -210,6 +214,7 @@ function registerTestBot(defaultWorkingDir: string, workingDir?: string): void {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  __resetFlaggedCwdProbeCacheForTests();
   mocks.sessions.clear();
   activeSessions.clear();
   mocks.replyMessage.mockImplementation(async (...args: any[]) => (args[3] === 'interactive' ? CARD_ID : 'om_reply'));
@@ -377,5 +382,67 @@ describe('default working dir missing → the repo picker, not a start in that d
 
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
     expect(publishedCards()).toHaveLength(0);
+  });
+});
+
+
+describe('a restored session whose boot cwd probe timed out', () => {
+  it('answers the message without forking, without touching stream-card bookkeeping, and without the ✋ ack', async () => {
+    const anchor = 'om_flagged_root';
+    const messageId = 'om_flagged_message';
+    const flaggedCwd = join(tmpRoot, 'flagged-mount');
+    registerTestBot(flaggedCwd);
+    // Seed the shared probe cache with a recent timeout: the guard must answer
+    // from it immediately instead of waiting another full probe budget.
+    const hung = await probeFlaggedCwd(flaggedCwd, {
+      probe: () => new Promise<void>(() => {}),
+      timeoutMs: 10,
+    });
+    expect(hung.status).toBe('timeout');
+
+    const stored = mocks.createSession(CHAT, anchor, 'Topic', 'group');
+    const ds = {
+      larkAppId: APP,
+      chatId: CHAT,
+      chatType: 'group',
+      scope: 'thread',
+      worker: null,
+      workerReady: false,
+      session: {
+        ...stored,
+        larkAppId: APP,
+        chatId: CHAT,
+        cliId: 'claude-code',
+        status: 'active',
+        workingDir: flaggedCwd,
+        restoreCwdUnverifiedAt: new Date().toISOString(),
+      },
+    } as unknown as DaemonSession;
+    mocks.updateSession(ds.session);
+    activeSessions.set(sessionKey(anchor, APP), ds);
+
+    const started = Date.now();
+    await handleThreadReply(
+      makeEventData(messageId, OPENING, anchor),
+      makeCtx(anchor, messageId),
+    );
+
+    // The recent timeout answers immediately: no second 1500ms probe per message.
+    expect(Date.now() - started).toBeLessThan(500);
+    // No CLI start.
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    // The human was told which directory and what to do.
+    const replies = [...mocks.replyMessage.mock.calls, ...mocks.sendMessage.mock.calls]
+      .map(call => String((call as unknown[])[2]))
+      .filter(text => text.includes('暂时读不到'));
+    expect(replies).toHaveLength(1);
+    expect(replies[0]).toContain(flaggedCwd);
+    expect(replies[0]).toContain('/repo');
+    expect(replies[0]).toContain('/cd');
+    // No dangling stream-card turn state and no ✋ received ack.
+    expect(ds.streamCardPending).toBeUndefined();
+    expect(ds.streamCardPendingTurnId).toBeUndefined();
+    expect(ds.currentTurnId).toBeUndefined();
+    expect(mocks.addReaction).not.toHaveBeenCalled();
   });
 });

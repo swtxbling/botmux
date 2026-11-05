@@ -58,6 +58,7 @@ import { clearSessionPreviewTarget } from './session-preview-registry.js';
 import { composeRowFromActive, composeRowFromPersistedActive } from './dashboard-rows.js';
 import type { DashboardRowOptions } from './dashboard-rows.js';
 import { probeRestoreSessionCwds, type RestoreCwdProbe } from './restore-cwd-probe.js';
+import { clearRestoreCwdUnverified, markRestoreCwdUnverified } from './restore-cwd-flag.js';
 import {
   composeSpawnCodexAppContext,
   composeSpawnUserContent,
@@ -2789,14 +2790,18 @@ export async function restoreActiveSessions(
   for (const session of active) {
     const unverified = cwdProbeTimedOut(session);
     if (unverified === !!session.restoreCwdUnverifiedAt) continue;
-    session.restoreCwdUnverifiedAt = unverified ? new Date().toISOString() : undefined;
-    try {
-      sessionStore.updateSession(session);
-    } catch (err) {
-      logger.warn(
-        `[${session.sessionId.substring(0, 8)}] Could not persist working-directory probe verdict: `
-        + `${err instanceof Error ? err.message : String(err)}`,
-      );
+    if (unverified) {
+      markRestoreCwdUnverified(session);
+      try {
+        sessionStore.updateSession(session);
+      } catch (err) {
+        logger.warn(
+          `[${session.sessionId.substring(0, 8)}] Could not persist working-directory probe verdict: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    } else {
+      clearRestoreCwdUnverified(session);
     }
   }
   // Rows announced/quarantined during restore must not resolve transcripts:
