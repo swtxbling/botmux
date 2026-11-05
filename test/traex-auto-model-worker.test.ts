@@ -881,14 +881,14 @@ describe('same-worker Auto restart model continuity', () => {
     { cliId: 'traex', resume: false, cliSessionId: 'native', eligible: true, preserved: false },
     { cliId: 'traex', resume: true, cliSessionId: 'native', eligible: false, preserved: false },
     { cliId: 'claude-code', resume: true, cliSessionId: 'native', eligible: false, preserved: false },
-  ])('passes the delivered catalog only to an eligible same-session Auto resume (%j)', ({ eligible, preserved, ...cfg }) => {
+  ])('passes the delivered catalog only to an eligible same-session Auto resume (%j)', async ({ eligible, preserved, ...cfg }) => {
     const prepare = vi.fn(() => ({ prompt: '', diagnostics: [], pluginManifest: { pluginIds: [] } }));
     const scope = { lastInitConfig: { cliSessionId: 'native' },
       traexAutoModelRuntimeEligible: () => eligible,
       deliveredPluginSkillCatalogFingerprint: 'delivered',
       resolvePluginGenerationBot: () => ({ larkAppId: 'app' }), readGlobalConfig: () => ({}),
       prepareCliPluginGeneration: prepare, config: { session: { dataDir: '/data' } }, log: vi.fn() };
-    loadWorkerFunction<(cfg: any, adapter: any) => void>('refreshCliPluginGeneration', scope)(
+    await loadWorkerFunction<(cfg: any, adapter: any) => Promise<void>>('refreshCliPluginGeneration', scope)(
       { ...cfg, sessionId: 'session', workingDir: '/workspace', prompt: '' }, { id: cfg.cliId });
     expect(prepare).toHaveBeenCalledWith(expect.objectContaining({
       previousSkillCatalogFingerprint: preserved ? 'delivered' : undefined,

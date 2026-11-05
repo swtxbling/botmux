@@ -34,8 +34,8 @@ describe('session skill runtime preparation', () => {
     rmSync(src, { recursive: true, force: true });
   });
 
-  it('leaves prompt unchanged and writes no manifest when bot has no skill policy', () => {
-    const result = prepareSessionSkillPrompt({
+  it('leaves prompt unchanged and writes no manifest when bot has no skill policy', async () => {
+    const result = await prepareSessionSkillPrompt({
       sessionId: 's1',
       cliId: 'codex',
       workingDir: '/repo',
@@ -48,11 +48,11 @@ describe('session skill runtime preparation', () => {
     expect(readSessionSkillManifest('s1')).toBeNull();
   });
 
-  it('writes manifest and appends catalog for configured priority skills', () => {
+  it('writes manifest and appends catalog for configured priority skills', async () => {
     write(join(src, 'deploy', 'SKILL.md'), '---\nname: deploy\ndescription: Deploy services\n---\n# Deploy');
     installLocalSkill(join(src, 'deploy'), { link: false });
 
-    const result = prepareSessionSkillPrompt({
+    const result = await prepareSessionSkillPrompt({
       sessionId: 's2',
       cliId: 'codex',
       workingDir: '/repo',
@@ -66,7 +66,7 @@ describe('session skill runtime preparation', () => {
     expect(readSessionSkillManifest('s2')?.prioritySkills.map((s) => s.name)).toEqual(['deploy']);
   });
 
-  it('injects plugin-owned skills without adding them to the user skill registry', () => {
+  it('injects plugin-owned skills without adding them to the user skill registry', async () => {
     const pluginRoot = join(src, 'plugin-demo');
     const skillDir = join(pluginRoot, 'skills', 'browser');
     write(join(skillDir, 'SKILL.md'), '---\nname: browser\ndescription: Browser tools\n---\n# Browser');
@@ -75,7 +75,7 @@ describe('session skill runtime preparation', () => {
       id: 'plugin:demo:browser',
     });
 
-    const result = prepareSessionSkillPrompt({
+    const result = await prepareSessionSkillPrompt({
       sessionId: 'plugin-session',
       cliId: 'codex',
       workingDir: '/repo',
@@ -93,7 +93,7 @@ describe('session skill runtime preparation', () => {
     expect(readSkillRegistry().skills.browser).toBeUndefined();
   });
 
-  it('refreshes a prompt-less CLI generation and removes stale session skills', () => {
+  it('refreshes a prompt-less CLI generation and removes stale session skills', async () => {
     const pluginRoot = join(src, 'plugin-refresh');
     const skillDir = join(pluginRoot, 'skills', 'browser');
     write(join(skillDir, 'SKILL.md'), '---\nname: browser\ndescription: Browser tools\n---\n# Browser');
@@ -102,7 +102,7 @@ describe('session skill runtime preparation', () => {
       id: 'plugin:demo:browser',
     });
 
-    const prepared = prepareSessionSkillPrompt({
+    const prepared = await prepareSessionSkillPrompt({
       sessionId: 'refresh-session',
       cliId: 'codex',
       workingDir: '/repo',
@@ -113,7 +113,7 @@ describe('session skill runtime preparation', () => {
     expect(prepared.prompt).toBe('');
     expect(readSessionSkillManifest('refresh-session')?.prioritySkills.map(skill => skill.name)).toEqual(['browser']);
 
-    prepareSessionSkillPrompt({
+    await prepareSessionSkillPrompt({
       sessionId: 'refresh-session',
       cliId: 'codex',
       workingDir: '/repo',

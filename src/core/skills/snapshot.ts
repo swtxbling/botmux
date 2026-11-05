@@ -35,23 +35,27 @@
  *    reason is recorded.
  * A skill that is not snapshotted keeps its original rootDir — there is no
  * fallback grant: in the sandbox it is unreadable and the reader explains why.
+ *
+ * Reads are bounded too: each skill's source is resolved and copied with async
+ * fs under a per-skill deadline (DEFAULT_SKILL_SNAPSHOT_DEADLINE_MS). macOS
+ * privacy protection (TCC) can block a read until the user answers — possibly
+ * never — and synchronous fs on the worker's main thread could not be timed
+ * out at all. A skill that misses its deadline is abandoned, skipped with an
+ * actionable diagnostic (skill, path, remedy), and the session continues.
  */
 import {
-  closeSync,
   constants as fsConstants,
-  fstatSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
-  openSync,
+  promises as fsp,
   readdirSync,
-  readSync,
   realpathSync,
   renameSync,
   rmSync,
-  writeSync,
   type Stats,
 } from 'node:fs';
+import type { FileHandle } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { config } from '../../config.js';
@@ -78,6 +82,19 @@ export const DEFAULT_SKILL_SNAPSHOT_LIMITS: SkillSnapshotLimits = {
   maxBytes: 32 * 1024 * 1024,
   maxDepth: 16,
 };
+
+/**
+ * Per-skill budget for reading/copying ONE managed skill source.
+ *
+ * Snapshot I/O must never pin the worker's main thread forever: on macOS a
+ * source directory inside a privacy-protected location (Desktop, Documents,
+ * Downloads, an external volume …) blocks the read until the user answers the
+ * TCC prompt — which can be never. Synchronous fs cannot be timed out from the
+ * same thread (no timer can run while the thread is blocked), so the copy is
+ * async and every skill gets this deadline. A skill that misses it is skipped
+ * with an actionable diagnostic; the session continues without it.
+ */
+export const DEFAULT_SKILL_SNAPSHOT_DEADLINE_MS = 10_000;
 
 export function sessionSkillRuntimeDir(sessionId: string, dataDir: string = config.session.dataDir): string {
   return join(dataDir, 'runtime-skills', sessionId);
@@ -247,7 +264,24 @@ export function resolveManagedSkillSource(
   skill: Pick<ResolvedSkill, 'rootDir' | 'source'>,
   trust: SkillSnapshotTrust,
 ): { ok: true; root: string } | { ok: false; reason: 'source_missing' | 'not_botmux_managed' | 'source_overlaps_protected' } {
-  const root = realOrNull(skill.rootDir);
+  return decideManagedSkillSource(skill, trust, realOrNull(skill.rootDir));
+}
+
+const realOrNullAsync = async (path: string): Promise<string | null> => {
+  try { return await fsp.realpath(path); } catch { return null; }
+};
+
+/** The decision itself, on an already-canonical `root` (null = unreadable).
+ *  The async snapshot path resolves the root off-thread first, under a
+ *  deadline, so a privacy-protected source cannot block the worker there.
+ *  The sync realpaths below are on botmux's own trust roots, never on the
+ *  skill source; they are already warm because the async phase just visited
+ *  the same paths, so they cannot be the first TCC-blocked read. */
+function decideManagedSkillSource(
+  skill: Pick<ResolvedSkill, 'rootDir' | 'source'>,
+  trust: SkillSnapshotTrust,
+  root: string | null,
+): { ok: true; root: string } | { ok: false; reason: 'source_missing' | 'not_botmux_managed' | 'source_overlaps_protected' } {
   if (!root) return { ok: false, reason: 'source_missing' };
   const type = skill.source?.type;
   const base = STORE_SOURCE_TYPES.has(type) ? realOrNull(trust.storeDir)
@@ -301,7 +335,7 @@ export const __testOnly_snapshotNofollowFlags = snapshotNofollowFlags;
 const nofollow = (): number => snapshotNofollowFlags(process.platform);
 
 /** An open directory plus the path used for diagnostics / darwin lookups. */
-interface Dir { fd: number; path: string }
+interface Dir { fd: number; path: string; handle: FileHandle }
 
 /** Path through which `name` inside `dir` is reached WITHOUT re-resolving the
  *  dir's path: Linux goes through the pinned fd (/proc/self/fd/N), so a parent
@@ -311,37 +345,123 @@ function childPath(dir: Dir, name: string): string {
   return IS_LINUX ? `/proc/self/fd/${dir.fd}/${name}` : join(dir.path, name);
 }
 
-function openDirNoSymlinks(absPath: string): Dir {
+async function openDirNoSymlinks(absPath: string): Promise<Dir> {
+  const dirFlags = fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | nofollow();
   if (IS_DARWIN) {
-    return { fd: openSync(absPath, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | nofollow()), path: absPath };
+    const handle = await fsp.open(absPath, dirFlags);
+    return { fd: handle.fd, path: absPath, handle };
   }
   if (!IS_LINUX) throw new Error('skill snapshots are supported on Linux and macOS only');
-  let fd = openSync('/', fsConstants.O_RDONLY | fsConstants.O_DIRECTORY);
+  let handle = await fsp.open('/', fsConstants.O_RDONLY | fsConstants.O_DIRECTORY);
   try {
     for (const part of absPath.split('/').filter(Boolean)) {
-      const next = openSync(`/proc/self/fd/${fd}/${part}`, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | nofollow());
-      closeSync(fd);
-      fd = next;
+      const next = await fsp.open(`/proc/self/fd/${handle.fd}/${part}`, dirFlags);
+      await handle.close().catch(() => undefined);
+      handle = next;
     }
   } catch (err) {
-    closeSync(fd);
+    await handle.close().catch(() => undefined);
     throw err;
   }
-  return { fd, path: absPath };
+  return { fd: handle.fd, path: absPath, handle };
 }
 
-function listDir(dir: Dir): string[] {
-  return readdirSync(IS_LINUX ? `/proc/self/fd/${dir.fd}` : dir.path).sort();
+async function closeDir(dir: Dir): Promise<void> {
+  await dir.handle.close().catch(() => undefined);
 }
 
-function openSubdir(parent: Dir, name: string): Dir {
-  return {
-    fd: openSync(childPath(parent, name), fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | nofollow()),
-    path: join(parent.path, name),
-  };
+async function listDir(dir: Dir): Promise<string[]> {
+  return (await fsp.readdir(IS_LINUX ? `/proc/self/fd/${dir.fd}` : dir.path)).sort();
+}
+
+async function openSubdir(parent: Dir, name: string): Promise<Dir> {
+  const handle = await fsp.open(childPath(parent, name),
+    fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | nofollow());
+  return { fd: handle.fd, path: join(parent.path, name), handle };
 }
 
 class SnapshotLimitError extends Error {}
+
+/** Thrown inside a copy that was abandoned after its deadline: it must unwind
+ *  before touching any further path (its output dir was already removed). */
+class SnapshotAbortedError extends Error {}
+
+/** Which side of the copy stalled: a source read may need a privacy grant, a
+ *  destination write may need free space / write permission — the remedy in
+ *  the diagnostic depends on it. */
+class SnapshotTimeoutError extends Error {
+  constructor(
+    readonly sourcePath: string | undefined,
+    readonly writePath: string | undefined,
+    readonly timeoutMs: number,
+  ) {
+    super(`${sourcePath ? `reading ${sourcePath}` : writePath ? `writing ${writePath}` : 'the skill source'} did not finish within ${timeoutMs}ms`);
+  }
+}
+
+/** Cooperative half of the per-skill deadline: fs.promises calls cannot be
+ *  cancelled, and a read blocked by macOS TCC may never return. Whoever wins
+ *  the race sets `aborted`, and the abandoned copy checks it after EVERY
+ *  awaited operation so it stops before touching anything else. */
+interface SnapshotAbort { aborted: boolean; sourcePath?: string; writePath?: string }
+
+function ensureLive(abort: SnapshotAbort): void {
+  if (abort.aborted) throw new SnapshotAbortedError('skill copy abandoned after its deadline');
+}
+
+const isAbort = (err: unknown): err is SnapshotAbortedError => err instanceof SnapshotAbortedError;
+
+/** Await one fs operation, remembering which side/path stalled, then honour
+ *  the abort flag. `kind` only affects the diagnostic text. */
+async function guarded<T>(
+  abort: SnapshotAbort,
+  kind: 'source' | 'write',
+  path: string,
+  work: Promise<T>,
+): Promise<T> {
+  if (kind === 'source') abort.sourcePath = path;
+  else abort.writePath = path;
+  const value = await work;
+  ensureLive(abort);
+  return value;
+}
+
+/** fsp.open guarded like `guarded`, but a handle that arrives AFTER the abort
+ *  must be closed instead of dropped (the copy will never use it). */
+async function openGuarded(
+  abort: SnapshotAbort,
+  kind: 'source' | 'write',
+  path: string,
+  work: Promise<FileHandle>,
+): Promise<FileHandle> {
+  if (kind === 'source') abort.sourcePath = path;
+  else abort.writePath = path;
+  const handle = await work;
+  if (abort.aborted) {
+    await handle.close().catch(() => undefined);
+    throw new SnapshotAbortedError('skill copy abandoned after its deadline');
+  }
+  return handle;
+}
+
+/** Reject with SnapshotTimeoutError once `timeoutMs` elapses without `work`
+ *  settling, and mark the work abandoned. The work itself may run on in the
+ *  libuv pool; `abort` stops it at its next awaited operation. */
+async function withinDeadline<T>(work: Promise<T>, timeoutMs: number, abort: SnapshotAbort): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      abort.aborted = true;
+      reject(new SnapshotTimeoutError(abort.sourcePath, abort.writePath, timeoutMs));
+    }, timeoutMs);
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([work, expired]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 let raceHookForTests: ((relDir: string) => void) | undefined;
 /** Test seam: runs after a source dir was listed and before its entries are
@@ -350,15 +470,35 @@ export function __testOnly_setSnapshotRaceHook(hook: ((relDir: string) => void) 
   raceHookForTests = hook;
 }
 
+type SnapshotReadHook = (path: string) => void | Promise<void>;
+let readHookForTests: SnapshotReadHook | undefined;
+/** Test seam: runs before every read of a source dir / file. Returning a
+ *  never-settling promise emulates a read that a macOS privacy prompt (TCC)
+ *  blocks forever — the per-skill deadline must survive it and keep going. */
+export function __testOnly_setSnapshotReadHook(hook: SnapshotReadHook | undefined): void {
+  readHookForTests = hook;
+}
+const sourceRead = async (path: string): Promise<void> => { await readHookForTests?.(path); };
+
 interface CopyStats { entries: number; dirs: number; files: number; bytes: number; skipped: string[] }
 
-function copyManagedTree(rootReal: string, dst: Dir, limits: SkillSnapshotLimits): CopyStats {
+async function copyManagedTree(
+  rootReal: string,
+  dst: Dir,
+  limits: SkillSnapshotLimits,
+  abort: SnapshotAbort,
+  onRead: (path: string) => Promise<void>,
+): Promise<CopyStats> {
   const stats: CopyStats = { entries: 0, dirs: 0, files: 0, bytes: 0, skipped: [] };
 
-  const copyFile = (src: Dir, name: string, rel: string, out: Dir): void => {
-    const fd = openSync(childPath(src, name), fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | nofollow());
+  const copyFile = async (src: Dir, name: string, rel: string, out: Dir): Promise<void> => {
+    const srcPath = join(src.path, name);
+    abort.sourcePath = srcPath;
+    await onRead(srcPath);
+    const fh = await openGuarded(abort, 'source', srcPath,
+      fsp.open(childPath(src, name), fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | nofollow()));
     try {
-      const st = fstatSync(fd);
+      const st = await guarded(abort, 'source', srcPath, fh.stat());
       if (!st.isFile()) { stats.skipped.push(`${rel} (not a regular file)`); return; }
       if (st.nlink > 1) { stats.skipped.push(`${rel} (hard-linked)`); return; }
       stats.files += 1;
@@ -368,34 +508,55 @@ function copyManagedTree(rootReal: string, dst: Dir, limits: SkillSnapshotLimits
       const buf = Buffer.alloc(st.size);
       let off = 0;
       while (off < st.size) {
-        const n = readSync(fd, buf, off, st.size - off, off);
-        if (n <= 0) break;
-        off += n;
+        const { bytesRead } = await guarded(abort, 'source', srcPath, fh.read(buf, off, st.size - off, off));
+        if (bytesRead <= 0) break;
+        off += bytesRead;
       }
-      const outFd = openSync(childPath(out, name),
+      const outPath = childPath(out, name);
+      ensureLive(abort);
+      const outFh = await openGuarded(abort, 'write', outPath, fsp.open(outPath,
         fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | nofollow(),
-        (st.mode & 0o111) ? 0o755 : 0o644);
-      try { writeSync(outFd, buf, 0, off); } finally { closeSync(outFd); }
+        (st.mode & 0o111) ? 0o755 : 0o644));
+      try {
+        let written = 0;
+        while (written < off) {
+          const { bytesWritten } = await guarded(abort, 'write', outPath, outFh.write(buf, written, off - written));
+          if (bytesWritten <= 0) break;
+          written += bytesWritten;
+        }
+      } finally {
+        await outFh.close().catch(() => undefined);
+      }
     } finally {
-      closeSync(fd);
+      await fh.close().catch(() => undefined);
     }
   };
 
-  const walk = (src: Dir, out: Dir, rel: string, depth: number): void => {
+  const walk = async (src: Dir, out: Dir, rel: string, depth: number): Promise<void> => {
     if (depth > limits.maxDepth) throw new SnapshotLimitError(`deeper than ${limits.maxDepth} levels`);
-    const names = listDir(src);
+    abort.sourcePath = src.path;
+    await onRead(src.path);
+    const names = await guarded(abort, 'source', src.path, listDir(src));
     raceHookForTests?.(rel);
     for (const name of names) {
       const entryRel = rel ? `${rel}/${name}` : name;
       stats.entries += 1;
       if (stats.entries > limits.maxEntries) throw new SnapshotLimitError(`more than ${limits.maxEntries} entries`);
+      const entryPath = join(src.path, name);
       let st: Stats;
-      try { st = lstatSync(childPath(src, name)); } catch { stats.skipped.push(`${entryRel} (vanished)`); continue; }
+      try {
+        st = await guarded(abort, 'source', entryPath, fsp.lstat(childPath(src, name)));
+      } catch (err) {
+        if (isAbort(err) || abort.aborted) throw new SnapshotAbortedError('skill copy abandoned after its deadline');
+        stats.skipped.push(`${entryRel} (vanished)`);
+        continue;
+      }
       if (st.isSymbolicLink()) { stats.skipped.push(`${entryRel} (symlink)`); continue; }
       if (st.isFile()) {
         try {
-          copyFile(src, name, entryRel, out);
+          await copyFile(src, name, entryRel, out);
         } catch (err: any) {
+          if (isAbort(err)) throw err;
           if (err?.code === 'ELOOP') { stats.skipped.push(`${entryRel} (symlink)`); continue; }
           throw err;
         }
@@ -406,24 +567,53 @@ function copyManagedTree(rootReal: string, dst: Dir, limits: SkillSnapshotLimits
       if (stats.dirs > limits.maxDirs) throw new SnapshotLimitError(`more than ${limits.maxDirs} directories`);
       let child: Dir;
       try {
-        child = openSubdir(src, name);
+        child = await openSubdir(src, name);
       } catch (err: any) {
+        if (isAbort(err)) throw err;
         if (err?.code === 'ELOOP' || err?.code === 'ENOTDIR') { stats.skipped.push(`${entryRel} (symlink)`); continue; }
         throw err;
       }
       try {
-        mkdirSync(childPath(out, name), { mode: 0o755 });
-        const outChild = openSubdir(out, name);
-        try { walk(child, outChild, entryRel, depth + 1); } finally { closeSync(outChild.fd); }
+        const outChildPath = childPath(out, name);
+        await guarded(abort, 'write', outChildPath, fsp.mkdir(outChildPath, { mode: 0o755 }));
+        const outChild = await openSubdir(out, name);
+        try { await walk(child, outChild, entryRel, depth + 1); } finally { await closeDir(outChild); }
       } finally {
-        closeSync(child.fd);
+        await closeDir(child);
       }
     }
   };
 
-  const root = openDirNoSymlinks(rootReal);
-  try { walk(root, dst, '', 0); } finally { closeSync(root.fd); }
+  const root = await openDirNoSymlinks(rootReal);
+  try { await walk(root, dst, '', 0); } finally { await closeDir(root); }
   return stats;
+}
+
+/** Actionable text for a skill that hit the per-skill deadline. The remedy
+ *  depends on which side stalled: a source read is the macOS TCC shape, a
+ *  destination write is a local disk/permission problem. */
+function snapshotTimeoutMessage(
+  name: string,
+  stuck: { sourcePath?: string; writePath?: string },
+  fallbackPath: string,
+  timeoutMs: number,
+): string {
+  if (!stuck.sourcePath && stuck.writePath) {
+    return `skill "${name}" was not snapshotted: writing ${stuck.writePath} did not finish within ${timeoutMs}ms, so the session continues without it. `
+      + 'The source itself was read fine — check that the session runtime dir is writable and has free space.';
+  }
+  const path = stuck.sourcePath ?? fallbackPath;
+  return `skill "${name}" was not snapshotted: reading ${path} did not finish within ${timeoutMs}ms, so the session continues without it. `
+    + 'A read that never returns usually means macOS privacy protection (TCC) is blocking the folder that holds this skill: '
+    + 'grant Full Disk Access to the program that runs botmux in System Settings > Privacy & Security, '
+    + 'or move/install the skill outside that protected folder (`botmux skills install <path>`).';
+}
+
+/** Actionable text for a skill whose read failed outright (EACCES, EIO, …). */
+function snapshotReadFailureMessage(name: string, path: string, err: unknown): string {
+  return `skill "${name}" could not be snapshotted: reading ${path} failed (${err instanceof Error ? err.message : String(err)}), so the session continues without it. `
+    + 'Check that the path is readable by the botmux process (macOS privacy protection may require Full Disk Access), '
+    + 'or move/install the skill outside that folder (`botmux skills install <path>`).';
 }
 
 export interface SessionSkillSnapshotResult {
@@ -436,17 +626,49 @@ export interface SessionSkillSnapshotResult {
  * Snapshot every enabled botmux-managed skill of `manifest` into this
  * session's runtime dir and return the manifest rewritten to read from it.
  * Non-managed and project skills are left exactly as they were. A managed
- * skill that cannot be snapshotted (limits, I/O) also keeps its original
- * path, with an error diagnostic (`skillName`) the reader surfaces when that
- * path is unreadable in a sandboxed session.
+ * skill that cannot be snapshotted (limits, I/O, a read blocked past
+ * `deadlineMs`) also keeps its original path, with an error diagnostic
+ * (`skillName`) the reader surfaces when that path is unreadable in a
+ * sandboxed session.
+ *
+ * Async on purpose: a privacy-protected source (macOS TCC) can block a read
+ * forever, and synchronous fs on the worker's main thread cannot be timed out
+ * (no timer runs while the thread is blocked). Every skill is read off-thread
+ * under `deadlineMs`; a skill that misses it is skipped and the rest continue.
  */
-export function snapshotSessionSkills(
+export async function snapshotSessionSkills(
   manifest: SessionSkillManifest,
-  opts: { dataDir?: string; trust?: SkillSnapshotTrust; limits?: SkillSnapshotLimits } = {},
-): SessionSkillSnapshotResult {
+  opts: { dataDir?: string; trust?: SkillSnapshotTrust; limits?: SkillSnapshotLimits; deadlineMs?: number } = {},
+): Promise<SessionSkillSnapshotResult> {
+  // One generation per session at a time. A run can still be settling on a
+  // timed-out skill when the next spawn starts another one, and the settling
+  // tail unconditionally replaces (rm + rename) the session's snapshot root:
+  // serialised, the last run always wins instead of a slow old run deleting
+  // the snapshot a newer run already published.
+  const key = manifest.sessionId;
+  const run = (sessionSnapshotChains.get(key) ?? Promise.resolve())
+    .catch(() => undefined)
+    .then(() => snapshotSessionSkillsUnlocked(manifest, opts));
+  const tail = run.then(() => undefined, () => undefined);
+  sessionSnapshotChains.set(key, tail);
+  void tail.then(() => {
+    // Only the tail deletes the entry; a later run has installed a new tail.
+    if (sessionSnapshotChains.get(key) === tail) sessionSnapshotChains.delete(key);
+  });
+  return run;
+}
+
+const sessionSnapshotChains = new Map<string, Promise<void>>();
+
+async function snapshotSessionSkillsUnlocked(
+  manifest: SessionSkillManifest,
+  opts: { dataDir?: string; trust?: SkillSnapshotTrust; limits?: SkillSnapshotLimits; deadlineMs?: number } = {},
+): Promise<SessionSkillSnapshotResult> {
   const dataDir = opts.dataDir ?? config.session.dataDir;
   const trust = opts.trust ?? defaultSkillSnapshotTrust({ workingDir: manifest.workingDir, dataDir });
   const limits = opts.limits ?? DEFAULT_SKILL_SNAPSHOT_LIMITS;
+  const deadlineMs = opts.deadlineMs !== undefined && opts.deadlineMs > 0
+    ? opts.deadlineMs : DEFAULT_SKILL_SNAPSHOT_DEADLINE_MS;
   const runtimeDir = sessionSkillRuntimeDir(manifest.sessionId, dataDir);
   const finalRoot = sessionSkillSnapshotRoot(manifest.sessionId, dataDir);
   const diagnostics: SkillDiagnostic[] = [];
@@ -456,7 +678,7 @@ export function snapshotSessionSkills(
   mkdirSync(runtimeDir, { recursive: true, mode: 0o700 });
   const tmpPath = mkdtempSync(join(runtimeDir, '.snapshot-'));
   try {
-    const tmp = openDirNoSymlinks(realpathSync(tmpPath));
+    const tmp = await openDirNoSymlinks(realpathSync(tmpPath));
     try {
       for (const skill of manifest.prioritySkills) {
         if (skill.source?.type === 'project') continue;
@@ -464,7 +686,28 @@ export function snapshotSessionSkills(
           diagnostics.push({ level: 'error', code, message, skillName: skill.name });
           log.push(message);
         };
-        const source = resolveManagedSkillSource(skill, trust);
+        // One deadline per skill, covering BOTH its root resolution and its
+        // copy: either can block on a privacy-protected source.
+        const abort: SnapshotAbort = { aborted: false };
+        const startedAt = Date.now();
+        const remaining = () => Math.max(1, deadlineMs - (Date.now() - startedAt));
+
+        let source: ReturnType<typeof decideManagedSkillSource>;
+        try {
+          const rootReal = await withinDeadline((async () => {
+            abort.sourcePath = skill.rootDir;
+            await sourceRead(skill.rootDir);
+            return realOrNullAsync(skill.rootDir);
+          })(), remaining(), abort);
+          source = decideManagedSkillSource(skill, trust, rootReal);
+        } catch (err) {
+          if (err instanceof SnapshotTimeoutError) {
+            fail('skill_snapshot_timeout', snapshotTimeoutMessage(skill.name, err, skill.rootDir, deadlineMs));
+          } else {
+            fail('skill_snapshot_failed', snapshotReadFailureMessage(skill.name, skill.rootDir, err));
+          }
+          continue;
+        }
         if (!source.ok) {
           // Linked / external skills are never copied and keep their own path
           // (expected, no diagnostic). A store- or plugin-installed one that
@@ -483,9 +726,13 @@ export function snapshotSessionSkills(
         }
         try {
           mkdirSync(childPath(tmp, skill.name), { mode: 0o755 });
-          const out = openSubdir(tmp, skill.name);
-          let stats: CopyStats;
-          try { stats = copyManagedTree(source.root, out, limits); } finally { closeSync(out.fd); }
+          const out = await openSubdir(tmp, skill.name);
+          // The copy owns `out` and closes it when it settles. On a timeout it
+          // may still be running, so we must NOT close it here: its fd number
+          // could be reused by an unrelated open while it is still writing.
+          const copy = copyManagedTree(source.root, out, limits, abort, sourceRead)
+            .finally(() => closeDir(out));
+          const stats = await withinDeadline(copy, remaining(), abort);
           if (!lstatSync(join(tmp.path, skill.name, skill.entrypoint)).isFile()) {
             throw new Error(`entrypoint ${skill.entrypoint} missing from the snapshot`);
           }
@@ -500,14 +747,16 @@ export function snapshotSessionSkills(
           if (err instanceof SnapshotLimitError) {
             fail('skill_snapshot_too_large',
               `skill "${skill.name}" exceeds the session snapshot limit (${limits.maxEntries} entries / ${limits.maxDirs} dirs / ${limits.maxFiles} files / ${limits.maxBytes} bytes / depth ${limits.maxDepth}): ${err.message}`);
+          } else if (err instanceof SnapshotTimeoutError || err instanceof SnapshotAbortedError) {
+            fail('skill_snapshot_timeout',
+              snapshotTimeoutMessage(skill.name, err instanceof SnapshotTimeoutError ? err : {}, source.root, deadlineMs));
           } else {
-            fail('skill_snapshot_failed',
-              `skill "${skill.name}" could not be snapshotted: ${err instanceof Error ? err.message : String(err)}`);
+            fail('skill_snapshot_failed', snapshotReadFailureMessage(skill.name, source.root, err));
           }
         }
       }
     } finally {
-      closeSync(tmp.fd);
+      await closeDir(tmp);
     }
 
     rmSync(finalRoot, { recursive: true, force: true });
