@@ -565,6 +565,41 @@ export function frozenReplyContextForTurn(
   return frozen ?? { target: resolveSessionReplyTarget(ds, turnId) };
 }
 
+/** The Lark reply root an Ask card issued by `turnId` must land under.
+ *
+ *  A chat-scope session has no session-level topic, so its asks default to the
+ *  group top level (`null`). But a chat-scope turn can still be bound to an
+ *  existing topic (a folded topic mention), and the confirmation belongs to the
+ *  conversation that raised it — otherwise the card is posted where the person
+ *  who asked is not looking. Only the EXACT turn's frozen destination is
+ *  consulted: a queued/late ask can never be re-aimed at whatever topic a
+ *  sibling turn answered last, and a turn that answered flat keeps its card
+ *  flat even after a later turn entered a topic. Thread-scope sessions route off
+ *  their session root, exactly as before. */
+export function askReplyRootForTurn(
+  ds: Pick<DaemonSession, 'scope' | 'chatId' | 'session' | 'currentReplyTarget'>,
+  turnId: string | undefined,
+): string | null {
+  if (ds.scope !== 'chat') return ds.session.rootMessageId;
+  // No proven turn → no topic claim; stay at the group top level.
+  if (!turnId) return null;
+  const target = frozenReplyContextForTurn(ds, turnId).target;
+  // Only a real topic moves the card. A quote-only turn answered at the group
+  // top level; replying in-thread to its quoted message would open a NEW topic.
+  return target.mode === 'thread' ? target.rootMessageId : null;
+}
+
+/** Whether a persisted chat-scope Ask root still belongs to this session: the
+ *  group top level, or a topic one of the session's own turns was frozen into. */
+export function chatAskRootBelongsToSession(
+  ds: Pick<DaemonSession, 'session'>,
+  rootMessageId: string | null,
+): boolean {
+  if (rootMessageId === null) return true;
+  return Object.values(ds.session.turnReplyContexts ?? {})
+    .some(ctx => ctx.target.mode === 'thread' && ctx.target.rootMessageId === rootMessageId);
+}
+
 /** Window within which sibling turn records are treated as the SAME turn for
  *  --mention-back ambiguity. Type-ahead follow-ups each land as their own
  *  per-turn record (distinct message_id), and the model may resolve

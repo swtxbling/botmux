@@ -634,7 +634,7 @@ import {
   signDispatchLaunchIpcResponse,
   verifyDispatchLaunchIpcRequest,
 } from './core/dispatch-launch-ipc-auth.js';
-import { beginReplyTargetTurn, buildTurnParticipantsFrom, chatSessionAnsweredRootAtTopLevel, fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, registryTurnMayAuthenticateHuman, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
+import { askReplyRootForTurn, beginReplyTargetTurn, buildTurnParticipantsFrom, chatAskRootBelongsToSession, chatSessionAnsweredRootAtTopLevel, fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, registryTurnMayAuthenticateHuman, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { sameTrustedPrincipal } from './core/active-turn-authority.js';
 import { isSerialGroupInput, trustedSessionController } from './core/trusted-session-controller.js';
 import {
@@ -10292,7 +10292,9 @@ const explicitAskContinuation = createExplicitAskContinuation({
     const ds = findActiveBySessionId(receipt.input.sessionId);
     return sessionsRestored && !!ds && ds.larkAppId === receipt.input.larkAppId
       && ds.chatId === receipt.input.chatId
-      && (ds.session.scope === 'chat' ? null : ds.session.rootMessageId) === receipt.input.rootMessageId
+      && (ds.session.scope === 'chat'
+        ? chatAskRootBelongsToSession(ds, receipt.input.rootMessageId)
+        : ds.session.rootMessageId === receipt.input.rootMessageId)
       && (!receipt.result || !ds.worker || ds.lastScreenStatus === 'idle');
   },
   dispatch: async (receipt, key) => {
@@ -10402,14 +10404,17 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
   }
   // Authentication and routing are separate: host HMAC callers must also use
   // the live session route, never a stale/manually supplied project-card root.
+  // The destination comes from the ISSUING TURN, not from the session scope:
+  // a chat-scope turn bound to an existing topic asks its question there, and
+  // the topic is frozen into the ask at registration so a later turn (or a
+  // restart re-attach) cannot re-aim the card.
+  const askOriginTurnId = typeof body.originTurnId === 'string' ? body.originTurnId : undefined;
   if (askSession) {
     boundAsk = bindSessionScopedIpcIdentity(parsed, {
       sessionId: askSession.session.sessionId,
       larkAppId: askSession.larkAppId,
       chatId: askSession.chatId,
-      rootMessageId: askSession.session.scope === 'chat'
-        ? null
-        : askSession.session.rootMessageId,
+      rootMessageId: askReplyRootForTurn(askSession, askOriginTurnId),
     });
   }
   if (askSession?.session.vcMeetingReceiver) {
