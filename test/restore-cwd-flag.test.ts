@@ -52,6 +52,7 @@ import {
 } from '../src/core/restore-cwd-flag.js';
 import {
   __resetFlaggedCwdProbeCacheForTests,
+  claimUnverifiedWorkingDirNotice,
   probeFlaggedCwd,
 } from '../src/core/restore-cwd-recovery.js';
 import { logger } from '../src/utils/logger.js';
@@ -169,12 +170,22 @@ describe('probeFlaggedCwd cache / clearRestoreCwdUnverified', () => {
     expect(probe).toHaveBeenCalledTimes(2);
   });
 
-  it('reuses a positive verdict so the next fork can proceed immediately', async () => {
+  it('re-probes a positive answer instead of reusing it', async () => {
     const probe = vi.fn(async () => {});
-    await probeFlaggedCwd('/cooldown/good', { probe });
-    const cached = await probeFlaggedCwd('/cooldown/good', { probe });
-    expect(cached.status).toBe('ok');
-    expect(probe).toHaveBeenCalledTimes(1);
+    expect((await probeFlaggedCwd('/cooldown/good', { probe })).status).toBe('ok');
+    expect((await probeFlaggedCwd('/cooldown/good', { probe })).status).toBe('ok');
+    // Clearing the boot flag must rest on a fresh check, never on a cached ok.
+    expect(probe).toHaveBeenCalledTimes(2);
+  });
+
+  it('rate-limits the unverified-directory notice per session', () => {
+    let clock = 5_000;
+    const now = (): number => clock;
+    expect(claimUnverifiedWorkingDirNotice('sess-notice', { now })).toBe(true);
+    expect(claimUnverifiedWorkingDirNotice('sess-notice', { now })).toBe(false);
+    expect(claimUnverifiedWorkingDirNotice('other-session', { now })).toBe(true);
+    clock += 31_000;
+    expect(claimUnverifiedWorkingDirNotice('sess-notice', { now })).toBe(true);
   });
 
   it('does not cache a missing directory, so a recreated one is detected at once', async () => {

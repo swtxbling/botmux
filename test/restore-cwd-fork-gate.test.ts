@@ -10,7 +10,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 const fsCalls = vi.hoisted(() => [] as string[]);
 vi.mock('node:fs', async (importOriginal) => {
@@ -57,6 +57,8 @@ let home: string;
 let dataDir: string;
 let cwd: string;
 let missingCwd: string;
+let sessionReply: ReturnType<typeof vi.fn>;
+let onMissingWorkingDir: ReturnType<typeof vi.fn>;
 
 function makeSession(): DaemonSession {
   const stored = sessionStore.createSession('oc_gate', `om_gate_${Date.now()}`, 'Topic', 'group');
@@ -109,8 +111,11 @@ beforeEach(() => {
     workingDir: cwd,
   });
   sessionStore.init(APP);
+  sessionReply = vi.fn(async () => 'om_reply');
+  onMissingWorkingDir = vi.fn();
   initWorkerPool({
-    sessionReply: vi.fn(async () => 'om_reply'),
+    sessionReply,
+    onMissingWorkingDir,
     getSessionWorkingDir: () => cwd,
     getActiveCount: () => 1,
     closeSession: vi.fn(),
@@ -132,6 +137,26 @@ describe('forkWorker cwd choke point', () => {
     expect(() => forkWorker(ds, 'hello')).toThrow(MissingWorkingDirError);
     expect(fsCalls).not.toContain(cwd);
     expect(spawnCalls).toHaveLength(0);
+    // The freeze-prone missing-dir recovery path (deleted-worktree origin +
+    // project-dir scans, all synchronous) must not be entered at all.
+    expect(onMissingWorkingDir).not.toHaveBeenCalled();
+    const siblings = dirname(cwd);
+    // No sync scan over the directory's siblings either (the missing-dir
+    // recovery path looks for deleted worktree origins and project dirs there).
+    // The only sibling the fork path may legitimately touch is the data dir.
+    const outsideDataDir = fsCalls.filter(path =>
+      path.startsWith(`${siblings}/`) && path !== dataDir && !path.startsWith(`${dataDir}/`));
+    expect(outsideDataDir).toEqual([]);
+
+    // The human gets the plain notice, once per cooldown even if a retry arrives.
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    const notice = String(sessionReply.mock.calls[0]![1]);
+    expect(notice).toContain(cwd);
+    expect(notice).toContain('暂时读不到');
+    expect(notice).toContain('/repo');
+    expect(notice).toContain('/cd');
+    expect(() => forkWorker(ds, 'hello again')).toThrow(MissingWorkingDirError);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
 
     // The background child-process probe answers "ok" and clears the persisted flag.
     await waitFor(() => !ds.session.restoreCwdUnverifiedAt);
@@ -166,5 +191,8 @@ describe('forkAdoptWorker cwd choke point', () => {
     expect(forkAdoptWorker(ds)).toBe('rejected');
     expect(fsCalls).not.toContain(cwd);
     expect(spawnCalls).toHaveLength(0);
+    expect(onMissingWorkingDir).not.toHaveBeenCalled();
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(String(sessionReply.mock.calls[0]![1])).toContain(cwd);
   });
 });

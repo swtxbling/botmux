@@ -9,11 +9,13 @@
 // call. So every caller goes through this cache:
 //
 //   - single-flight per directory: concurrent callers share one probe;
-//   - a positive answer is remembered for one cooldown window (fork proceeds);
 //   - a timeout is remembered for one cooldown window and answers instantly
 //     afterwards (the daemon turn guard replies without waiting, the fork path
 //     refuses without touching the directory), while a fresh probe is only
-//     allowed again after that window.
+//     allowed again after that window;
+//   - a positive answer is NEVER reused: clearing the boot flag must rest on a
+//     fresh check right before it (the residual window where the directory
+//     hangs between that check and the fork is a documented limit).
 import {
   probeRestoreSessionCwds,
   type RestoreCwdProbe,
@@ -62,9 +64,8 @@ export function probeFlaggedCwd(
   const cooldownMs = options.cooldownMs ?? FLAGGED_CWD_PROBE_COOLDOWN_MS;
   const current = cache.get(cwd);
   if (current?.inFlight) return current.inFlight;
-  if (current?.at !== undefined && current.result && now() - current.at < cooldownMs) {
-    // Only ok/timeout verdicts are cached (cheap answers are re-checked).
-    if (current.result.status === 'ok') return Promise.resolve(current.result);
+  if (current?.at !== undefined && current.result?.status === 'timeout'
+      && now() - current.at < cooldownMs) {
     // A recent check timed out. Do not start another one during the cooldown;
     // the caller answers from this verdict immediately.
     return Promise.resolve(timeoutResult());
@@ -78,10 +79,11 @@ export function probeFlaggedCwd(
   const entry: FlaggedCwdEntry = { inFlight: started };
   cache.set(cwd, entry);
   return started.then((result) => {
-    // Cache only verdicts worth reusing: a positive answer (fork may proceed)
-    // and a timeout (do not spawn another stuck child). Missing/unreadable are
-    // cheap to re-check and may be fixed between attempts.
-    if (result.status === 'ok' || result.status === 'timeout') {
+    // Only a timeout is cached (to avoid spawning another stuck child and to
+    // answer repeated messages instantly). A positive/missing/unreadable answer
+    // is cheap to obtain and must be fresh: in particular an `ok` may clear the
+    // boot flag, and a stale ok would hide a directory that hangs right after.
+    if (result.status === 'timeout') {
       cache.set(cwd, { result, at: now() });
     } else {
       cache.delete(cwd);
@@ -107,7 +109,27 @@ export function scheduleFlaggedCwdProbe(
     .catch(() => { /* probeFlaggedCwd never rejects; keep the fork refusal safe */ });
 }
 
-/** Test hook: drop remembered verdicts between cases. */
+const noticeSentAt = new Map<string, number>();
+
+/**
+ * Rate limit for the fork-path "directory still unreadable" notice: a session
+ * gets at most one notice per cooldown window, so scheduler retries or a burst
+ * of card actions cannot spam the chat. Returns true when the caller may send.
+ */
+export function claimUnverifiedWorkingDirNotice(
+  sessionId: string,
+  options: { cooldownMs?: number; now?: () => number } = {},
+): boolean {
+  const now = options.now ?? Date.now;
+  const cooldownMs = options.cooldownMs ?? FLAGGED_CWD_PROBE_COOLDOWN_MS;
+  const last = noticeSentAt.get(sessionId);
+  if (last !== undefined && now() - last < cooldownMs) return false;
+  noticeSentAt.set(sessionId, now());
+  return true;
+}
+
+/** Test hook: drop remembered verdicts and notice timestamps between cases. */
 export function __resetFlaggedCwdProbeCacheForTests(): void {
   cache.clear();
+  noticeSentAt.clear();
 }

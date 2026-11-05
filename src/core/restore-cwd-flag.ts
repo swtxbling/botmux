@@ -35,6 +35,15 @@ export function clearRestoreCwdUnverified(session: Session): boolean {
   return true;
 }
 
+/** The one plain-language notice used by every path that refuses a flagged cwd. */
+export function unverifiedWorkingDirNotice(cwd: string, detail?: string): string {
+  return `这条会话的工作目录暂时读不到：${cwd}`
+    + (detail ? `（${detail}）` : '')
+    + '。为了不卡住其他会话，我没有启动 CLI。'
+    + '请先确认这个目录可以访问；目录恢复后重新发一次消息即可，'
+    + '或者用 /repo、/cd 换一个目录。';
+}
+
 export interface FlaggedTurnGuardOptions extends FlaggedCwdProbeOptions {
   cwd: string;
   reply: (text: string) => Promise<unknown>;
@@ -66,9 +75,7 @@ export async function guardFlaggedSessionTurn(
     clearRestoreCwdUnverified(session);
     return true;
   }
-  const notice = `这条会话的工作目录暂时读不到：${options.cwd}`
-    + `（${check.detail ?? 'directory check failed'}）。为了不卡住其他会话，我没有启动 CLI。`
-    + '请先让这个目录恢复可访问，再用 /repo 或 /cd 换一个目录后重新发消息。';
+  const notice = unverifiedWorkingDirNotice(options.cwd, check.detail ?? 'directory check failed');
   try {
     await options.reply(notice);
   } catch (err) {
