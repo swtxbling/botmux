@@ -752,6 +752,7 @@ import {
 import {
   decideOrdinaryImRedelivery,
   isProvablyUndeliveredOrdinaryIm,
+  ORDINARY_IM_REPLAYABLE_REASON,
 } from '../services/ordinary-im-redelivery.js';
 import {
   isRecoveryRetryTurnId,
@@ -11451,9 +11452,15 @@ function ordinaryImReplayDecision(
 }
 
 /** True when the turn still provably never reached the worker. Drives which
- * notice is honest: "did not run, resend" vs "could not confirm, check first". */
-function isRecordProvablyUndelivered(record: OrdinaryImDelivery): boolean {
-  return isProvablyUndeliveredOrdinaryIm({
+ * notice is honest: "did not run, resend" vs "could not confirm, check first".
+ *
+ * Unconfirmed transport is proof only once the worker is gone
+ * (`worker_exited_before_ipc_enqueue`). While the worker is still alive (IPC
+ * callback timeout / error, generation change), bytes already handed to
+ * `child.send` can still be read and executed later, so telling the user
+ * "it did not run, just resend" could make the turn run twice. */
+function isRecordProvablyUndelivered(record: OrdinaryImDelivery, reason: string): boolean {
+  return reason === ORDINARY_IM_REPLAYABLE_REASON && isProvablyUndeliveredOrdinaryIm({
     received: record.received,
     transportConfirmed: record.transportConfirmed || record.transportEverConfirmed,
   });
@@ -11489,7 +11496,7 @@ function maybeAutoRedeliverOrdinaryImDelivery(
       // replay and must not be seen as "already done".
       const lateDecision = ordinaryImReplayDecision(record, reason, priorTurnIds);
       if (lateDecision !== 'auto-redeliver') {
-        const noticeKey = isRecordProvablyUndelivered(record)
+        const noticeKey = isRecordProvablyUndelivered(record, reason)
           ? 'worker.input_not_delivered'
           : 'worker.input_delivery_failed';
         logger.warn(
@@ -11631,10 +11638,7 @@ function failOrdinaryImDelivery(
   // never left the daemon can simply be sent again, while an ambiguous one must
   // be checked in the session first.
   const key = messageKey
-    ?? (isProvablyUndeliveredOrdinaryIm({
-      received: record.received,
-      transportConfirmed: record.transportConfirmed || record.transportEverConfirmed,
-    })
+    ?? (isRecordProvablyUndelivered(record, reason)
       ? 'worker.input_not_delivered'
       : 'worker.input_delivery_failed');
   reportOrdinaryImDeliveryFailure(record.ds, record.turnId, reason, key);

@@ -1218,7 +1218,9 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     await Promise.resolve();
     expect(sessionReply).toHaveBeenCalledTimes(1);
     expect(sessionReply.mock.calls[0]?.[1]).toContain('无法确认这条消息是否已进入 Worker 的执行队列');
-    expect(sessionReply.mock.calls[0]?.[1]).toContain('不要直接重发');
+    // Ambiguous ⇒ check first, never the "it did not run, just resend" advice.
+    expect(sessionReply.mock.calls[0]?.[1]).toContain('先在 Web 终端看一眼这个会话');
+    expect(sessionReply.mock.calls[0]?.[1]).not.toContain('重新发一次即可');
   });
 
   it('waits quietly when the worker receipt arrives late', async () => {
@@ -1723,7 +1725,9 @@ describe('ordinary IM worker receipt acknowledgement', () => {
 
     expect(sessionReply).toHaveBeenCalledTimes(1);
     expect(sessionReply.mock.calls[0]?.[1]).toContain('无法确认这条消息是否已进入 Worker 的执行队列');
-    expect(sessionReply.mock.calls[0]?.[1]).toContain('不要直接重发');
+    // Ambiguous ⇒ check first, never the "it did not run, just resend" advice.
+    expect(sessionReply.mock.calls[0]?.[1]).toContain('先在 Web 终端看一眼这个会话');
+    expect(sessionReply.mock.calls[0]?.[1]).not.toContain('重新发一次即可');
   });
 
   it('uses only the startup failure notice when a cold worker exits before ready', async () => {
@@ -2038,7 +2042,9 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     expect(sessionReply.mock.calls.map(call => call[1])).toEqual([
       expect.stringContaining('could not confirm whether this message entered the Worker execution queue'),
     ]);
-    expect(sessionReply.mock.calls.every(call => String(call[1]).includes('do not resend'))).toBe(true);
+    // Ambiguous ⇒ check first, never the "it did not run, just resend" advice.
+    expect(sessionReply.mock.calls.every(call => String(call[1]).includes('look at this session in the Web terminal first'))).toBe(true);
+    expect(sessionReply.mock.calls.some(call => String(call[1]).includes('the earlier copy did not run'))).toBe(false);
   });
 
   it('retries a turn that the worker received but could not enqueue', async () => {
