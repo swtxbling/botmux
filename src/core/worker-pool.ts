@@ -724,6 +724,7 @@ export function mergeModelFallbackObservation(
 
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { dashboardEventBus } from './dashboard-events.js';
+import { clearRestoreCwdUnverified } from './restore-cwd-flag.js';
 import { publishTurnFinished } from './turn-finished-event.js';
 import {
   publishSessionPreviewCleared,
@@ -15050,7 +15051,13 @@ export function forkWorker(
   // semantics: this is re-derived on every fork/restore. A re-attach past a
   // deleted directory keeps the real one, so the next cold start still sees
   // it missing instead of inheriting the worker's $HOME.
-  if (!workingDirMissing) ds.workingDir = cwd;
+  if (!workingDirMissing) {
+    ds.workingDir = cwd;
+    // The directory just answered a real check, so transcript scans (token
+    // usage / open todos) are safe again for this row: drop the boot verdict
+    // instead of waiting for the next daemon restart.
+    clearRestoreCwdUnverified(ds.session);
+  }
 
   // Also persist the effective launch dir onto the SESSION record so a sibling
   // bot @-ed into the same anchor can inherit it (inherit-peer reads the
@@ -22880,7 +22887,12 @@ export function forkAdoptWorker(
   // unhandled 'error' (spawn ENOENT) that would crash the daemon.
   const rawAdoptCwd = adopted.cwd ?? ds.workingDir ?? process.cwd();
   const adoptCwd = rawAdoptCwd && existsSync(rawAdoptCwd) ? rawAdoptCwd : homedir();
-  if (adoptCwd !== rawAdoptCwd) logger.warn(`[${t}] adopt cwd "${rawAdoptCwd}" does not exist — falling back to ${adoptCwd}`);
+  if (adoptCwd !== rawAdoptCwd) {
+    logger.warn(`[${t}] adopt cwd "${rawAdoptCwd}" does not exist — falling back to ${adoptCwd}`);
+  } else {
+    // The adopted directory is readable again; re-enable transcript scans.
+    clearRestoreCwdUnverified(ds.session);
+  }
   const forkEnv = workerForkEnv(buildBotWorkerEnv(process.env, botCfg.envPolicy));
   // Node: fork `dist/worker.js`. Standalone binary: re-exec THIS binary with the
   // hidden `__worker` subcommand over the same IPC channel (see self-spawn.ts).

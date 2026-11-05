@@ -2755,8 +2755,11 @@ export async function restoreActiveSessions(
       // has no resolvable cwd; the probe must never turn that into a startup
       // failure — leave it to the per-row restore path as before.
       try {
-        const cwd = session.adoptedFrom?.cwd
-          ? expandHome(session.adoptedFrom.cwd)
+        // Adopt rows are resolved EXACTLY like forkAdoptWorker does (raw
+        // `adopted.cwd ?? workingDir ?? process.cwd()`, no `~` expansion), so
+        // the probe and the fork look at the same path.
+        const cwd = session.adoptedFrom
+          ? (session.adoptedFrom.cwd ?? session.workingDir ?? process.cwd())
           : getSessionWorkingDir({
               workingDir: session.workingDir,
               larkAppId: session.larkAppId,
@@ -2766,8 +2769,10 @@ export async function restoreActiveSessions(
         return [];
       }
     }),
-    options.cwdProbe,
-    options.cwdProbeTimeoutMs,
+    {
+      probe: options.cwdProbe,
+      timeoutMs: options.cwdProbeTimeoutMs,
+    },
   );
   // Only a probe that never answered defers eager work. A clean 'missing' /
   // 'unreadable' answer is cheap and the restore branches below already handle

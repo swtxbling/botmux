@@ -2265,6 +2265,14 @@ describe('restoreActiveSessions — unresponsive working directory isolation', (
     const unpinned = makeActivePersistentSession('om_unpinned_cwd');
     unpinned.workingDir = undefined;
     sessionStore.updateSession(unpinned);
+    // An adopt row must be probed exactly where forkAdoptWorker looks: the
+    // adopted cwd first, NOT the row's own workingDir.
+    const adopt = makeActivePersistentSession('om_adopt_cwd');
+    adopt.workingDir = '/tmp/adopt-own-working-dir';
+    adopt.adoptedFrom = {
+      source: 'tmux', tmuxTarget: 'ext:0.0', originalCliPid: 111, cliId: 'claude-code', cwd: '/tmp/adopt-proj',
+    } as any;
+    sessionStore.updateSession(adopt);
     probe.result = 'exists';
     const active = new Map<string, DaemonSession>();
     wp.registry = active;
@@ -2280,6 +2288,11 @@ describe('restoreActiveSessions — unresponsive working directory isolation', (
     expect(probedCwds).toContain(join(homedir(), 'hung-mount/proj'));
     expect(probedCwds).toContain(homedir());
     expect(probedCwds).not.toContain('~/hung-mount/proj');
+    expect(probedCwds).toContain('/tmp/adopt-proj');
+    expect(probedCwds).not.toContain('/tmp/adopt-own-working-dir');
     expect(forkWorker).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(forkAdoptWorker).mock.calls.some(
+      ([ds]) => ds.session.sessionId === adopt.sessionId,
+    )).toBe(true);
   });
 });

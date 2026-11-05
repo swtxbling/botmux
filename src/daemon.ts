@@ -968,6 +968,7 @@ import { normalizeBrand } from './im/lark/lark-hosts.js';
 import { buildDocCommentTurnInput, buildDocWatchWarmupTurnInput } from './core/doc-comment-prompt.js';
 import { advanceDocCommentCursor, docCommentRepliesAfterCursor, latestDocCommentPollCursor } from './core/doc-comment-poller.js';
 import { renderBufferedSenderBlock } from './core/session-manager.js';
+import { guardFlaggedSessionTurn } from './core/restore-cwd-flag.js';
 import { shutdownBackendDisposition } from './core/persistent-backend.js';
 import {
   abortRemoteShutdownFleet,
@@ -30334,6 +30335,27 @@ async function handleThreadReplyAdmitted(
           resume: openingResume,
         });
         markIngressAdmitted(ctx);
+        if (openingTurn) releaseInitialUserTurn(ds);
+        return;
+      }
+    }
+    // The boot probe could not read this session's directory. Re-check it out
+    // of process (killable, no daemon thread-pool use) BEFORE any fork: the
+    // fork path checks existence synchronously, so forking into a hung mount
+    // would freeze the whole daemon on a plain user message. Still unreachable
+    // ⇒ tell the human plainly and do not fork; reachable ⇒ the flag is cleared
+    // and the turn proceeds normally.
+    if (ds.session.restoreCwdUnverifiedAt) {
+      const flaggedCwd = ds.adoptedFrom
+        ? (ds.adoptedFrom.cwd ?? ds.workingDir ?? process.cwd())
+        : getSessionWorkingDir(ds);
+      const proceed = await guardFlaggedSessionTurn(ds.session, {
+        cwd: flaggedCwd,
+        reply: notice => (scope === 'thread'
+          ? replyMessage(larkAppId, anchor, notice, 'text', true)
+          : sendMessage(larkAppId, ds.chatId, notice, 'text')),
+      });
+      if (!proceed) {
         if (openingTurn) releaseInitialUserTurn(ds);
         return;
       }
