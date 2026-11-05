@@ -212,6 +212,56 @@ export function decideSessionStartGatedSubmitWarning(state: {
   return { warn: true, reason: 'record-missing-after-session-start' };
 }
 
+/** How long BotMux waits after pressing Enter on a parked draft before it gives
+ *  up and asks the human. Short on purpose: the transcript record for a
+ *  successful submit usually appears within a couple of seconds, and a longer
+ *  wait only delays the notice when the Enter was not enough. */
+export const SUBMIT_DRAFT_AUTO_SUBMIT_RECHECK_MS = 5_000;
+
+/** Two overlapping submit chains can run for back-to-back writes on the same
+ *  pane; without a shared cooldown each chain's own one-shot flag would let
+ *  both press Enter. One press per pane per window is enough. */
+export const SUBMIT_DRAFT_AUTO_SUBMIT_COOLDOWN_MS = 15_000;
+
+/** Draft evidence that is bounded to the input box itself. The generic
+ *  `[Pasted Content N chars]` rule matches ANYWHERE on screen — including a
+ *  finished turn's transcript — so pressing Enter on it could submit a draft
+ *  that does not belong to the failed turn (or a human's own in-progress text).
+ *  Only the composer-bounded Claude rules may trigger an automatic Enter. */
+const COMPOSER_BOUNDED_DRAFT_RULES: ReadonlySet<string> = new Set([
+  'draft_parked:claude_composer',
+  'draft_parked:claude_pasted_chip',
+]);
+
+/** Whether a submit_unconfirmed outcome can be finished without a human: the
+ *  exact payload is still sitting in the composer (`draft_parked`), so one
+ *  Enter submits that same text once. Never for ZMX (its screen history is not
+ *  a live view, so the parked-draft diagnosis is blanked there anyway), never
+ *  on screen-wide draft evidence, never within the pane cooldown, and never
+ *  twice within one chain — a second Enter on an empty composer is a blind
+ *  keypress, exactly what this feature must not do. */
+export function shouldAutoSubmitParkedDraft(state: {
+  diagnosisReason: SubmitFailureDiagnosisReason;
+  /** Stable rule id from the diagnosis; only composer-bounded rules qualify. */
+  matched?: string;
+  backendType?: string;
+  alreadyAutoSubmitted: boolean;
+  /** Time since this pane's last automatic Enter, if one ever happened. */
+  msSinceLastAutoSubmit?: number;
+  cooldownMs?: number;
+}): boolean {
+  if (state.diagnosisReason !== 'draft_parked') return false;
+  if (!state.matched || !COMPOSER_BOUNDED_DRAFT_RULES.has(state.matched)) return false;
+  if (state.backendType === 'zmx') return false;
+  if (
+    state.msSinceLastAutoSubmit !== undefined
+    && state.msSinceLastAutoSubmit < (state.cooldownMs ?? SUBMIT_DRAFT_AUTO_SUBMIT_COOLDOWN_MS)
+  ) {
+    return false;
+  }
+  return !state.alreadyAutoSubmitted;
+}
+
 /** Hard ceiling for the busy-turn wait. See `shouldWaitThroughBusyTurn`. */
 export const SUBMIT_BUSY_TURN_MAX_WAITS = 12;
 

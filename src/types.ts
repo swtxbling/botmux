@@ -707,6 +707,17 @@ export interface Session {
   /** Crash-safe bounded recovery state for an ordinary Claude/Lark logical
    * turn. Timer ownership is runtime-only; this record re-arms it on restore. */
   ordinaryTurnRecovery?: import('./services/ordinary-turn-recovery.js').OrdinaryTurnRecoveryState;
+  /** One-shot automatic replay of an ordinary turn the dead worker provably
+   * never received (IPC transport never confirmed). Persisted BEFORE the
+   * replay starts so a daemon restart, a second worker exit, or a failing
+   * replay cannot loop. A LIST because one dead worker can leave several
+   * ordinary turns unsettled in the same settlement pass — a single slot
+   * would be overwritten by the next turn and silently un-spend the first
+   * one's retry. Bounded (see ORDINARY_IM_AUTO_REDELIVERY_MARK_LIMIT). */
+  ordinaryImAutoRedelivery?: {
+    turnIds: string[];
+    attemptedAt: string;
+  };
   /** One failure notice per logical turn whose ordinary recovery ended failed:
    * durable delivery state (retried until Feishu accepts it, never re-sent once
    * delivered) plus the material for the card's retry button. Bounded. */
