@@ -9,6 +9,8 @@ import { sessionEnvUnsetFlags } from '../../core/session-env.js';
 import { logger } from '../../utils/logger.js';
 import { isExecutable } from '../../utils/executable.js';
 import { PROCESS_TABLE_MAX_BUFFER } from '../../utils/exec-limits.js';
+import { classifyPaneLiveness, PANE_LIVENESS_FORMAT, readPaneProcessAlive, type PaneLivenessObservation } from './pane-liveness.js';
+import { readUnreapedPaneExit } from './unreaped-pane-exit.js';
 import { tmuxCommand, tmuxSocketArgs } from './tmux-socket.js';
 
 /**
@@ -331,16 +333,27 @@ export class TmuxBackend {
    */
   static probeSessionForLaunch(name: string, socketName?: string): SessionProbe {
     const probe = TmuxBackend.classifyHasSession(name, true, socketName);
-    // A session whose pane is a KEPT CORPSE (a retaining `remain-on-exit` —
-    // `failed` on tmux >= 3.2, `on` on older/unknown builds — set by
-    // TmuxPipeBackend for status reporting) answers has-session but has no
-    // live CLI. For LAUNCH selection — and only there — that must read
-    // 'missing', or
-    // the next generation would "reattach" to a dead pane. Deliberately not in
-    // classifyHasSession: that is the generic existence probe used by dozens of
-    // call sites (teardown verification, restore, read isolation), each of
-    // which wants a single cheap round-trip and its own verdict on a stall.
-    if (probe === 'exists' && TmuxBackend.isPaneDead(name, socketName)) return 'missing';
+    if (probe !== 'exists') return probe;
+    // `has-session` only proves the SESSION still exists. A session whose pane
+    // has no runnable process answers it too:
+    //   · a KEPT CORPSE (retaining `remain-on-exit` — `failed` on tmux >= 3.2,
+    //     `on` on older/unknown builds — set by TmuxPipeBackend for status
+    //     reporting), which reports `#{pane_dead}=1`; and
+    //   · a pane whose pane process is already gone (reaped, or an unreaped
+    //     zombie) while tmux has not classified it yet — `#{pane_dead}=0`.
+    // For LAUNCH selection — and only there — either must read 'missing', or
+    // the next generation "reattaches", gets `target pane has exited`, and the
+    // session looks hung. Confirmed dead therefore also reaps the stale session
+    // (by its tmux session id, so a session re-created under the same name is
+    // never the victim) and the worker rebuilds with the normal fresh resume.
+    //
+    // 'unknown' keeps the historical answer ('exists' ⇒ reattach): an
+    // unanswered liveness probe must never tear down a possibly-live session.
+    const liveness = TmuxBackend.probePaneLiveness(name, socketName);
+    if (liveness.liveness === 'dead') {
+      TmuxBackend.reapDeadPaneSession(name, socketName, liveness);
+      return 'missing';
+    }
     return probe;
   }
 
@@ -400,21 +413,91 @@ export class TmuxBackend {
     }
   }
 
-  /** True only when tmux explicitly flags the target pane dead. Any
-   *  inconclusive answer (probe error, timeout, an option this tmux does not
-   *  report) is `false` — a liveness probe must never invent a death. */
-  static isPaneDead(name: string, socketName?: string): boolean {
+  /**
+   * Tri-state liveness of the process behind a session's active pane.
+   *
+   * `display-message` answers one line ({@link PANE_LIVENESS_FORMAT}) with the
+   * explicit death flag, the pane's pid, tmux's exit status if it already has
+   * one, and the session id the answer came from. Only a decisive answer
+   * counts (see {@link classifyPaneLiveness}): a timeout, a spawn failure or a
+   * garbled line is 'unknown', which callers must treat as "do not act" — a
+   * liveness probe must never invent a death, or a transient tmux stall would
+   * tear down live sessions.
+   */
+  static probePaneLiveness(name: string, socketName?: string): PaneLivenessObservation {
     try {
       const out = String(
         execFileSync(
-          'tmux', [...tmuxSocketArgs(socketName), 'display-message', '-p', '-t', name, '#{pane_dead}'],
+          'tmux', [...tmuxSocketArgs(socketName), 'display-message', '-p', '-t', name, PANE_LIVENESS_FORMAT],
           { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], env: tmuxEnv(), timeout: 2000 },
         ) ?? '',
-      ).trim();
-      return out === '1';
+      );
+      const observation = classifyPaneLiveness(out, readPaneProcessAlive);
+      // A pane death the kernel already knows outlives tmux's publish window:
+      // for an unreaped zombie of THIS server /proc holds the real exit code.
+      // Kept for the reaped session's diagnostic log — a launch probe has no
+      // CLI lifetime to replay it into the crash-restart policy, and the
+      // instance that owned the generation already reported its own exit.
+      if (observation.liveness === 'dead' && observation.deathStatus === null
+          && observation.panePid !== null) {
+        const serverPid = Number(String(out).trim().split(':')[4]);
+        const kernel = Number.isSafeInteger(serverPid)
+          ? readUnreapedPaneExit(observation.panePid, serverPid)
+          : null;
+        if (kernel?.kind === 'exited') observation.deathStatus = kernel.code;
+      }
+      return observation;
     } catch {
-      return false;
+      return { liveness: 'unknown', panePid: null, deathStatus: null, sessionId: null };
     }
+  }
+
+  /**
+   * Remove the session a confirmed-dead liveness answer described, so the cold
+   * path can create a fresh generation under the same name (a retained corpse
+   * otherwise makes `new-session` fail with `duplicate session`).
+   *
+   * Targets the tmux session id from the SAME answer, never the name alone: if
+   * another worker replaced the session between probe and kill, that new one
+   * has a different `$N` and must survive. The exit status (when tmux or the
+   * kernel had one) is logged for diagnostics; it cannot be replayed into the
+   * crash-restart policy here — the caller is a launch-selection probe with no
+   * CLI lifetime to report it against, and the previous generation's own
+   * watcher already reported its exit if it was still running. Best-effort and
+   * bounded: a failed kill leaves the stale session, and the subsequent
+   * `new-session` reports `duplicate session` instead of hanging.
+   */
+  private static reapDeadPaneSession(
+    name: string,
+    socketName: string | undefined,
+    observed: PaneLivenessObservation,
+  ): void {
+    const target = observed.sessionId;
+    if (!target) {
+      // No session id in the answer: a name-only kill could hit a session that
+      // replaced this one between probe and kill. Leave it; the create that
+      // follows reports `duplicate session` instead of silently killing a peer.
+      logger.warn(`[tmux] confirmed-dead pane session ${name} had no session id; not reaping it`);
+      return;
+    }
+    try {
+      execFileSync(
+        'tmux', [...tmuxSocketArgs(socketName), 'kill-session', '-t', target],
+        { stdio: 'ignore', env: tmuxEnv(), timeout: 3000 },
+      );
+    } catch { /* already gone, or the server answered "can't find session" */ }
+    logger.warn(
+      `[tmux] reaped confirmed-dead pane session ${name} (${target}): `
+      + `pane_pid=${observed.panePid ?? 'unknown'}, exit=${observed.deathStatus ?? 'unknown'}`,
+    );
+  }
+
+  /** True only when the pane is provably dead: tmux explicitly flags it dead,
+   *  or its pane process is gone. Any inconclusive answer (probe error,
+   *  timeout, an option this tmux does not report) is `false` — a liveness
+   *  probe must never invent a death. */
+  static isPaneDead(name: string, socketName?: string): boolean {
+    return TmuxBackend.probePaneLiveness(name, socketName).liveness === 'dead';
   }
 
   /**
