@@ -11473,11 +11473,11 @@ function maybeAutoRedeliverOrdinaryImDelivery(
   const decision = ordinaryImReplayDecision(record, reason, priorTurnIds);
   if (decision !== 'auto-redeliver') return false;
   if (!markOrdinaryImAutoRedelivery(ds, record.turnId)) return false;
+  // The canonical "Ordinary IM worker delivery failed ..." line is already
+  // logged by failOrdinaryImDelivery; this line only records the decision.
   logger.warn(
-    `[${tag(ds)}] Ordinary IM worker delivery failed `
-    + `turn=${record.turnId.substring(0, 16)} generation=${record.workerGeneration} `
-    + `attempts=${record.attempt} reason=${reason}; the worker never confirmed IPC `
-    + 'transport, so this exact turn is being replayed once on a fresh worker',
+    `[${tag(ds)}] Ordinary IM turn ${record.turnId.substring(0, 16)} is provably `
+    + 'undelivered (worker never confirmed IPC transport); replaying it once on a fresh worker',
   );
   const timer = setTimeout(() => {
     // This body runs outside the event handler that used to call the notice
@@ -11947,9 +11947,13 @@ function settleOrdinaryImDeliveriesForWorker(
       clearOrdinaryImDelivery(record);
       continue;
     }
+    // Use the sticky transport flag: a retry resets the per-attempt
+    // `transportConfirmed`, but an earlier attempt's bytes may already be in
+    // the channel. The logged reason must match the replay decision, since this
+    // line is the only way to diagnose a skipped replay later.
     const reason = record.received
       ? 'worker_exited_after_receipt'
-      : record.transportConfirmed
+      : record.transportConfirmed || record.transportEverConfirmed
         ? 'worker_exited_after_ipc_enqueue'
         : 'worker_exited_before_ipc_enqueue';
     failOrdinaryImDelivery(record, reason);

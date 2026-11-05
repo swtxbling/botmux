@@ -227,10 +227,12 @@ export const SUBMIT_DRAFT_AUTO_SUBMIT_COOLDOWN_MS = 15_000;
  *  `[Pasted Content N chars]` rule matches ANYWHERE on screen — including a
  *  finished turn's transcript — so pressing Enter on it could submit a draft
  *  that does not belong to the failed turn (or a human's own in-progress text).
- *  Only the composer-bounded Claude rules may trigger an automatic Enter. */
+ *  Only evidence produced by botmux's own frame may trigger an automatic Enter. */
 const COMPOSER_BOUNDED_DRAFT_RULES: ReadonlySet<string> = new Set([
+  // Only evidence that the BOT'S OWN frame is parked: the `<user_message>`
+  // wrapper is written by botmux itself. A Claude paste chip is also drawn for
+  // text a human pasted, so pressing Enter on it could submit their draft.
   'draft_parked:claude_composer',
-  'draft_parked:claude_pasted_chip',
 ]);
 
 /** Whether a submit_unconfirmed outcome can be finished without a human: the

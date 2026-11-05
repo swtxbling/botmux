@@ -18707,6 +18707,45 @@ let unscopedSubmitFailureChainSequence = 0;
  *  cliGeneration). Scheduling the same key again replaces the existing timer
  *  instead of stacking a second one, so a logical submission/attempt can never
  *  produce two overlapping chains (and thus two submit_unconfirmed warnings). */
+type DraftAutoSubmitStepResult = 'sent' | 'refused' | 'skipped';
+
+/** The one automatic Enter for a parked draft, extracted so the action itself
+ *  is unit-testable (the submit-failure chain lives in a closure). The caller
+ *  owns the per-chain flag, the pane cooldown registry and the recheck arming;
+ *  this function only decides and presses.
+ *
+ *  `refused` still means the one Enter was SPENT: the per-chain flag must flip
+ *  regardless, so a second blind keypress can never happen. */
+function autoSubmitParkedDraftStep(state: {
+  diagnosis: { reason: string; matched?: string };
+  backendType?: string;
+  backend: { sendSpecialKeys?: (...keys: string[]) => boolean; write?: (data: string) => void } | undefined;
+  alreadyAutoSubmitted: boolean;
+  msSinceLastAutoSubmit?: number;
+}): DraftAutoSubmitStepResult {
+  if (!shouldAutoSubmitParkedDraft({
+    diagnosisReason: state.diagnosis.reason as Parameters<typeof shouldAutoSubmitParkedDraft>[0]['diagnosisReason'],
+    matched: state.diagnosis.matched,
+    backendType: state.backendType,
+    alreadyAutoSubmitted: state.alreadyAutoSubmitted,
+    msSinceLastAutoSubmit: state.msSinceLastAutoSubmit,
+  })) {
+    return 'skipped';
+  }
+  try {
+    if (state.backend && typeof state.backend.sendSpecialKeys === 'function') {
+      return state.backend.sendSpecialKeys('Enter') === false ? 'refused' : 'sent';
+    }
+    if (state.backend && typeof state.backend.write === 'function') {
+      state.backend.write('\r');
+      return 'sent';
+    }
+  } catch {
+    return 'refused';
+  }
+  return 'refused';
+}
+
 const submitFailureChains = createSubmitFailureChainController();
 /** When this pane last received an automatic Enter for a parked draft. Shared
  *  across submit chains because back-to-back writes may each own a chain, and
@@ -19010,18 +19049,20 @@ function scheduleSubmitFailureNotify(
     }
     log(`Submit failure diagnosis: ${submitDiagnosis.reason} (${submitDiagnosis.evidence})${submitDiagnosis.matched ? ` match=${submitDiagnosis.matched}` : ''} preview="${preview}"`);
 
-    if (
-      shouldAutoSubmitParkedDraft({
-        diagnosisReason: submitDiagnosis.reason,
-        matched: submitDiagnosis.matched,
+    const backendAtAction = backend;
+    const generationAtAction = cliSpawnGeneration;
+    const draftStep = chainIsCurrent()
+      ? autoSubmitParkedDraftStep({
+        diagnosis: submitDiagnosis,
         backendType: effectiveBackendType,
+        backend: backendAtAction as any,
         alreadyAutoSubmitted: draftAutoSubmitted,
-        msSinceLastAutoSubmit: backend && draftAutoSubmitAt.has(backend)
-          ? Date.now() - (draftAutoSubmitAt.get(backend) as number)
+        msSinceLastAutoSubmit: backendAtAction && draftAutoSubmitAt.has(backendAtAction)
+          ? Date.now() - (draftAutoSubmitAt.get(backendAtAction) as number)
           : undefined,
       })
-      && chainIsCurrent()
-    ) {
+      : 'skipped';
+    if (draftStep !== 'skipped') {
       // The exact message is still visible in the composer, so pressing Enter
       // submits that same text once — no human needed, and no risk of a second
       // execution. Then re-check once: if the receipt arrives, the warning is
@@ -19031,21 +19072,8 @@ function scheduleSubmitFailureNotify(
       // forbid a second blind keypress, so it must not depend on the outcome of
       // the first one. A refusal just falls through to the warning.
       draftAutoSubmitted = true;
-      const backendAtAction = backend;
-      const generationAtAction = cliSpawnGeneration;
       if (backendAtAction) draftAutoSubmitAt.set(backendAtAction, Date.now());
-      let submitted = false;
-      try {
-        if (backendAtAction && 'sendSpecialKeys' in backendAtAction) {
-          submitted = (backendAtAction as any).sendSpecialKeys('Enter') !== false;
-        } else if (backendAtAction) {
-          backendAtAction.write('\r');
-          submitted = true;
-        }
-      } catch {
-        submitted = false;
-      }
-      if (submitted && backend === backendAtAction
+      if (draftStep === 'sent' && backend === backendAtAction
         && cliSpawnGeneration === generationAtAction && chainIsCurrent()) {
         log(
           `Deferred recheck: draft still parked in the ${cliName()} composer — sent one Enter `

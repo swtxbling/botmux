@@ -551,6 +551,13 @@ describe('ordinary IM redelivery decision', () => {
     expect(decideOrdinaryImRedelivery({ ...base, priorAutoRedeliveryTurnIds: ['om_other', 'om_turn'] })).toBe('notify-human');
   });
 
+  it('never replays a turn whose ingress never even attempted transport', () => {
+    // attempt === 0 is the standalone-binary bootstrap path: ingress already
+    // told the user to resend, so a replay would duplicate that advice.
+    expect(decideOrdinaryImRedelivery({ ...base, attempt: 0 })).toBe('notify-human');
+    expect(decideOrdinaryImRedelivery({ ...base, attempt: 1 })).toBe('auto-redeliver');
+  });
+
   it('never replays a deliberate retirement or a live-worker retry timeout', () => {
     expect(decideOrdinaryImRedelivery({ ...base, reason: 'worker_retired_before_commit' })).toBe('notify-human');
     expect(decideOrdinaryImRedelivery({ ...base, reason: 'ipc_callback_timeout' })).toBe('notify-human');

@@ -1505,7 +1505,7 @@ export const messages: Record<string, string> = {
   'worker.mojo_legacy_pinned': '⚠️ 本 mojo 会话创建于「本机执行」升级之前，已被固定在旧的沙箱回退模式——这里的工具和回复基本不可用。这是刻意为之（升级绝不能把活跃会话悄悄切到本机执行）。\n请关闭本会话（❌ 按钮或 /close），再发一条新消息即可用新行为开启全新会话。',
   'worker.start_failed': '⚠️ {cliName} 会话启动失败：{reason}\n会话 {sessionId}，详细日志见本机 {logPath}\n请检查 Dashboard 的 Agent / 后端配置和 daemon 所在机器的安装环境，修复后重发消息即可重试。',
   'worker.input_delivery_failed': '⚠️ Botmux 无法确认这条消息是否已进入 Worker 的执行队列：它可能没执行，也可能已经在跑。为避免重复执行，Botmux 不会自动重发。\n下一步：先在 Web 终端看一眼这个会话；确认没有执行，再重新发一次。\nturn: {turnId}',
-  'worker.input_not_delivered': '⚠️ 这条消息没有送到 CLI，也没有被执行：Botmux 能确认 Worker 从未收到它。为避免重复执行，Botmux 只会自动重发一次，这次重发没有成功。\n下一步：重新发一次即可，之前那条没有执行。\nturn: {turnId}',
+  'worker.input_not_delivered': '⚠️ 这条消息没有送到 CLI，也没有被执行：Botmux 能确认 Worker 从未收到它。\n下一步：重新发一次即可，之前那条没有执行。\nturn: {turnId}',
   'worker.input_rejected_before_admission': '⚠️ 这条消息在进入 Worker 执行队列之前就被拒收：它没有被执行，也没有产生任何副作用。常见原因是会话里正在执行的那一轮由另一个身份发起（跨身份打断隔离）；等那一轮结束后重新发送即可。\nturn: {turnId}｜reason: {reason}',
   'worker.input_retired_unconfirmed': '⚠️ 会话在处理这条消息期间被主动休眠或更换，Botmux 未能确认它是否已进入执行队列。请先查看会话记录确认结果；若未执行，再重新发送这条消息。\nturn: {turnId}',
   'worker.start_failed_log_fallback': 'daemon 日志',
