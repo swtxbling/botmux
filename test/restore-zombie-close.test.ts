@@ -33,7 +33,7 @@ import { recordDeploymentContinuation } from '../src/services/deployment-continu
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
-import { tmpdir } from 'os';
+import { homedir, tmpdir } from 'os';
 
 let tempDir: string;
 
@@ -187,6 +187,8 @@ vi.mock('../src/core/worker-pool.js', () => ({
 }));
 
 vi.mock('../src/bot-registry.js', () => ({
+  effectiveDefaultWorkingDir: vi.fn(() => undefined),
+  botAutoWorktreeEnabled: vi.fn(() => false),
   getBot: vi.fn(() => ({
     config: {
       larkAppId: 'app_test',
@@ -1087,9 +1089,12 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     await restoreActiveSessions(map);
 
     expect(announceSessionRow).toHaveBeenCalledTimes(1);
-    expect(announceSessionRow).toHaveBeenCalledWith(expect.objectContaining({
-      session: expect.objectContaining({ sessionId: s.sessionId }),
-    }));
+    expect(announceSessionRow).toHaveBeenCalledWith(
+      expect.objectContaining({
+        session: expect.objectContaining({ sessionId: s.sessionId }),
+      }),
+      { includeTokenUsage: false, includeOpenTodos: false },
+    );
     expect(closeSession).not.toHaveBeenCalled();
     const ds = map.get(sessionKey('om_missing', 'app_test'));
     expect(ds).toBeDefined();              // active record retained…
@@ -2181,5 +2186,113 @@ describe('restoreActiveSessions — deployment interrupted Codex turn', () => {
     const active = new Map<string, DaemonSession>(); wp.registry = active;
     await restoreActiveSessions(active);
     expect(forkWorker).not.toHaveBeenCalled();
+  });
+});
+
+describe('restoreActiveSessions — unresponsive working directory isolation', () => {
+  it('bounds one hung cwd and still restores/reattaches every other session', async () => {
+    const hung = makeActivePersistentSession('om_hung_cwd');
+    hung.workingDir = '/cwd-that-never-answers';
+    sessionStore.updateSession(hung);
+    const healthy = makeActivePersistentSession('om_healthy_cwd');
+    healthy.workingDir = '/cwd-that-answers';
+    sessionStore.updateSession(healthy);
+    probe.result = 'exists';
+    const active = new Map<string, DaemonSession>();
+    wp.registry = active;
+
+    const probedCwds: string[] = [];
+    const started = Date.now();
+    await expect(restoreActiveSessions(active, undefined, {
+      cwdProbe: cwd => {
+        probedCwds.push(cwd);
+        return cwd === '/cwd-that-never-answers'
+          ? new Promise<void>(() => {})
+          : Promise.resolve();
+      },
+      cwdProbeTimeoutMs: 30,
+    })).resolves.toBeUndefined();
+    const elapsed = Date.now() - started;
+    // The probe must see the SAME expanded directory the fork path will touch.
+    expect(probedCwds).toContain('/cwd-that-never-answers');
+    expect(probedCwds).toContain('/cwd-that-answers');
+
+    // One bad directory may cost at most the probe timeout, never daemon boot.
+    expect(elapsed).toBeLessThan(2000);
+    // Both rows stay registered: the bad one is deferred, never dropped, and
+    // stays closeable / retryable from the store.
+    expect(active.get(sessionKey('om_hung_cwd', 'app_test'))?.session.sessionId).toBe(hung.sessionId);
+    expect(active.get(sessionKey('om_healthy_cwd', 'app_test'))?.session.sessionId).toBe(healthy.sessionId);
+    expect(sessionStore.getSession(hung.sessionId)?.status).toBe('active');
+    expect(announceSessionRow).toHaveBeenCalledTimes(2);
+    expect(announceSessionRow).toHaveBeenCalledWith(
+      expect.objectContaining({ session: expect.objectContaining({ sessionId: hung.sessionId }) }),
+      { includeTokenUsage: false, includeOpenTodos: false },
+    );
+    // Eager re-attach runs only for the responsive session; the hung one is
+    // deferred to its next message instead of blocking startup.
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+    expect(forkWorker).toHaveBeenCalledWith(
+      expect.objectContaining({ session: expect.objectContaining({ sessionId: healthy.sessionId }) }),
+      '',
+      true,
+      { reattachLiveBackend: true },
+    );
+    const warnLines = vi.mocked(logger.warn).mock.calls.map(call => String(call[0]));
+    expect(warnLines.some(line => line.includes(hung.sessionId)
+      && line.includes('/cwd-that-never-answers')
+      && line.includes('timeout'))).toBe(true);
+    expect(warnLines.some(line => line.includes('skipping eager recovery'))).toBe(true);
+    // The verdict is persisted so dashboard reads (list/detail/SSE replay) also
+    // skip transcript scans for this row, and a later boot clears it.
+    expect(sessionStore.getSession(hung.sessionId)?.restoreCwdUnverifiedAt).toEqual(expect.any(String));
+    expect(sessionStore.getSession(healthy.sessionId)?.restoreCwdUnverifiedAt).toBeUndefined();
+    // A persisted turn-recovery backoff is NOT re-armed: an overdue backoff
+    // fires on the next tick with forkWorker, which would redo the blocking cwd
+    // check the probe just timed out on.
+    expect(ensureOrdinaryTurnRecoveryAttached).not.toHaveBeenCalledWith(
+      expect.objectContaining({ session: expect.objectContaining({ sessionId: hung.sessionId }) }),
+    );
+    expect(ensureOrdinaryTurnRecoveryAttached).toHaveBeenCalledWith(
+      expect.objectContaining({ session: expect.objectContaining({ sessionId: healthy.sessionId }) }),
+    );
+  });
+
+  it('probes expanded and bot-default cwds, not raw persisted strings', async () => {
+    const tilde = makeActivePersistentSession('om_tilde_cwd');
+    tilde.workingDir = '~/hung-mount/proj';
+    sessionStore.updateSession(tilde);
+    const unpinned = makeActivePersistentSession('om_unpinned_cwd');
+    unpinned.workingDir = undefined;
+    sessionStore.updateSession(unpinned);
+    // An adopt row must be probed exactly where forkAdoptWorker looks: the
+    // adopted cwd first, NOT the row's own workingDir.
+    const adopt = makeActivePersistentSession('om_adopt_cwd');
+    adopt.workingDir = '/tmp/adopt-own-working-dir';
+    adopt.adoptedFrom = {
+      source: 'tmux', tmuxTarget: 'ext:0.0', originalCliPid: 111, cliId: 'claude-code', cwd: '/tmp/adopt-proj',
+    } as any;
+    sessionStore.updateSession(adopt);
+    probe.result = 'exists';
+    const active = new Map<string, DaemonSession>();
+    wp.registry = active;
+    const probedCwds: string[] = [];
+
+    await restoreActiveSessions(active, undefined, {
+      cwdProbe: cwd => { probedCwds.push(cwd); return Promise.resolve(); },
+      cwdProbeTimeoutMs: 30,
+    });
+
+    // `~/x` is expanded exactly like forkWorker does, and an unpinned row is
+    // probed at its bot default (`~` here) instead of being skipped.
+    expect(probedCwds).toContain(join(homedir(), 'hung-mount/proj'));
+    expect(probedCwds).toContain(homedir());
+    expect(probedCwds).not.toContain('~/hung-mount/proj');
+    expect(probedCwds).toContain('/tmp/adopt-proj');
+    expect(probedCwds).not.toContain('/tmp/adopt-own-working-dir');
+    expect(forkWorker).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(forkAdoptWorker).mock.calls.some(
+      ([ds]) => ds.session.sessionId === adopt.sessionId,
+    )).toBe(true);
   });
 });

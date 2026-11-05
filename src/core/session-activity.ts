@@ -6,6 +6,7 @@
 import * as sessionStore from '../services/session-store.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { composeRowFromActive, composeRowFromClosed, composeRowFromPersistedActive } from './dashboard-rows.js';
+import type { DashboardRowOptions } from './dashboard-rows.js';
 import { buildSessionMessagePreview } from './session-message-preview.js';
 import type { DaemonSession } from './types.js';
 import type { Session } from '../types.js';
@@ -174,10 +175,20 @@ export function clearAgentAttention(ds: DaemonSession): boolean {
   return true;
 }
 
-export function announceSessionRow(ds: DaemonSession): void {
+/**
+ * Publish the dashboard row for a session that already exists in `activeSessions`.
+ *
+ * `opts` is forwarded to `composeRowFromActive`. Startup restore passes
+ * `{ includeTokenUsage: false, includeOpenTodos: false }`: both of those scans
+ * resolve the session transcript through a SYNCHRONOUS `realpathSync(workingDir)`,
+ * and restore runs before the Feishu dispatchers start — one unreadable or
+ * hanging directory would otherwise keep every bot offline. The dashboard fills
+ * usage/todos in from its detail endpoints afterwards.
+ */
+export function announceSessionRow(ds: DaemonSession, opts?: DashboardRowOptions): void {
   dashboardEventBus.publish({
     type: 'session.spawned',
-    body: { session: composeRowFromActive(ds) },
+    body: { session: composeRowFromActive(ds, opts) },
   });
 }
 

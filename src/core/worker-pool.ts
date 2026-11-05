@@ -64,7 +64,8 @@ import {
   markMessageListenerRunPreviewRunning,
 } from '../services/message-listener-run-preview-store.js';
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
-import { MissingWorkingDirError } from './working-dir-recovery.js';
+import { MissingWorkingDirError, UnverifiedWorkingDirError } from './working-dir-recovery.js';
+import { claimUnverifiedWorkingDirNotice, scheduleFlaggedCwdProbe } from './restore-cwd-recovery.js';
 import { spawnWorker, isStandaloneBinary, WORKER_ENTRY_SUBCOMMAND } from './self-spawn.js';
 import {
   resolveSessionLaunchModel,
@@ -724,6 +725,7 @@ export function mergeModelFallbackObservation(
 
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { dashboardEventBus } from './dashboard-events.js';
+import { clearRestoreCwdUnverified, unverifiedWorkingDirNotice } from './restore-cwd-flag.js';
 import { publishTurnFinished } from './turn-finished-event.js';
 import {
   publishSessionPreviewCleared,
@@ -15027,6 +15029,33 @@ export function forkWorker(
   // Only re-attaching a backing session that is still alive goes ahead — that
   // CLI keeps running where it was and is not respawned.
   const rawCwd = cb.getSessionWorkingDir(ds);
+  // A row whose boot-time probe timed out must not be touched by the SYNC cwd
+  // check below: on a hung mount `existsSync` freezes the whole daemon, which is
+  // exactly what the boot probe exists to avoid. Refuse this fork with the shape
+  // callers already handle for a missing directory, and re-check the directory
+  // out of process in the background; once it answers, the persisted flag is
+  // cleared and the next attempt forks normally.
+  if (rawCwd && ds.session.restoreCwdUnverifiedAt) {
+    logger.warn(`[${t}] workingDir "${rawCwd}" was unreadable at boot and is still unverified — refusing to check it synchronously; a background probe will clear the flag when it answers`);
+    scheduleFlaggedCwdProbe(rawCwd, () => clearRestoreCwdUnverified(ds.session));
+    // Tell the human in plain language (async, no fs) instead of publishing the
+    // missing-directory/repo-picker recovery card: that path resolves deleted
+    // worktree origins and scans project dirs SYNCHRONOUSLY under the directory,
+    // which is exactly the freeze this refusal exists to avoid. Rate-limited so
+    // scheduler retries / bursts of card actions cannot spam the chat.
+    if (claimUnverifiedWorkingDirNotice(ds.session.sessionId)) {
+      void cb.sessionReply(
+        sessionAnchorId(ds),
+        unverifiedWorkingDirNotice(rawCwd),
+        'text',
+        ds.larkAppId,
+        initAttributionTurnId,
+      ).catch((err: unknown) => {
+        logger.warn(`[${t}] could not send the unverified-working-dir notice: ${err instanceof Error ? err.message : String(err)}`);
+      });
+    }
+    throw new UnverifiedWorkingDirError(rawCwd);
+  }
   const workingDirMissing = !!rawCwd && !existsSync(rawCwd);
   if (workingDirMissing && !opts.reattachLiveBackend) {
     logger.warn(`[${t}] workingDir "${rawCwd}" does not exist — refusing to start the CLI elsewhere`);
@@ -15050,7 +15079,13 @@ export function forkWorker(
   // semantics: this is re-derived on every fork/restore. A re-attach past a
   // deleted directory keeps the real one, so the next cold start still sees
   // it missing instead of inheriting the worker's $HOME.
-  if (!workingDirMissing) ds.workingDir = cwd;
+  if (!workingDirMissing) {
+    ds.workingDir = cwd;
+    // The directory just answered a real check, so transcript scans (token
+    // usage / open todos) are safe again for this row: drop the boot verdict
+    // instead of waiting for the next daemon restart.
+    clearRestoreCwdUnverified(ds.session);
+  }
 
   // Also persist the effective launch dir onto the SESSION record so a sibling
   // bot @-ed into the same anchor can inherit it (inherit-peer reads the
@@ -22879,8 +22914,32 @@ export function forkAdoptWorker(
   // Fall back to home if the adopted cwd is gone — a missing fork cwd emits an
   // unhandled 'error' (spawn ENOENT) that would crash the daemon.
   const rawAdoptCwd = adopted.cwd ?? ds.workingDir ?? process.cwd();
+  // Same rule as forkWorker: never run a sync existence check on a directory
+  // the boot probe could not read. Refuse this adopt fork (existing contract)
+  // and let the background probe clear the flag for the next attempt.
+  if (ds.session.restoreCwdUnverifiedAt) {
+    logger.warn(`[${t}] adopt cwd "${rawAdoptCwd}" was unreadable at boot and is still unverified — refusing the adopt fork; a background probe will clear the flag when it answers`);
+    scheduleFlaggedCwdProbe(rawAdoptCwd, () => clearRestoreCwdUnverified(ds.session));
+    if (claimUnverifiedWorkingDirNotice(ds.session.sessionId)) {
+      void cb.sessionReply(
+        sessionAnchorId(ds),
+        unverifiedWorkingDirNotice(rawAdoptCwd),
+        'text',
+        ds.larkAppId,
+        opts?.turnId,
+      ).catch((err: unknown) => {
+        logger.warn(`[${t}] could not send the unverified-working-dir notice: ${err instanceof Error ? err.message : String(err)}`);
+      });
+    }
+    return 'rejected';
+  }
   const adoptCwd = rawAdoptCwd && existsSync(rawAdoptCwd) ? rawAdoptCwd : homedir();
-  if (adoptCwd !== rawAdoptCwd) logger.warn(`[${t}] adopt cwd "${rawAdoptCwd}" does not exist — falling back to ${adoptCwd}`);
+  if (adoptCwd !== rawAdoptCwd) {
+    logger.warn(`[${t}] adopt cwd "${rawAdoptCwd}" does not exist — falling back to ${adoptCwd}`);
+  } else {
+    // The adopted directory is readable again; re-enable transcript scans.
+    clearRestoreCwdUnverified(ds.session);
+  }
   const forkEnv = workerForkEnv(buildBotWorkerEnv(process.env, botCfg.envPolicy));
   // Node: fork `dist/worker.js`. Standalone binary: re-exec THIS binary with the
   // hidden `__worker` subcommand over the same IPC channel (see self-spawn.ts).

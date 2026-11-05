@@ -968,6 +968,7 @@ import { normalizeBrand } from './im/lark/lark-hosts.js';
 import { buildDocCommentTurnInput, buildDocWatchWarmupTurnInput } from './core/doc-comment-prompt.js';
 import { advanceDocCommentCursor, docCommentRepliesAfterCursor, latestDocCommentPollCursor } from './core/doc-comment-poller.js';
 import { renderBufferedSenderBlock } from './core/session-manager.js';
+import { guardFlaggedSessionTurn } from './core/restore-cwd-flag.js';
 import { shutdownBackendDisposition } from './core/persistent-backend.js';
 import {
   abortRemoteShutdownFleet,
@@ -29996,6 +29997,26 @@ async function handleThreadReplyAdmitted(
       if (openingTurn && !accepted) releaseInitialUserTurn(ds);
     }
   } else {
+    // The boot probe could not read this session's directory. Check it out of
+    // process BEFORE this turn mutates any stream-card bookkeeping or forks a
+    // queued activation: the fork paths check existence synchronously, so
+    // forking into a hung mount would freeze the whole daemon on a plain user
+    // message. Still unreachable ⇒ tell the human plainly and do not fork;
+    // reachable ⇒ the flag is cleared and the turn proceeds normally. The
+    // shared probe cache makes a recent timeout answer immediately (no
+    // 1500ms wait per message while the mount stays broken).
+    if (ds.session.restoreCwdUnverifiedAt) {
+      const flaggedCwd = ds.adoptedFrom
+        ? (ds.adoptedFrom.cwd ?? ds.workingDir ?? process.cwd())
+        : getSessionWorkingDir(ds);
+      const proceed = await guardFlaggedSessionTurn(ds.session, {
+        cwd: flaggedCwd,
+        reply: notice => (scope === 'thread'
+          ? replyMessage(larkAppId, anchor, notice, 'text', true)
+          : sendMessage(larkAppId, ds.chatId, notice, 'text')),
+      });
+      if (!proceed) return;
+    }
     // Worker not running — re-fork with resume. This is a NEW turn, so drop
     // any restored streaming-card reference; worker_ready will POST a fresh
     // card instead of PATCHing the previous turn's card in place.
