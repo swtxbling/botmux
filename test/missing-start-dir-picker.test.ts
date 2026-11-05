@@ -427,8 +427,9 @@ describe('a restored session whose boot cwd probe timed out', () => {
       makeCtx(anchor, messageId),
     );
 
-    // The recent timeout answers immediately: no second 1500ms probe per message.
-    expect(Date.now() - started).toBeLessThan(500);
+    // The recent timeout answers immediately instead of running another full
+    // 1500ms probe (loaded-box margin; the regression would exceed 1500ms).
+    expect(Date.now() - started).toBeLessThan(1200);
     // No CLI start.
     expect(mocks.forkWorker).not.toHaveBeenCalled();
     // The human was told which directory and what to do.

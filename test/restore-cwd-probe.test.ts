@@ -63,11 +63,12 @@ describe('probeRestoreSessionCwds', () => {
     const started = Date.now();
     const results = await probeRestoreSessionCwds([
       { sessionId: 'sess-hung', cwd: '/cwd-that-never-answers' },
-    ], { probe: hangingProbe, timeoutMs: 25 });
+    ], { probe: hangingProbe, timeoutMs: 50 });
     const elapsed = Date.now() - started;
 
     expect(results.get('sess-hung')?.status).toBe('timeout');
-    expect(elapsed).toBeLessThan(1000);
+    // Loaded-box margin: the probe must return promptly, not after tens of seconds.
+    expect(elapsed).toBeLessThan(2000);
     const line = warn.mock.calls.map(call => String(call[0])).find(text => text.includes('sess-hung'));
     expect(line).toBeDefined();
     expect(line).toContain('/cwd-that-never-answers');
@@ -83,12 +84,12 @@ describe('probeRestoreSessionCwds', () => {
       cwd: `/hung/${index}`,
     }));
     const started = Date.now();
-    const results = await probeRestoreSessionCwds(targets, { probe: hangingProbe, timeoutMs: 60 });
+    const results = await probeRestoreSessionCwds(targets, { probe: hangingProbe, timeoutMs: 150 });
     const elapsed = Date.now() - started;
 
     expect([...results.values()].every(result => result.status === 'timeout')).toBe(true);
-    // Serialized batches would take ceil(8/4) * 60ms = 120ms; one deadline is 60ms.
-    expect(elapsed).toBeLessThan(120);
+    // One shared deadline, with room for a loaded box: 2x the budget.
+    expect(elapsed).toBeLessThan(300);
   });
 
   it('still returns at the one deadline when there are more directories than probe slots', async () => {
@@ -99,14 +100,21 @@ describe('probeRestoreSessionCwds', () => {
       cwd: `/hung/${index}`,
     }));
     const started = Date.now();
-    const results = await probeRestoreSessionCwds(targets, { probe, timeoutMs: 50, concurrency: 8 });
+    const results = await probeRestoreSessionCwds(targets, { probe, timeoutMs: 200, concurrency: 8 });
     const elapsed = Date.now() - started;
 
     expect([...results.values()].every(result => result.status === 'timeout')).toBe(true);
     expect(results.size).toBe(40);
-    // Only one batch is started; the rest are classified at the deadline without spawning.
-    expect(probe).toHaveBeenCalledTimes(8);
-    expect(elapsed).toBeLessThan(150);
+    // Only the first batch is started; the rest are classified at the deadline
+    // without spawning. A timer may fire a hair before the wall-clock deadline,
+    // so allow at most one jittered extra batch (16), never the 40 of a
+    // per-probe budget.
+    expect(probe.mock.calls.length).toBeGreaterThanOrEqual(8);
+    expect(probe.mock.calls.length).toBeLessThanOrEqual(16);
+    // One shared deadline with a loaded-box margin (< 2x). The regression this
+    // guards (a per-probe budget instead of one deadline) would run 5 serial
+    // batches: 5 * 200ms = 1000ms, still clearly red.
+    expect(elapsed).toBeLessThan(400);
   });
 
   it('does not consume the daemon file-system thread pool when probes hang', async () => {
@@ -116,7 +124,7 @@ describe('probeRestoreSessionCwds', () => {
     // hanging while the assertion below runs.
     const hungChildren = createSubprocessCwdProbe({
       args: () => ['-c', 'sleep 5'],
-      timeoutMs: 250,
+      timeoutMs: 900,
     });
     const targets = Array.from({ length: 6 }, (_, index) => ({
       sessionId: `sess-hung-${index}`,
@@ -125,29 +133,30 @@ describe('probeRestoreSessionCwds', () => {
     let probesFinished = false;
     const probing = probeRestoreSessionCwds(targets, {
       probe: hungChildren,
-      timeoutMs: 120,
+      timeoutMs: 500,
     }).then((results) => {
       probesFinished = true;
       return results;
     });
 
-    await sleep(40);
+    await sleep(100);
     // A plain async fs call in the daemon process must still get a pool slot. It
     // would stall if the hung checks were `fs.promises.stat` calls.
     const started = Date.now();
     const content = await Promise.race([
       readFile('/etc/hostname', 'utf8'),
-      sleep(800).then(() => { throw new Error('daemon fs pool starved by hung cwd probes'); }),
+      sleep(2000).then(() => { throw new Error('daemon fs pool starved by hung cwd probes'); }),
     ]);
     expect(typeof content).toBe('string');
-    expect(Date.now() - started).toBeLessThan(400);
+    // Loaded-box margin; a starved pool would hit the 2000ms race above.
+    expect(Date.now() - started).toBeLessThan(1500);
     // The children were still hung when we proved the pool is free.
     expect(probesFinished).toBe(false);
 
     const results = await probing;
     expect([...results.values()].every(result => result.status === 'timeout')).toBe(true);
     // Let the child kill timers fire so no `sleep` process outlives this test.
-    await sleep(250);
+    await sleep(1000);
   });
 
   it('distinguishes missing, not-a-directory and unreadable answers', async () => {

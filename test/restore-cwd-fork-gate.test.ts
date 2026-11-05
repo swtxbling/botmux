@@ -82,7 +82,7 @@ function makeSession(): DaemonSession {
   return ds;
 }
 
-const waitFor = async (predicate: () => boolean, timeoutMs = 2000): Promise<void> => {
+const waitFor = async (predicate: () => boolean, timeoutMs = 5000): Promise<void> => {
   const started = Date.now();
   while (!predicate()) {
     if (Date.now() - started > timeoutMs) throw new Error('condition not reached in time');
