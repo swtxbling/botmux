@@ -36,6 +36,11 @@ export interface OrdinaryImRedeliveryState {
   /** The tracked payload carries no prompt text (defensive: a blank fork would
    *  spawn a worker and then never send the turn). */
   contentEmpty?: boolean;
+  /** How many transport attempts this record made. 0 means the turn never
+   *  reached `child.send` at all (standalone-binary bootstrap path): ingress
+   *  has already told the user to resend, so a replay would duplicate that
+   *  advice. */
+  attempt?: number;
   /** Turn ids of earlier automatic redeliveries for this session, read from the
    * persisted session record. A LIST because one dead worker can settle several
    * turns at once (the worker exit path loops over every pending record): with a
@@ -77,6 +82,7 @@ export function decideOrdinaryImRedelivery(
 ): OrdinaryImRedeliveryDecision {
   if (!isProvablyUndeliveredOrdinaryIm(state)) return 'notify-human';
   if (state.reason !== ORDINARY_IM_REPLAYABLE_REASON) return 'notify-human';
+  if (state.attempt !== undefined && state.attempt <= 0) return 'notify-human';
   if (!isPlainOwnerTurn(state.turnId)) return 'notify-human';
   if (state.contentEmpty) return 'notify-human';
   if (state.sessionStatus !== 'active') return 'notify-human';

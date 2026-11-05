@@ -11214,6 +11214,12 @@ const transferInputGates = new WeakMap<DaemonSession, TransferInputGate>();
 const transferReplacementForkBypass = new WeakSet<DaemonSession>();
 
 const ORDINARY_IM_TRANSPORT_TIMEOUT_MS = 2_000;
+/** Grace before the deferred replay runs. `exit` is emitted before the child's
+ * last IPC frames are necessarily dispatched, so a `child.send` success
+ * callback or the worker's own `turn_input_received` ACK can still arrive after
+ * the exit handler returned. Waiting lets those drain (and the timer re-checks
+ * them again) instead of replaying a turn the worker may already have read. */
+const ORDINARY_IM_AUTO_REPLAY_DELAY_MS = 300;
 const ORDINARY_IM_MAX_ATTEMPTS = 2;
 
 type OrdinaryImDelivery = {
@@ -11382,6 +11388,46 @@ function markOrdinaryImAutoRedelivery(ds: DaemonSession, turnId: string): boolea
   }
 }
 
+/** Re-evaluate the replay decision from the record's CURRENT facts. Called
+ * when settlement is settled (a decision, not yet an action) and again inside
+ * the deferred timer: a late `child.send` success callback or the worker's
+ * `turn_input_received` ACK can land after `exit`, and replaying then would
+ * execute a turn the dead worker may already have read.
+ *
+ * `priorTurnIds` is the mark snapshot taken BEFORE this attempt wrote its own
+ * mark. Passing it (instead of reading the session again) keeps the
+ * "already retried" guard referring to earlier attempts only, while still
+ * honouring a mark a previous daemon process left for this same turn. */
+function ordinaryImReplayDecision(
+  record: OrdinaryImDelivery,
+  reason: string,
+  priorTurnIds: readonly string[] | undefined,
+): ReturnType<typeof decideOrdinaryImRedelivery> {
+  const ds = record.ds;
+  const content = record.message.type === 'init'
+    ? record.message.prompt
+    : record.message.content;
+  return decideOrdinaryImRedelivery({
+    turnId: record.turnId,
+    reason,
+    received: record.received,
+    transportConfirmed: record.transportConfirmed || record.transportEverConfirmed,
+    sessionStatus: ds.session.status,
+    contentEmpty: content.trim().length === 0,
+    attempt: record.attempt,
+    priorAutoRedeliveryTurnIds: priorTurnIds,
+  });
+}
+
+/** True when the turn still provably never reached the worker. Drives which
+ * notice is honest: "did not run, resend" vs "could not confirm, check first". */
+function isRecordProvablyUndelivered(record: OrdinaryImDelivery): boolean {
+  return isProvablyUndeliveredOrdinaryIm({
+    received: record.received,
+    transportConfirmed: record.transportConfirmed || record.transportEverConfirmed,
+  });
+}
+
 /** The replay door: decide, mark, then schedule the respawn. The respawn must
  * wait until the exit handler has finished clearing `ds.worker` and fencing the
  * generation, so it runs from a timer rather than inline. Returns true when
@@ -11391,18 +11437,9 @@ function maybeAutoRedeliverOrdinaryImDelivery(
   reason: string,
 ): boolean {
   const ds = record.ds;
-  const content = record.message.type === 'init'
-    ? record.message.prompt
-    : record.message.content;
-  const decision = decideOrdinaryImRedelivery({
-    turnId: record.turnId,
-    reason,
-    received: record.received,
-    transportConfirmed: record.transportConfirmed || record.transportEverConfirmed,
-    sessionStatus: ds.session.status,
-    contentEmpty: content.trim().length === 0,
-    priorAutoRedeliveryTurnIds: ds.session.ordinaryImAutoRedelivery?.turnIds,
-  });
+  // Snapshot before writing this attempt's own mark; reused by the timer.
+  const priorTurnIds = ds.session.ordinaryImAutoRedelivery?.turnIds?.slice();
+  const decision = ordinaryImReplayDecision(record, reason, priorTurnIds);
   if (decision !== 'auto-redeliver') return false;
   if (!markOrdinaryImAutoRedelivery(ds, record.turnId)) return false;
   logger.warn(
@@ -11416,6 +11453,24 @@ function maybeAutoRedeliverOrdinaryImDelivery(
     // synchronously: an exception here would be an uncaught daemon error, so
     // every step is contained and a failed replay always ends in a notice.
     try {
+      // Re-decide from current facts: late IPC callbacks / ACKs, a session that
+      // stopped being active, or a mark written meanwhile all disqualify the
+      // replay and must not be seen as "already done".
+      const lateDecision = ordinaryImReplayDecision(record, reason, priorTurnIds);
+      if (lateDecision !== 'auto-redeliver') {
+        const noticeKey = isRecordProvablyUndelivered(record)
+          ? 'worker.input_not_delivered'
+          : 'worker.input_delivery_failed';
+        logger.warn(
+          `[${tag(ds)}] Not replaying ordinary IM turn ${record.turnId.substring(0, 16)}: `
+          + `state changed before the replay (received=${record.received} `
+          + `transportConfirmed=${record.transportConfirmed} `
+          + `transportEverConfirmed=${record.transportEverConfirmed} `
+          + `status=${ds.session.status})`,
+        );
+        reportOrdinaryImDeliveryFailure(ds, record.turnId, reason, noticeKey);
+        return;
+      }
       if (ds.session.status !== 'active') {
         logger.warn(
           `[${tag(ds)}] Not replaying ordinary IM turn ${record.turnId.substring(0, 16)}: `
@@ -11457,7 +11512,7 @@ function maybeAutoRedeliverOrdinaryImDelivery(
         );
       }
     }
-  }, 0);
+  }, ORDINARY_IM_AUTO_REPLAY_DELAY_MS);
   timer.unref?.();
   return true;
 }

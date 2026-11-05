@@ -185,7 +185,9 @@ function makeDs(worker: any, sessionId: string): DaemonSession {
   } as DaemonSession;
 }
 
-const flush = () => new Promise<void>(resolve => setTimeout(resolve, 10));
+// The deferred replay waits ~300ms so late IPC callbacks/ACKs can drain; give
+// every assertion room for that plus the timer callback itself.
+const flush = () => new Promise<void>(resolve => setTimeout(resolve, 400));
 
 /** The pre-ready startup guard also posts its own notice on this harness; keep
  *  this suite's assertions on the DELIVERY notice only. */
@@ -326,7 +328,7 @@ describe('ordinary IM auto-redelivery (worker exit settlement)', () => {
       worker.sentCallbacks[0](null); // attempt 1's success, too late for its own slot
 
       worker.emit('exit', 1, null);
-      await vi.advanceTimersByTimeAsync(10);
+      await vi.advanceTimersByTimeAsync(400);
 
       expect(replay).not.toHaveBeenCalled();
       expect(ds.session.ordinaryImAutoRedelivery).toBeUndefined();
@@ -336,6 +338,27 @@ describe('ordinary IM auto-redelivery (worker exit settlement)', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('does not replay when transport confirmation arrives after exit but before the timer', async () => {
+    // `exit` is emitted before the child's last IPC frames are dispatched: a
+    // child.send success callback can land after the exit handler returned. The
+    // worker may then already hold the turn, so the deferred replay must
+    // re-check the record's current facts instead of trusting the settlement.
+    const worker = makeFakeWorker({ manualTransport: true });
+    const ds = makeDs(worker, 'sid-late-after-exit');
+    __testOnly_setupWorkerHandlers(ds, worker);
+    expect(sendWorkerInput(ds, { content: 'late after exit' }, 'om_late_after_exit_1')).toBe(true);
+
+    worker.emit('exit', 1, null);
+    worker.sentCallbacks[0](null);
+    await flush();
+
+    expect(replay).not.toHaveBeenCalled();
+    expect(ds.session.ordinaryImAutoRedelivery?.turnIds).toEqual(['om_late_after_exit_1']);
+    const notices = deliveryNotices();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatch(/could not confirm|无法确认/);
   });
 
   it('replays only once even when the exit is settled twice for the same worker', async () => {
