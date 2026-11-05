@@ -37,9 +37,9 @@ describe('CLI plugin generation', () => {
     rmSync(home, { recursive: true, force: true });
   });
 
-  it('zero injection emits no replacement or deferred skill catalog on resume', () => {
+  it('zero injection emits no replacement or deferred skill catalog on resume', async () => {
     for (const prompt of ['', '只运行测试']) {
-      const result = prepareCliPluginGeneration({ sessionId: 'zero', bot: { larkAppId: 'sub' },
+      const result = await prepareCliPluginGeneration({ sessionId: 'zero', bot: { larkAppId: 'sub' },
         cliId: 'claude-code', adapter: { id: 'claude-code' } as CliAdapter,
         workingDir: home, dataDir, global: { plugins: [] }, prompt,
         replacesPriorGeneration: true, promptInjection: 'none' });
@@ -51,7 +51,7 @@ describe('CLI plugin generation', () => {
     }
   });
 
-  it('protects shared global skills for every CLI using the common spawn preparation', () => {
+  it('protects shared global skills for every CLI using the common spawn preparation', async () => {
     const skillsDir = join(home, '.shared', 'skills');
     const shared = join(skillsDir, 'botmux-send', 'SKILL.md');
     const user = join(skillsDir, 'user-skill', 'SKILL.md');
@@ -61,42 +61,42 @@ describe('CLI plugin generation', () => {
       adapter: { id: 'traex', skillsDir } as CliAdapter, workingDir: home,
       dataDir, global: { plugins: [] }, prompt: 'task', replacesPriorGeneration: false,
       promptInjection: 'none' as const };
-    expect(() => prepareCliPluginGeneration(opts)).toThrow('全局 botmux 技能');
+    await expect(prepareCliPluginGeneration(opts)).rejects.toThrow('全局 botmux 技能');
     expect(existsSync(shared)).toBe(true);
     expect(existsSync(user)).toBe(true);
     rmSync(join(skillsDir, 'botmux-send'), { recursive: true });
-    expect(prepareCliPluginGeneration(opts).prompt).toBe('task');
+    expect((await prepareCliPluginGeneration(opts)).prompt).toBe('task');
     expect(existsSync(user)).toBe(true);
   });
 
-  it('suppresses an unchanged delivered Auto catalog while still refreshing snapshots and publishing removals', () => {
+  it('suppresses an unchanged delivered Auto catalog while still refreshing snapshots and publishing removals', async () => {
     const source = join(home, 'skill-src', 'demo');
     write(join(source, 'SKILL.md'), '---\nname: demo\ndescription: A demo\n---\n# Demo');
     installLocalSkill(source, { link: false });
     const opts = { sessionId: 'auto-catalog', bot: { larkAppId: 'app', skills: { include: ['skill:demo'] } },
       dataDir, cliId: 'traex' as const, adapter: { id: 'traex' } as CliAdapter,
       workingDir: join(home, 'proj'), prompt: 'first', replacesPriorGeneration: false };
-    const first = prepareCliPluginGeneration(opts);
+    const first = await prepareCliPluginGeneration(opts);
     expect(first.prompt).toContain('botmux_skills');
-    const same = prepareCliPluginGeneration({ ...opts, prompt: '', replacesPriorGeneration: true,
+    const same = await prepareCliPluginGeneration({ ...opts, prompt: '', replacesPriorGeneration: true,
       previousSkillCatalogFingerprint: first.skillCatalogFingerprint });
     expect(same.prompt).toBe('');
     expect(same.skillCatalog).toBeUndefined();
     expect(same.deferredSkillCatalog).toBeUndefined();
     expect(same.skillReadonlyRoots?.length).toBeGreaterThan(0);
     expect(readSessionSkillManifest('auto-catalog')?.prioritySkills.map(skill => skill.name)).toEqual(['demo']);
-    const unchangedRealTurn = prepareCliPluginGeneration({ ...opts, prompt: 'next ask', replacesPriorGeneration: true,
+    const unchangedRealTurn = await prepareCliPluginGeneration({ ...opts, prompt: 'next ask', replacesPriorGeneration: true,
       previousSkillCatalogFingerprint: first.skillCatalogFingerprint });
     expect(unchangedRealTurn.prompt).toBe('next ask');
-    const removed = prepareCliPluginGeneration({ ...opts, bot: { larkAppId: 'app' }, prompt: '',
+    const removed = await prepareCliPluginGeneration({ ...opts, bot: { larkAppId: 'app' }, prompt: '',
       replacesPriorGeneration: true, previousSkillCatalogFingerprint: first.skillCatalogFingerprint });
     expect(removed.deferredSkillCatalog).toContain('Skills not listed here are no longer available');
     expect(removed.skillCatalogFingerprint).not.toBe(first.skillCatalogFingerprint);
-    const ordinary = prepareCliPluginGeneration({ ...opts, prompt: '', replacesPriorGeneration: true });
+    const ordinary = await prepareCliPluginGeneration({ ...opts, prompt: '', replacesPriorGeneration: true });
     expect(ordinary.deferredSkillCatalog).toContain('<botmux_skills_refresh>');
   });
 
-  it('replaces Skills and MCP plugin bindings when the same session starts a new CLI process', () => {
+  it('replaces Skills and MCP plugin bindings when the same session starts a new CLI process', async () => {
     const source = join(home, 'demo-source');
     write(join(source, 'package.json'), JSON.stringify({
       name: '@botmux-ai/plugin-demo',
@@ -119,7 +119,7 @@ describe('CLI plugin generation', () => {
     installLocalPlugin(source);
     const adapter = { id: 'codex' } as CliAdapter;
 
-    expect(() => prepareCliPluginGeneration({
+    await expect(prepareCliPluginGeneration({
       sessionId: 'timeout-ceiling',
       bot: { larkAppId: 'app', plugins: ['demo'], pluginRuntime: { demo: { toolTimeoutMs: 120_000 } } },
       global: { plugins: [], mcpGatewayMaxToolTimeoutMs: 60_000 },
@@ -129,9 +129,9 @@ describe('CLI plugin generation', () => {
       workingDir: '/repo',
       prompt: 'test',
       replacesPriorGeneration: false,
-    })).toThrow('plugin_mcp_tool_timeout_exceeds_max:demo:120000:60000');
+    })).rejects.toThrow('plugin_mcp_tool_timeout_exceeds_max:demo:120000:60000');
 
-    const first = prepareCliPluginGeneration({
+    const first = await prepareCliPluginGeneration({
       sessionId: 'same-session',
       bot: {
         larkAppId: 'app-1',
@@ -179,7 +179,7 @@ describe('CLI plugin generation', () => {
     expect('mcpReadonlyRoots' in first).toBe(false);
     expect('mcpHidePaths' in first).toBe(false);
 
-    const refreshed = prepareCliPluginGeneration({
+    const refreshed = await prepareCliPluginGeneration({
       sessionId: 'same-session',
       bot: { larkAppId: 'app-1', plugins: [] },
       global: { plugins: [] },
@@ -207,7 +207,7 @@ describe('CLI plugin generation', () => {
       sessionMcpRuntimeManifestPath('same-session', dataDir),
     ]);
   });
-  it('hands the sandbox only this session\'s snapshot of exactly the enabled skills', () => {
+  it('hands the sandbox only this session\'s snapshot of exactly the enabled skills', async () => {
     // Two installed skills; the bot enables one. Under sandbox=true the worker
     // feeds skillReadonlyRoots into fs-policy's sessionOwnedReadonlyRoots: it
     // must be the session's own snapshot root — never the store or a skill dir.
@@ -220,7 +220,7 @@ describe('CLI plugin generation', () => {
       ['codex', { id: 'codex' } as CliAdapter],
       ['claude-code', { id: 'claude-code', skillDelivery: { nativeKind: 'claude-plugin' } } as CliAdapter],
     ] as const) {
-      const result = prepareCliPluginGeneration({
+      const result = await prepareCliPluginGeneration({
         sessionId: 'roots',
         bot: { larkAppId: 'app-1', skills: { include: ['skill:deploy'] } },
         global: { plugins: [] },
@@ -245,7 +245,7 @@ describe('CLI plugin generation', () => {
     }
     // workingDir = ~ (the default when a bot configures none) contains the
     // store, but it is no credential location: the store skill still snapshots.
-    const wide = prepareCliPluginGeneration({
+    const wide = await prepareCliPluginGeneration({
       sessionId: 'wide', bot: { larkAppId: 'app-1', skills: { include: ['skill:deploy'] } },
       global: { plugins: [] }, dataDir, cliId: 'codex', adapter: { id: 'codex' } as CliAdapter,
       workingDir: home, prompt: 'task', replacesPriorGeneration: false,
@@ -257,7 +257,7 @@ describe('CLI plugin generation', () => {
     expect(wide.diagnostics.join('\n')).not.toContain('skill_snapshot');
   });
 
-  it('review repros: only the store skill is snapshotted — linked skills (sibling bot home, host ~/.claude, aliased ~/.ssh, working-dir link) are never copied and no credential is in reach (generation → fs-policy)', () => {
+  it('review repros: only the store skill is snapshotted — linked skills (sibling bot home, host ~/.claude, aliased ~/.ssh, working-dir link) are never copied and no credential is in reach (generation → fs-policy)', async () => {
     const realHome = realpathSync(home);
     const botmux = join(realHome, '.botmux');
     const sibling = join(botmux, 'bots', 'cli_sibling');
@@ -277,7 +277,7 @@ describe('CLI plugin generation', () => {
       for (const dir of [sibling, join(realHome, '.claude'), join(vault, 'ssh'), join(realHome, 'proj', '.shared', 'wd')]) {
         installLocalSkill(dir, { link: true });
       }
-      const result = prepareCliPluginGeneration({
+      const result = await prepareCliPluginGeneration({
         sessionId: 'linked',
         bot: { larkAppId: 'cli_self', skills: { include: ['skill:deploy', 'skill:sibhome', 'skill:hostclaude', 'skill:vaultssh', 'skill:wdlink'] } },
         global: { plugins: [] },

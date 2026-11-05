@@ -27,7 +27,7 @@ describe('shared OpenViking example delivery', () => {
 
   it('installed but disabled contributes no memory prompt, CLI command or MCP server', async () => {
     for (const cliId of ['codex', 'claude-code', 'opencode'] as CliId[]) {
-      const result = prepareCliPluginGeneration({
+      const result = await prepareCliPluginGeneration({
         sessionId: `off-${cliId}`, bot: { larkAppId: 'owner-bot' }, global: { plugins: [] },
         cliId, adapter: { id: cliId } as CliAdapter, workingDir: home,
         dataDir: join(home, '.botmux/data'), prompt: 'Current task',
@@ -41,7 +41,7 @@ describe('shared OpenViking example delivery', () => {
 
   it('one plugin supplies the same memory skill and CLI to different Agent adapters', async () => {
     for (const cliId of ['codex', 'claude-code', 'opencode'] as CliId[]) {
-      const result = prepareCliPluginGeneration({
+      const result = await prepareCliPluginGeneration({
         sessionId: `on-${cliId}`, bot: { larkAppId: 'owner-bot', plugins: ['openviking'] }, global: { plugins: [] },
         cliId, adapter: { id: cliId } as CliAdapter, workingDir: home,
         dataDir: join(home, '.botmux/data'), prompt: 'Use past project decisions',

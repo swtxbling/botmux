@@ -158,7 +158,7 @@ d('bwrap three-tier enforcement (real bubblewrap)', () => {
     expect(readFileSync(sibling, 'utf8')).toBe('SIBLING-SECRET\n');
   });
 
-  it('sandbox=true × `botmux skill show` (KERNEL-level): own manifest + own snapshot readable, not writable; sibling session + store unreachable', () => {
+  it('sandbox=true × `botmux skill show` (KERNEL-level): own manifest + own snapshot readable, not writable; sibling session + store unreachable', async () => {
     // The worker grants the session's own manifest as a mandatory read-only FILE
     // and its skill SNAPSHOT root through sessionOwnedReadonlyRoots. Before the
     // fix both reads hit an unmounted path (ENOENT) inside bwrap.
@@ -169,14 +169,14 @@ d('bwrap three-tier enforcement (real bubblewrap)', () => {
       writeFileSync(join(store, name, 'SKILL.md'), `${body}\n`);
     }
     const trust: SkillSnapshotTrust = { storeDir: store, pluginsDir: join(S, 'botmux-home/plugins'), sessionDataDir: dataDir, botsDirs: [join(S, 'botmux-home/bots')], workingDir: join(S, 'proj') };
-    const snap = (sessionId: string, name: string) => snapshotSessionSkills({
+    const snap = async (sessionId: string, name: string) => (await snapshotSessionSkills({
       sessionId, cliId: 'codex', workingDir: join(S, 'proj'), policyMode: 'priority', diagnostics: [],
       generatedAt: '2026-10-19T00:00:00.000Z',
       prioritySkills: [{ id: name, name, tags: [], rootDir: join(store, name), entrypoint: 'SKILL.md',
         source: { type: 'local-copy', originalPath: join(store, name) }, priorityReason: 'bot:include' }],
-    }, { trust, dataDir }).manifest;
-    const own = snap('e2e-session', 'deploy');
-    snap('other-session', 'payroll');
+    }, { trust, dataDir })).manifest;
+    const own = await snap('e2e-session', 'deploy');
+    await snap('other-session', 'payroll');
     const ownManifest = sessionSkillManifestPath('e2e-session', dataDir);
     const otherManifest = sessionSkillManifestPath('other-session', dataDir);
     mkdirSync(dirname(ownManifest), { recursive: true });
@@ -218,7 +218,7 @@ d('bwrap three-tier enforcement (real bubblewrap)', () => {
     const store = join(S, 'botmux-home/skills/store');
     mkdirSync(join(store, 'live'), { recursive: true });
     writeFileSync(join(store, 'live', 'SKILL.md'), 'LIVE-V1\n');
-    snapshotSessionSkills({
+    await snapshotSessionSkills({
       sessionId: 'e2e-session', cliId: 'codex', workingDir: join(S, 'proj'), policyMode: 'priority', diagnostics: [],
       generatedAt: '2026-10-19T00:00:00.000Z',
       prioritySkills: [{ id: 'live', name: 'live', tags: [], rootDir: join(store, 'live'), entrypoint: 'SKILL.md',
