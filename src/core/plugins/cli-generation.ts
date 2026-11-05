@@ -38,7 +38,7 @@ function renderReplacementCatalog(manifest: SessionSkillManifest | null): string
 }
 
 /** Prepare the shared Skills/MCP snapshot immediately before a real CLI spawn. */
-export function prepareCliPluginGeneration(opts: {
+export async function prepareCliPluginGeneration(opts: {
   sessionId: string;
   bot: Pick<BotConfig, 'larkAppId' | 'name' | 'plugins' | 'skills' | 'pluginRuntime'>;
   global?: Pick<GlobalConfig, 'plugins' | 'mcpGatewayMaxToolTimeoutMs'>;
@@ -52,7 +52,7 @@ export function prepareCliPluginGeneration(opts: {
   /** Only the host's admitted Auto resume passes its last delivered catalog. */
   previousSkillCatalogFingerprint?: string;
   now?: () => string;
-}): CliPluginGenerationResult {
+}): Promise<CliPluginGenerationResult> {
   const pluginManifest = refreshSessionPluginManifest({
     sessionId: opts.sessionId,
     bot: opts.bot,
@@ -72,12 +72,12 @@ export function prepareCliPluginGeneration(opts: {
     assertNoGlobalBotmuxSkills(opts.adapter.skillsDir);
     // Keep operational MCP/plugin state, but do not advertise or materialize
     // any skill catalog, including the replacement catalog on resume.
-    prepareSessionSkillPrompt({ sessionId: opts.sessionId, cliId: opts.cliId,
+    await prepareSessionSkillPrompt({ sessionId: opts.sessionId, cliId: opts.cliId,
       workingDir: opts.workingDir, prompt: opts.prompt, botPolicy: undefined });
     return { pluginManifest, prompt: opts.prompt, diagnostics: [] };
   }
   const pluginSkills = resolvePluginSkillPackages(pluginManifest.pluginIds);
-  const preparedSkills = prepareSessionSkillPrompt({
+  const preparedSkills = await prepareSessionSkillPrompt({
     sessionId: opts.sessionId,
     cliId: opts.cliId,
     workingDir: opts.workingDir,

@@ -21,7 +21,7 @@ export interface PreparedSessionSkillPrompt {
   snapshotDiagnostics?: string[];
 }
 
-export function prepareSessionSkillPrompt(opts: {
+export async function prepareSessionSkillPrompt(opts: {
   sessionId: string;
   cliId: CliId;
   workingDir: string;
@@ -31,7 +31,7 @@ export function prepareSessionSkillPrompt(opts: {
   /** Test overrides; production uses the live botmux layout (snapshot.ts). */
   snapshotTrust?: SkillSnapshotTrust;
   snapshotLimits?: SkillSnapshotLimits;
-}): PreparedSessionSkillPrompt {
+}): Promise<PreparedSessionSkillPrompt> {
   if (!opts.botPolicy && !opts.pluginSkills?.length) {
     removeSessionSkillRuntime(opts.sessionId);
     return { prompt: opts.prompt, manifest: null };
@@ -58,7 +58,7 @@ export function prepareSessionSkillPrompt(opts: {
   // that is what the file sandbox exposes. Linked / external skills keep their
   // own path — readable wherever the CLI can already read it, unavailable in
   // the file sandbox (`botmux skill show` explains). The catalog is unchanged.
-  const snapshot = snapshotSessionSkills(manifest, {
+  const snapshot = await snapshotSessionSkills(manifest, {
     trust: opts.snapshotTrust,
     limits: opts.snapshotLimits,
   });

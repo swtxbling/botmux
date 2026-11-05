@@ -2783,7 +2783,11 @@ export function closeSession(
     // not take a new snapshot — re-close must not pin a later `null` over a
     // live dashboard read, and must not spend the scan when apply will ignore it.
     let tokenUsage: NonNullable<Session['tokenUsage']> | null | undefined;
-    if (session.status !== 'closed') {
+    // A row whose boot-time cwd probe timed out must not run the (synchronous,
+    // realpath-based) transcript scan here either: closing it while the
+    // directory hangs would freeze the daemon, which is exactly what `/close`
+    // is meant to rescue. Keep any snapshot already on the row.
+    if (session.status !== 'closed' && !session.restoreCwdUnverifiedAt) {
       tokenUsage = null;
       try {
         tokenUsage = getSessionTokenUsage({

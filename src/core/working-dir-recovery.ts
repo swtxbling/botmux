@@ -32,6 +32,20 @@ export class MissingWorkingDirError extends Error {
   }
 }
 
+/**
+ * The boot-time cwd probe could not read this session's directory and the fork
+ * was refused WITHOUT a synchronous filesystem check. Callers already handle
+ * {@link MissingWorkingDirError} as "the chat was told; do not add a generic
+ * retry hint", so this is a subclass rather than a new contract. The distinct
+ * name lets logs/tests tell a proven-missing directory from an unverified one.
+ */
+export class UnverifiedWorkingDirError extends MissingWorkingDirError {
+  constructor(path: string) {
+    super(path);
+    this.name = 'UnverifiedWorkingDirError';
+  }
+}
+
 /** The recovery card still describes the session: the directory it lost is
  *  still its directory and still missing. `/cd`, a manual re-create or a
  *  finished rebuild each retire it. */

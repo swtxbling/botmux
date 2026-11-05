@@ -22,6 +22,7 @@ import {
   __testOnly_snapshotNofollowFlags,
   snapshotNofollowFlags,
   __testOnly_setSnapshotRaceHook,
+  __testOnly_setSnapshotReadHook,
   defaultSkillSnapshotTrust,
   plausibleConfiguredBotmuxHome,
   removeSessionSkillRuntime,
@@ -77,6 +78,7 @@ describe('session skill snapshots (botmux-managed sources only)', () => {
 
   afterEach(() => {
     __testOnly_setSnapshotRaceHook(undefined);
+    __testOnly_setSnapshotReadHook(undefined);
     vi.unstubAllEnvs();
     rmSync(root, { recursive: true, force: true });
   });
@@ -102,14 +104,14 @@ describe('session skill snapshots (botmux-managed sources only)', () => {
     expect(__testOnly_snapshotNofollowFlags).toBe(snapshotNofollowFlags);
   });
 
-  it('copies exactly the enabled store skills (content, nesting, exec bit) and points the manifest at the snapshot', () => {
+  it('copies exactly the enabled store skills (content, nesting, exec bit) and points the manifest at the snapshot', async () => {
     write(join(store('deploy'), 'SKILL.md'), '# Deploy');
     write(join(store('deploy'), 'references', 'release.md'), '# Release');
     write(join(store('deploy'), 'scripts', 'run.sh'), '#!/bin/sh\necho hi\n');
     chmodSync(join(store('deploy'), 'scripts', 'run.sh'), 0o755);
     write(join(store('payroll'), 'SKILL.md'), '# Payroll');
 
-    const { manifest, diagnostics } = snapshotSessionSkills(manifestOf('s1', [skill('deploy', store('deploy'))]), { trust, dataDir });
+    const { manifest, diagnostics } = await snapshotSessionSkills(manifestOf('s1', [skill('deploy', store('deploy'))]), { trust, dataDir });
 
     expect(diagnostics).toEqual([]);
     expect(readdirSync(snap('s1'))).toEqual(['deploy']);
@@ -120,21 +122,21 @@ describe('session skill snapshots (botmux-managed sources only)', () => {
     expect(manifest.prioritySkills[0].snapshotOf).toBe(store('deploy'));
   });
 
-  it('snapshots plugin bundle skills (plugins/<id>/dist/…) too', () => {
+  it('snapshots plugin bundle skills (plugins/<id>/dist/…) too', async () => {
     const pluginSkill = join(home, '.botmux', 'plugins', 'demo', 'dist', 'skills', 'browser');
     write(join(pluginSkill, 'SKILL.md'), '# Browser');
-    const { manifest } = snapshotSessionSkills(manifestOf('s-plugin', [
+    const { manifest } = await snapshotSessionSkills(manifestOf('s-plugin', [
       skill('browser', pluginSkill, { type: 'plugin', pluginId: 'demo', root: join(home, '.botmux', 'plugins', 'demo', 'dist') }),
     ]), { trust, dataDir });
     expect(manifest.prioritySkills[0].rootDir).toBe(join(snap('s-plugin'), 'browser'));
   });
 
-  it('never copies a linked / external / project skill — it keeps its own path, with no diagnostic', () => {
+  it('never copies a linked / external / project skill — it keeps its own path, with no diagnostic', async () => {
     const linked = join(root, 'elsewhere', 'review');
     const project = join(workingDir, '.agents', 'skills', 'lint');
     write(join(linked, 'SKILL.md'), '# Review');
     write(join(project, 'SKILL.md'), '# Lint');
-    const { manifest, diagnostics } = snapshotSessionSkills(manifestOf('s-ext', [
+    const { manifest, diagnostics } = await snapshotSessionSkills(manifestOf('s-ext', [
       skill('review', linked, { type: 'local-link', path: linked }),
       skill('lint', project, { type: 'project', root: project }),
     ]), { trust, dataDir });
@@ -146,7 +148,7 @@ describe('session skill snapshots (botmux-managed sources only)', () => {
   });
 
   describe('repro: session data dir / bots dir aliased OUTSIDE the botmux root', () => {
-    it('a linked skill pointing into a redirected bots dir or data dir copies nothing', () => {
+    it('a linked skill pointing into a redirected bots dir or data dir copies nothing', async () => {
       // ~/.botmux/bots -> /outside/bots and the data dir -> /outside/data
       const outside = join(root, 'outside');
       write(join(outside, 'bots', 'cli_sibling', 'send-cred.json'), '{"appSecret":"SIBLING-SECRET"}');
@@ -158,7 +160,7 @@ describe('session skill snapshots (botmux-managed sources only)', () => {
       symlinkSync(join(outside, 'data'), aliasedData);
       const aliasedTrust = { ...trust, sessionDataDir: aliasedData };
       // loadSkillPackage stores CANONICAL roots, i.e. under /outside.
-      const { manifest } = snapshotSessionSkills(manifestOf('s-alias', [
+      const { manifest } = await snapshotSessionSkills(manifestOf('s-alias', [
         skill('sib', realpathSync(join(home, '.botmux', 'bots', 'cli_sibling')), { type: 'local-link', path: join(home, '.botmux', 'bots', 'cli_sibling') }),
         skill('ident', realpathSync(join(aliasedData, 'cli-identity')), { type: 'local-link', path: join(aliasedData, 'cli-identity') }),
       ]), { trust: aliasedTrust, dataDir });
@@ -166,7 +168,7 @@ describe('session skill snapshots (botmux-managed sources only)', () => {
       expect(contents(join(dataDir, 'runtime-skills'))).not.toMatch(/SECRET/);
     });
 
-    it('a store aliased into the data dir / a bots dir is not trusted (diagnosed, nothing copied)', () => {
+    it('a store aliased into the data dir / a bots dir is not trusted (diagnosed, nothing copied)', async () => {
       for (const [label, target] of [
         ['data dir', join(dataDir, 'evil-store')],
         ['bots dir', join(home, '.botmux', 'bots', 'cli_x', 'evil-store')],
@@ -174,7 +176,7 @@ describe('session skill snapshots (botmux-managed sources only)', () => {
         write(join(target, 'deploy', 'SKILL.md'), `# planted via ${label}`);
         const aliasedStore = join(root, `store-alias-${label.replace(' ', '-')}`);
         symlinkSync(target, aliasedStore);
-        const { manifest } = snapshotSessionSkills(manifestOf(`s-store-${label.replace(' ', '-')}`, [
+        const { manifest } = await snapshotSessionSkills(manifestOf(`s-store-${label.replace(' ', '-')}`, [
           skill('deploy', realpathSync(join(aliasedStore, 'deploy'))),
         ]), { trust: { ...trust, storeDir: aliasedStore }, dataDir });
         expect(manifest.prioritySkills[0].snapshotOf, label).toBeUndefined();
@@ -212,7 +214,7 @@ describe('session skill snapshots (botmux-managed sources only)', () => {
       write(join(sibling(), 'SKILL.md'), '# planted in a sibling BOT_HOME');
     };
 
-    it('store -> ~/.botmux: a sibling BOT_HOME / the data dir / bots.json "inside the store" are never copied', () => {
+    it('store -> ~/.botmux: a sibling BOT_HOME / the data dir / bots.json "inside the store" are never copied', async () => {
       plantSibling();
       write(join(dataDir, 'cli-identity', 'other.bin', '.data', 'lark-cli.env'), 'TOKEN=OTHER-SESSION-SECRET');
       write(join(dataDir, 'cli-identity', 'SKILL.md'), '# planted');
@@ -220,7 +222,7 @@ describe('session skill snapshots (botmux-managed sources only)', () => {
       const aliasedStore = join(root, 'store-to-botmux');
       symlinkSync(join(home, '.botmux'), aliasedStore);
       const t = { ...trust, storeDir: aliasedStore };
-      const { manifest } = snapshotSessionSkills(manifestOf('s-alias-home', [
+      const { manifest } = await snapshotSessionSkills(manifestOf('s-alias-home', [
         skill('sib', realpathSync(join(aliasedStore, 'bots', 'cli_sibling'))),           // forged "store" entry
         skill('ident', realpathSync(join(aliasedStore, 'data', 'cli-identity'))),
         skill('linked', sibling(), { type: 'local-link', path: sibling() }),              // --link of the sibling home
@@ -235,7 +237,7 @@ describe('session skill snapshots (botmux-managed sources only)', () => {
       expect(resolveManagedSkillSource({ rootDir: join(aliasedStore, 'deploy'), source: { type: 'local-copy', originalPath: '/x' } }, t).ok).toBe(false);
     });
 
-    it('session data dir inside the store: the data-dir subtree is never copied, ordinary store skills still are', () => {
+    it('session data dir inside the store: the data-dir subtree is never copied, ordinary store skills still are', async () => {
       const dataInStore = join(store(''), 'session-data');
       write(join(dataInStore, 'cli-identity', 'other.bin', '.data', 'lark-cli.env'), 'TOKEN=OTHER-SESSION-SECRET');
       write(join(dataInStore, 'cli-identity', 'SKILL.md'), '# planted');
@@ -243,7 +245,7 @@ describe('session skill snapshots (botmux-managed sources only)', () => {
       symlinkSync(dataInStore, join(store('wrapper'), 'unused-link')); // a link is never followed either
       write(join(store('deploy'), 'SKILL.md'), '# Deploy');
       const t = { ...trust, sessionDataDir: dataInStore };
-      const { manifest } = snapshotSessionSkills(manifestOf('s-data-in-store', [
+      const { manifest } = await snapshotSessionSkills(manifestOf('s-data-in-store', [
         skill('ident', join(dataInStore, 'cli-identity')),      // root inside the data dir
         skill('around', store('')),                              // the store root itself (covers the data dir)
         skill('deploy', store('deploy')),
@@ -259,10 +261,10 @@ describe('session skill snapshots (botmux-managed sources only)', () => {
         .toEqual({ ok: false, reason: 'source_overlaps_protected' });
     });
 
-    it('`--link` of a sibling BOT_HOME (with SKILL.md) is never copied, whatever the store resolves to', () => {
+    it('`--link` of a sibling BOT_HOME (with SKILL.md) is never copied, whatever the store resolves to', async () => {
       plantSibling();
       for (const storeDir of [trust.storeDir, join(home, '.botmux')]) {
-        const { manifest } = snapshotSessionSkills(manifestOf('s-link-sib', [
+        const { manifest } = await snapshotSessionSkills(manifestOf('s-link-sib', [
           skill('sib', sibling(), { type: 'local-link', path: sibling() }),
         ]), { trust: { ...trust, storeDir }, dataDir });
         expect(manifest.prioritySkills[0].snapshotOf).toBeUndefined();
@@ -270,7 +272,7 @@ describe('session skill snapshots (botmux-managed sources only)', () => {
       }
     });
 
-    it('a protected dir ALIASED INTO the store is matched at its real location (~/.ssh -> <store>/keys, data dir -> <store>/sd)', () => {
+    it('a protected dir ALIASED INTO the store is matched at its real location (~/.ssh -> <store>/keys, data dir -> <store>/sd)', async () => {
       write(join(store('keys'), 'id_rsa'), 'PRIVATE-KEY-SECRET');
       write(join(store('keys'), 'SKILL.md'), '# planted');
       symlinkSync(store('keys'), join(home, '.ssh'));
@@ -279,14 +281,14 @@ describe('session skill snapshots (botmux-managed sources only)', () => {
       const aliasedData = join(root, 'data-alias');
       symlinkSync(store('sd'), aliasedData);
       const t = { ...trust, sessionDataDir: aliasedData };
-      const { manifest } = snapshotSessionSkills(manifestOf('s-alias-into-store', [
+      const { manifest } = await snapshotSessionSkills(manifestOf('s-alias-into-store', [
         skill('keys', store('keys')), skill('sd', store('sd')),
       ]), { trust: t, dataDir });
       expect(manifest.prioritySkills.every(sk => !sk.snapshotOf)).toBe(true);
       expect(contents(join(dataDir, 'runtime-skills'))).not.toMatch(/SECRET/);
     });
 
-    it('a store aliased onto home cannot hand out ~/.ssh (explicitly denied host path) or cover the botmux home', () => {
+    it('a store aliased onto home cannot hand out ~/.ssh (explicitly denied host path) or cover the botmux home', async () => {
       write(join(home, '.ssh', 'id_rsa'), 'PRIVATE-KEY-SECRET');
       write(join(home, '.ssh', 'SKILL.md'), '# planted');
       const storeOnHome = join(root, 'store-to-home');
@@ -294,14 +296,14 @@ describe('session skill snapshots (botmux-managed sources only)', () => {
       const t = { ...trust, storeDir: storeOnHome };
       expect(resolveManagedSkillSource({ rootDir: join(home, '.ssh'), source: { type: 'local-copy', originalPath: '/x' } }, t))
         .toEqual({ ok: false, reason: 'source_overlaps_protected' });
-      const { manifest } = snapshotSessionSkills(manifestOf('s-home', [skill('ssh', join(home, '.ssh'))]), { trust: t, dataDir });
+      const { manifest } = await snapshotSessionSkills(manifestOf('s-home', [skill('ssh', join(home, '.ssh'))]), { trust: t, dataDir });
       expect(manifest.prioritySkills[0].snapshotOf).toBeUndefined();
       expect(contents(join(dataDir, 'runtime-skills'))).not.toMatch(/SECRET/);
     });
   });
 
   describe('repro: a directory swapped for a symlink while the copy runs', () => {
-    it('a dir replaced by a symlink after listing is skipped — the target is never read', () => {
+    it('a dir replaced by a symlink after listing is skipped — the target is never read', async () => {
       write(join(root, 'secret', '.ssh', 'id_rsa'), 'FAKE-PRIVATE-KEY-SECRET');
       write(join(store('race'), 'SKILL.md'), '# Race');
       write(join(store('race'), 'refs', 'note.md'), 'note');
@@ -311,14 +313,14 @@ describe('session skill snapshots (botmux-managed sources only)', () => {
         renameSync(join(store('race'), 'refs'), join(root, 'refs-moved'));
         symlinkSync(join(root, 'secret', '.ssh'), join(store('race'), 'refs'));
       });
-      const { manifest, diagnostics } = snapshotSessionSkills(manifestOf('s-race', [skill('race', store('race'))]), { trust, dataDir });
+      const { manifest, diagnostics } = await snapshotSessionSkills(manifestOf('s-race', [skill('race', store('race'))]), { trust, dataDir });
       expect(contents(snapRoot('s-race'))).not.toMatch(/SECRET/);
       expect(existsSync(join(snap('s-race'), 'race', 'refs'))).toBe(false);
       expect(manifest.prioritySkills[0].snapshotOf).toBe(store('race'));
       expect(diagnostics.join('\n')).toContain('refs (symlink)');
     });
 
-    it('an ANCESTOR swapped for a symlink mid-walk cannot redirect the copy (fds are pinned)', () => {
+    it('an ANCESTOR swapped for a symlink mid-walk cannot redirect the copy (fds are pinned)', async () => {
       write(join(root, 'secret', 'deep', 'id_rsa'), 'FAKE-PRIVATE-KEY-SECRET');
       write(join(store('race2'), 'SKILL.md'), '# Race2');
       write(join(store('race2'), 'a', 'deep', 'ok.md'), 'ok');
@@ -328,11 +330,11 @@ describe('session skill snapshots (botmux-managed sources only)', () => {
         renameSync(join(store('race2'), 'a'), join(root, 'a-moved'));
         symlinkSync(join(root, 'secret'), join(store('race2'), 'a'));
       });
-      snapshotSessionSkills(manifestOf('s-race2', [skill('race2', store('race2'))]), { trust, dataDir });
+      await snapshotSessionSkills(manifestOf('s-race2', [skill('race2', store('race2'))]), { trust, dataDir });
       expect(contents(snapRoot('s-race2'))).not.toMatch(/SECRET/);
     });
 
-    it('symlinks, hard links and special files inside a store skill are never carried over', () => {
+    it('symlinks, hard links and special files inside a store skill are never carried over', async () => {
       write(join(store('tricky'), 'SKILL.md'), '# Tricky');
       write(join(store('tricky'), 'real.md'), 'REAL');
       write(join(root, 'outside', 'secret.txt'), 'TOPSECRET');
@@ -340,7 +342,7 @@ describe('session skill snapshots (botmux-managed sources only)', () => {
       symlinkSync(join(root, 'outside', 'secret.txt'), join(store('tricky'), 'leak.txt'));
       symlinkSync(join(root, 'outside'), join(store('tricky'), 'outdir'));
       linkSync(join(root, 'outside', 'secret.txt'), join(store('tricky'), 'hard.txt'));
-      const { manifest, diagnostics } = snapshotSessionSkills(manifestOf('s-sym', [skill('tricky', store('tricky'))]), { trust, dataDir });
+      const { manifest, diagnostics } = await snapshotSessionSkills(manifestOf('s-sym', [skill('tricky', store('tricky'))]), { trust, dataDir });
       expect(readdirSync(join(snap('s-sym'), 'tricky')).sort()).toEqual(['SKILL.md', 'real.md']);
       expect(contents(snapRoot('s-sym'))).not.toContain('TOPSECRET');
       expect(manifest.diagnostics).toEqual([expect.objectContaining({ code: 'skill_snapshot_entries_skipped', level: 'warn' })]);
@@ -356,11 +358,11 @@ describe('session skill snapshots (botmux-managed sources only)', () => {
       ['many files', (dir: string) => { for (let i = 0; i < 6; i++) writeFileSync(join(dir, `f${i}.md`), 'x'); }, /more than 5 files/],
       ['big', (dir: string) => { writeFileSync(join(dir, 'blob.bin'), 'y'.repeat(4096)); }, /more than 1024 bytes/],
       ['deep', (dir: string) => { mkdirSync(join(dir, 'a', 'b', 'c', 'd', 'e', 'f'), { recursive: true }); }, /deeper than 4 levels/],
-    ])('%s → whole skill left out of the snapshot with a clear error', (_label, populate, reason) => {
+    ])('%s → whole skill left out of the snapshot with a clear error', async (_label, populate, reason) => {
       write(join(store('big'), 'SKILL.md'), '# Big');
       populate(store('big'));
       write(join(store('ok'), 'SKILL.md'), '# Ok');
-      const { manifest, diagnostics } = snapshotSessionSkills(manifestOf('s-big', [skill('big', store('big')), skill('ok', store('ok'))]), { trust, dataDir, limits });
+      const { manifest, diagnostics } = await snapshotSessionSkills(manifestOf('s-big', [skill('big', store('big')), skill('ok', store('ok'))]), { trust, dataDir, limits });
       expect(readdirSync(snap('s-big'))).toEqual(['ok']);
       const big = manifest.prioritySkills.find(s => s.name === 'big');
       expect(big?.rootDir).toBe(store('big'));
@@ -371,10 +373,10 @@ describe('session skill snapshots (botmux-managed sources only)', () => {
     });
   });
 
-  it('`botmux skill show` explains an unavailable skill: linked (copy-install hint) or failed snapshot (reason)', () => {
+  it('`botmux skill show` explains an unavailable skill: linked (copy-install hint) or failed snapshot (reason)', async () => {
     write(join(store('big'), 'SKILL.md'), '# Big');
     write(join(store('big'), 'blob.bin'), 'y'.repeat(4096));
-    const { manifest } = snapshotSessionSkills(manifestOf('s-why', [
+    const { manifest } = await snapshotSessionSkills(manifestOf('s-why', [
       skill('big', store('big')),
       skill('linked', join(root, 'not-mounted-in-sandbox'), { type: 'local-link', path: join(root, 'not-mounted-in-sandbox') }),
     ]), { trust, dataDir, limits: { maxEntries: 50, maxDirs: 10, maxFiles: 10, maxBytes: 100, maxDepth: 4 } });
@@ -393,33 +395,33 @@ describe('session skill snapshots (botmux-managed sources only)', () => {
     expect(linked.stderr).toContain('botmux skills install <path>` without --link');
   });
 
-  it('a linked skill outside the sandbox keeps working from its own path (no regression)', () => {
+  it('a linked skill outside the sandbox keeps working from its own path (no regression)', async () => {
     const linked = join(root, 'elsewhere', 'review');
     write(join(linked, 'SKILL.md'), '# Review live');
-    const { manifest } = snapshotSessionSkills(manifestOf('s-host', [skill('review', linked, { type: 'local-link', path: linked })]), { trust, dataDir });
+    const { manifest } = await snapshotSessionSkills(manifestOf('s-host', [skill('review', linked, { type: 'local-link', path: linked })]), { trust, dataDir });
     writeSessionSkillManifest(manifest);
     expect(runSkillSessionCommand(['show', 'review'], { BOTMUX_SESSION_ID: 's-host' }).stdout).toBe('# Review live');
   });
 
-  it('a running session keeps serving its snapshot after the store copy is replaced; a respawn picks up the update', () => {
+  it('a running session keeps serving its snapshot after the store copy is replaced; a respawn picks up the update', async () => {
     write(join(store('deploy'), 'SKILL.md'), '# Deploy v1');
     write(join(store('deploy'), 'references', 'notes.md'), 'notes v1');
-    writeSessionSkillManifest(snapshotSessionSkills(manifestOf('s-live', [skill('deploy', store('deploy'))]), { trust, dataDir }).manifest);
+    writeSessionSkillManifest((await snapshotSessionSkills(manifestOf('s-live', [skill('deploy', store('deploy'))]), { trust, dataDir })).manifest);
     rmSync(store('deploy'), { recursive: true, force: true }); // updateInstalledSkill shape
     write(join(store('deploy'), 'SKILL.md'), '# Deploy v2');
     const env = { BOTMUX_SESSION_ID: 's-live' };
     expect(runSkillSessionCommand(['show', 'deploy'], env).stdout).toBe('# Deploy v1');
     expect(runSkillSessionCommand(['read', 'deploy', 'references/notes.md'], env).stdout).toBe('notes v1');
     expect(runSkillSessionCommand(['resources', 'deploy'], env).stdout).toContain('references/notes.md');
-    writeSessionSkillManifest(snapshotSessionSkills(manifestOf('s-live', [skill('deploy', store('deploy'))]), { trust, dataDir }).manifest);
+    writeSessionSkillManifest((await snapshotSessionSkills(manifestOf('s-live', [skill('deploy', store('deploy'))]), { trust, dataDir })).manifest);
     expect(runSkillSessionCommand(['show', 'deploy'], env).stdout).toBe('# Deploy v2');
   });
 
-  it('keeps sessions apart and is removed with the session', () => {
+  it('keeps sessions apart and is removed with the session', async () => {
     write(join(store('a'), 'SKILL.md'), '# A');
     write(join(store('b'), 'SKILL.md'), '# B');
-    writeSessionSkillManifest(snapshotSessionSkills(manifestOf('sess-a', [skill('a', store('a'))]), { trust, dataDir }).manifest);
-    writeSessionSkillManifest(snapshotSessionSkills(manifestOf('sess-b', [skill('b', store('b'))]), { trust, dataDir }).manifest);
+    writeSessionSkillManifest((await snapshotSessionSkills(manifestOf('sess-a', [skill('a', store('a'))]), { trust, dataDir })).manifest);
+    writeSessionSkillManifest((await snapshotSessionSkills(manifestOf('sess-b', [skill('b', store('b'))]), { trust, dataDir })).manifest);
     expect(readdirSync(snap('sess-a'))).toEqual(['a']);
     expect(readdirSync(snap('sess-b'))).toEqual(['b']);
     expect(snap('sess-a')).toBe(join(realpathSync(dataDir), 'runtime-skills', 'sess-a', 'snapshot'));
@@ -438,10 +440,10 @@ describe('session skill snapshots (botmux-managed sources only)', () => {
     const homeTrust = () => ({ ...trust, workingDir: home });
     const pluginSkillDir = () => join(home, '.botmux', 'plugins', 'demo', 'dist', 'skills', 'browser');
 
-    it('store and plugin skills snapshot normally', () => {
+    it('store and plugin skills snapshot normally', async () => {
       write(join(store('deploy'), 'SKILL.md'), '# Deploy');
       write(join(pluginSkillDir(), 'SKILL.md'), '# Browser');
-      const { manifest, diagnostics } = snapshotSessionSkills({ ...manifestOf('s-home-ok', [
+      const { manifest, diagnostics } = await snapshotSessionSkills({ ...manifestOf('s-home-ok', [
         skill('deploy', store('deploy')),
         skill('browser', pluginSkillDir(), { type: 'plugin', pluginId: 'demo', root: join(home, '.botmux', 'plugins', 'demo', 'dist') }),
       ]), workingDir: home }, { trust: homeTrust(), dataDir });
@@ -450,7 +452,7 @@ describe('session skill snapshots (botmux-managed sources only)', () => {
       expect(readFileSync(join(snap('s-home-ok'), 'browser', 'SKILL.md'), 'utf-8')).toBe('# Browser');
     });
 
-    it('every credential repro is still refused: --link sibling BOT_HOME, store -> ~/.botmux, ~/.ssh aliased into the store, data dir inside the store, store -> ~', () => {
+    it('every credential repro is still refused: --link sibling BOT_HOME, store -> ~/.botmux, ~/.ssh aliased into the store, data dir inside the store, store -> ~', async () => {
       const sibling = join(home, '.botmux', 'bots', 'cli_sibling');
       write(join(sibling, 'send-cred.json'), '{"appSecret":"SIBLING-SECRET"}');
       write(join(sibling, 'SKILL.md'), '# planted');
@@ -475,7 +477,7 @@ describe('session skill snapshots (botmux-managed sources only)', () => {
       ];
       for (const [label, sk, t] of cases) {
         expect(resolveManagedSkillSource(sk, t).ok, label).toBe(false);
-        const { manifest } = snapshotSessionSkills({ ...manifestOf('s-home-deny', [sk, skill('deploy', store('deploy'))]), workingDir: home }, { trust: t, dataDir });
+        const { manifest } = await snapshotSessionSkills({ ...manifestOf('s-home-deny', [sk, skill('deploy', store('deploy'))]), workingDir: home }, { trust: t, dataDir });
         expect(manifest.prioritySkills.find(x => x.name === sk.name)?.snapshotOf, label).toBeUndefined();
         expect(contents(join(dataDir, 'runtime-skills')), label).not.toMatch(/SECRET/);
       }
@@ -501,19 +503,19 @@ describe('session skill snapshots (botmux-managed sources only)', () => {
     const pluginSkillDir = () => join(home, '.botmux', 'plugins', 'demo', 'dist', 'skills', 'browser');
     const pluginSkill = () => skill('browser', pluginSkillDir(), { type: 'plugin', pluginId: 'demo', root: join(home, '.botmux', 'plugins', 'demo', 'dist') });
 
-    it('$HOME/data + default workingDir ~: store and plugin skills snapshot normally', () => {
+    it('$HOME/data + default workingDir ~: store and plugin skills snapshot normally', async () => {
       const t = layout(join(home, 'data'));
       expect(t.botmuxRoots).toEqual([join(home, '.botmux')]);
       expect(t.botsDirs).toEqual(expect.arrayContaining([join(home, 'bots'), join(home, '.botmux', 'bots')]));
       write(join(store('deploy'), 'SKILL.md'), '# Deploy');
       write(join(pluginSkillDir(), 'SKILL.md'), '# Browser');
-      const { manifest, diagnostics } = snapshotSessionSkills({ ...manifestOf('s-homedata', [skill('deploy', store('deploy')), pluginSkill()]), workingDir: home },
+      const { manifest, diagnostics } = await snapshotSessionSkills({ ...manifestOf('s-homedata', [skill('deploy', store('deploy')), pluginSkill()]), workingDir: home },
         { trust: t, dataDir });
       expect(diagnostics).toEqual([]);
       expect(manifest.prioritySkills.map(sk => sk.rootDir)).toEqual([join(snap('s-homedata'), 'deploy'), join(snap('s-homedata'), 'browser')]);
     });
 
-    it('$HOME/data: every credential repro is still refused (--link sibling, ~/.ssh into the store, session data, bots dirs, bots.json)', () => {
+    it('$HOME/data: every credential repro is still refused (--link sibling, ~/.ssh into the store, session data, bots dirs, bots.json)', async () => {
       const sessionData = join(home, 'data');
       write(join(sessionData, 'cli-identity', 'x.env'), 'TOKEN=SESSION-SECRET');
       write(join(sessionData, 'cli-identity', 'SKILL.md'), '# planted');
@@ -548,7 +550,7 @@ describe('session skill snapshots (botmux-managed sources only)', () => {
       write(join(home, '.botmux', 'bots', 'SKILL.md'), '# planted');
       for (const [label, sk, tr] of cases) {
         expect(resolveManagedSkillSource(sk, tr).ok, label).toBe(false);
-        const { manifest } = snapshotSessionSkills({ ...manifestOf('s-homedata-deny', [sk, skill('deploy', store('deploy'))]), workingDir: home }, { trust: tr, dataDir });
+        const { manifest } = await snapshotSessionSkills({ ...manifestOf('s-homedata-deny', [sk, skill('deploy', store('deploy'))]), workingDir: home }, { trust: tr, dataDir });
         expect(manifest.prioritySkills.find(x => x.name === sk.name)?.snapshotOf, label).toBeUndefined();
         expect(manifest.prioritySkills.find(x => x.name === 'deploy')?.snapshotOf, label).toBe(store('deploy'));
         expect(contents(join(dataDir, 'runtime-skills')), label).not.toMatch(/SECRET/);
@@ -599,4 +601,113 @@ describe('session skill snapshots (botmux-managed sources only)', () => {
       expect(plausibleConfiguredBotmuxHome(join(root, 'x'), { ...lay, defaultBotmux: join(root, 'x', 'dfl') })).toBe(false);
     });
   });
+
+  // The macOS failure this guards: a skill source inside a privacy-protected
+  // folder blocks the read until TCC answers — possibly never. Synchronous fs
+  // on the worker's main thread could never be timed out, so the session hung
+  // right after "Codex runner freshness=current". Every skill now has a
+  // deadline; a blocked one is skipped and the session continues.
+  describe('a source read that never returns (macOS TCC / privacy-protected folder)', () => {
+    it('skips only the blocked skill at the deadline and reports its path + remedy', async () => {
+      write(join(store('blocked'), 'SKILL.md'), '# Blocked');
+      write(join(store('ok'), 'SKILL.md'), '# Ok');
+      __testOnly_setSnapshotReadHook(async (path) => {
+        if (path.startsWith(store('blocked'))) await new Promise<void>(() => undefined);
+      });
+      const startedAt = Date.now();
+      const { manifest, diagnostics } = await snapshotSessionSkills(
+        manifestOf('s-hang', [skill('blocked', store('blocked')), skill('ok', store('ok'))]),
+        { trust, dataDir, deadlineMs: 60 });
+      // The deadline fired; the test (and the worker) kept running.
+      expect(Date.now() - startedAt).toBeLessThan(10_000);
+      expect(readdirSync(snap('s-hang'))).toEqual(['ok']);
+      const blocked = manifest.prioritySkills.find(s => s.name === 'blocked');
+      expect(blocked?.rootDir).toBe(store('blocked'));
+      expect(blocked?.snapshotOf).toBeUndefined();
+      expect(manifest.prioritySkills.find(s => s.name === 'ok')?.snapshotOf).toBe(store('ok'));
+      expect(manifest.diagnostics).toEqual([
+        expect.objectContaining({ code: 'skill_snapshot_timeout', level: 'error', skillName: 'blocked' }),
+      ]);
+      const message = diagnostics.join('\n');
+      expect(message).toContain('"blocked"');
+      expect(message).toContain(store('blocked'));
+      expect(message).toContain('Full Disk Access');
+    });
+
+    it('bounds the skill-root resolution too (a hang before the copy is still a timeout)', async () => {
+      write(join(store('blocked-root'), 'SKILL.md'), '# Blocked root');
+      write(join(store('ok'), 'SKILL.md'), '# Ok');
+      __testOnly_setSnapshotReadHook(path => path === store('blocked-root')
+        ? new Promise<void>(() => undefined) : undefined);
+      const { manifest, diagnostics } = await snapshotSessionSkills(
+        manifestOf('s-hang-root', [skill('blocked-root', store('blocked-root')), skill('ok', store('ok'))]),
+        { trust, dataDir, deadlineMs: 60 });
+      expect(readdirSync(snap('s-hang-root'))).toEqual(['ok']);
+      expect(manifest.prioritySkills.find(s => s.name === 'blocked-root')?.rootDir).toBe(store('blocked-root'));
+      expect(manifest.diagnostics).toEqual([expect.objectContaining({ code: 'skill_snapshot_timeout', skillName: 'blocked-root' })]);
+      expect(diagnostics.join('\n')).toContain(store('blocked-root'));
+    });
+  });
+
+  it('skips an unreadable skill source with an actionable diagnostic and copies the rest', async () => {
+    write(join(store('unreadable'), 'SKILL.md'), '# Unreadable');
+    write(join(store('fine'), 'SKILL.md'), '# Fine');
+    chmodSync(store('unreadable'), 0o000);
+    try {
+      const { manifest, diagnostics } = await snapshotSessionSkills(
+        manifestOf('s-eacces', [skill('unreadable', store('unreadable')), skill('fine', store('fine'))]),
+        { trust, dataDir });
+      expect(readdirSync(snap('s-eacces'))).toEqual(['fine']);
+      expect(manifest.prioritySkills.find(s => s.name === 'unreadable')?.snapshotOf).toBeUndefined();
+      expect(manifest.prioritySkills.find(s => s.name === 'fine')?.snapshotOf).toBe(store('fine'));
+      expect(manifest.diagnostics).toEqual([
+        expect.objectContaining({ code: 'skill_snapshot_failed', level: 'error', skillName: 'unreadable' }),
+      ]);
+      const message = diagnostics.join('\n');
+      expect(message).toContain(store('unreadable'));
+      expect(message).toContain('Full Disk Access');
+    } finally {
+      chmodSync(store('unreadable'), 0o755);
+    }
+  });
+
+
+  it('serialises concurrent snapshots for one session: a slow timed-out run cannot delete the newer snapshot', async () => {
+    write(join(store('slow'), 'SKILL.md'), '# Slow');
+    write(join(store('fast'), 'SKILL.md'), '# Fast');
+    __testOnly_setSnapshotReadHook(async (path) => {
+      if (path.startsWith(store('slow'))) await new Promise<void>(() => undefined);
+    });
+    const [slow, fast] = await Promise.all([
+      snapshotSessionSkills(manifestOf('s-concurrent', [skill('slow', store('slow'))]), { trust, dataDir, deadlineMs: 60 }),
+      snapshotSessionSkills(manifestOf('s-concurrent', [skill('fast', store('fast'))]), { trust, dataDir }),
+    ]);
+    // The slow run produced nothing; the fast run's snapshot must survive it.
+    expect(slow.manifest.prioritySkills[0].snapshotOf).toBeUndefined();
+    expect(fast.manifest.prioritySkills[0].snapshotOf).toBe(store('fast'));
+    expect(readdirSync(snap('s-concurrent'))).toEqual(['fast']);
+  });
+
+  it('stops touching a timed-out skill as soon as the deadline fires (no late reads)', async () => {
+    write(join(store('late'), 'SKILL.md'), '# Late');
+    write(join(store('late'), 'extra.md'), 'extra');
+    const reads: string[] = [];
+    let rootReads = 0;
+    __testOnly_setSnapshotReadHook(async (path) => {
+      reads.push(path);
+      // Delay only the COPY's root listing (the resolve phase reads it first):
+      // the deadline fires while the copy is suspended mid-walk.
+      if (path === store('late') && ++rootReads === 2) {
+        await new Promise<void>(resolve => setTimeout(resolve, 200));
+      }
+    });
+    const { manifest } = await snapshotSessionSkills(
+      manifestOf('s-late', [skill('late', store('late'))]), { trust, dataDir, deadlineMs: 60 });
+    expect(manifest.prioritySkills[0].snapshotOf).toBeUndefined();
+    const readsAtDeadline = reads.length;
+    // Give the abandoned copy time to resume: it must not read any further.
+    await new Promise(resolve => setTimeout(resolve, 300));
+    expect(reads.slice(readsAtDeadline)).toEqual([]);
+  });
+
 });

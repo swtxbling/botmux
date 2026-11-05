@@ -847,6 +847,15 @@ export interface Session {
    * explicit close retries authoritative teardown before closing the row.
    */
   restoreQuarantinedAt?: string;
+  /**
+   * Boot-time working-directory probe did not answer for this row (macOS
+   * privacy prompt pending, unmounted disk, dead mount). While set, transcript
+   * scans (token usage / open todos) are skipped for this row so a dashboard
+   * read cannot run the synchronous `realpathSync(workingDir)` that froze the
+   * daemon at startup. Re-evaluated on every restore: cleared when a later boot
+   * probes the directory successfully.
+   */
+  restoreCwdUnverifiedAt?: string;
   pid?: number;
   /** Birth identity of the worker `pid` was recorded for (durable boot-id +
    *  starttime, see core/session-worker-identity.ts). Written and cleared with
