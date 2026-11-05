@@ -671,4 +671,43 @@ describe('session skill snapshots (botmux-managed sources only)', () => {
     }
   });
 
+
+  it('serialises concurrent snapshots for one session: a slow timed-out run cannot delete the newer snapshot', async () => {
+    write(join(store('slow'), 'SKILL.md'), '# Slow');
+    write(join(store('fast'), 'SKILL.md'), '# Fast');
+    __testOnly_setSnapshotReadHook(async (path) => {
+      if (path.startsWith(store('slow'))) await new Promise<void>(() => undefined);
+    });
+    const [slow, fast] = await Promise.all([
+      snapshotSessionSkills(manifestOf('s-concurrent', [skill('slow', store('slow'))]), { trust, dataDir, deadlineMs: 60 }),
+      snapshotSessionSkills(manifestOf('s-concurrent', [skill('fast', store('fast'))]), { trust, dataDir }),
+    ]);
+    // The slow run produced nothing; the fast run's snapshot must survive it.
+    expect(slow.manifest.prioritySkills[0].snapshotOf).toBeUndefined();
+    expect(fast.manifest.prioritySkills[0].snapshotOf).toBe(store('fast'));
+    expect(readdirSync(snap('s-concurrent'))).toEqual(['fast']);
+  });
+
+  it('stops touching a timed-out skill as soon as the deadline fires (no late reads)', async () => {
+    write(join(store('late'), 'SKILL.md'), '# Late');
+    write(join(store('late'), 'extra.md'), 'extra');
+    const reads: string[] = [];
+    let rootReads = 0;
+    __testOnly_setSnapshotReadHook(async (path) => {
+      reads.push(path);
+      // Delay only the COPY's root listing (the resolve phase reads it first):
+      // the deadline fires while the copy is suspended mid-walk.
+      if (path === store('late') && ++rootReads === 2) {
+        await new Promise<void>(resolve => setTimeout(resolve, 200));
+      }
+    });
+    const { manifest } = await snapshotSessionSkills(
+      manifestOf('s-late', [skill('late', store('late'))]), { trust, dataDir, deadlineMs: 60 });
+    expect(manifest.prioritySkills[0].snapshotOf).toBeUndefined();
+    const readsAtDeadline = reads.length;
+    // Give the abandoned copy time to resume: it must not read any further.
+    await new Promise(resolve => setTimeout(resolve, 300));
+    expect(reads.slice(readsAtDeadline)).toEqual([]);
+  });
+
 });

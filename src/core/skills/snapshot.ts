@@ -273,7 +273,10 @@ const realOrNullAsync = async (path: string): Promise<string | null> => {
 
 /** The decision itself, on an already-canonical `root` (null = unreadable).
  *  The async snapshot path resolves the root off-thread first, under a
- *  deadline, so a privacy-protected source cannot block the worker there. */
+ *  deadline, so a privacy-protected source cannot block the worker there.
+ *  The sync realpaths below are on botmux's own trust roots, never on the
+ *  skill source; they are already warm because the async phase just visited
+ *  the same paths, so they cannot be the first TCC-blocked read. */
 function decideManagedSkillSource(
   skill: Pick<ResolvedSkill, 'rootDir' | 'source'>,
   trust: SkillSnapshotTrust,
@@ -383,17 +386,24 @@ class SnapshotLimitError extends Error {}
  *  before touching any further path (its output dir was already removed). */
 class SnapshotAbortedError extends Error {}
 
+/** Which side of the copy stalled: a source read may need a privacy grant, a
+ *  destination write may need free space / write permission — the remedy in
+ *  the diagnostic depends on it. */
 class SnapshotTimeoutError extends Error {
-  constructor(readonly path: string | undefined, readonly timeoutMs: number) {
-    super(`reading ${path ?? 'the skill source'} did not finish within ${timeoutMs}ms`);
+  constructor(
+    readonly sourcePath: string | undefined,
+    readonly writePath: string | undefined,
+    readonly timeoutMs: number,
+  ) {
+    super(`${sourcePath ? `reading ${sourcePath}` : writePath ? `writing ${writePath}` : 'the skill source'} did not finish within ${timeoutMs}ms`);
   }
 }
 
 /** Cooperative half of the per-skill deadline: fs.promises calls cannot be
  *  cancelled, and a read blocked by macOS TCC may never return. Whoever wins
  *  the race sets `aborted`, and the abandoned copy checks it after EVERY
- *  awaited operation so it stops before writing anything else. */
-interface SnapshotAbort { aborted: boolean; lastPath?: string }
+ *  awaited operation so it stops before touching anything else. */
+interface SnapshotAbort { aborted: boolean; sourcePath?: string; writePath?: string }
 
 function ensureLive(abort: SnapshotAbort): void {
   if (abort.aborted) throw new SnapshotAbortedError('skill copy abandoned after its deadline');
@@ -401,12 +411,37 @@ function ensureLive(abort: SnapshotAbort): void {
 
 const isAbort = (err: unknown): err is SnapshotAbortedError => err instanceof SnapshotAbortedError;
 
-/** Await one fs operation, remembering which path blocked, then honour abort. */
-async function guarded<T>(abort: SnapshotAbort, path: string, work: Promise<T>): Promise<T> {
-  abort.lastPath = path;
+/** Await one fs operation, remembering which side/path stalled, then honour
+ *  the abort flag. `kind` only affects the diagnostic text. */
+async function guarded<T>(
+  abort: SnapshotAbort,
+  kind: 'source' | 'write',
+  path: string,
+  work: Promise<T>,
+): Promise<T> {
+  if (kind === 'source') abort.sourcePath = path;
+  else abort.writePath = path;
   const value = await work;
   ensureLive(abort);
   return value;
+}
+
+/** fsp.open guarded like `guarded`, but a handle that arrives AFTER the abort
+ *  must be closed instead of dropped (the copy will never use it). */
+async function openGuarded(
+  abort: SnapshotAbort,
+  kind: 'source' | 'write',
+  path: string,
+  work: Promise<FileHandle>,
+): Promise<FileHandle> {
+  if (kind === 'source') abort.sourcePath = path;
+  else abort.writePath = path;
+  const handle = await work;
+  if (abort.aborted) {
+    await handle.close().catch(() => undefined);
+    throw new SnapshotAbortedError('skill copy abandoned after its deadline');
+  }
+  return handle;
 }
 
 /** Reject with SnapshotTimeoutError once `timeoutMs` elapses without `work`
@@ -417,7 +452,7 @@ async function withinDeadline<T>(work: Promise<T>, timeoutMs: number, abort: Sna
   const expired = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
       abort.aborted = true;
-      reject(new SnapshotTimeoutError(abort.lastPath, timeoutMs));
+      reject(new SnapshotTimeoutError(abort.sourcePath, abort.writePath, timeoutMs));
     }, timeoutMs);
     timer.unref?.();
   });
@@ -458,12 +493,12 @@ async function copyManagedTree(
 
   const copyFile = async (src: Dir, name: string, rel: string, out: Dir): Promise<void> => {
     const srcPath = join(src.path, name);
-    abort.lastPath = srcPath;
+    abort.sourcePath = srcPath;
     await onRead(srcPath);
-    const fh = await guarded(abort, srcPath,
+    const fh = await openGuarded(abort, 'source', srcPath,
       fsp.open(childPath(src, name), fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | nofollow()));
     try {
-      const st = await guarded(abort, srcPath, fh.stat());
+      const st = await guarded(abort, 'source', srcPath, fh.stat());
       if (!st.isFile()) { stats.skipped.push(`${rel} (not a regular file)`); return; }
       if (st.nlink > 1) { stats.skipped.push(`${rel} (hard-linked)`); return; }
       stats.files += 1;
@@ -473,19 +508,19 @@ async function copyManagedTree(
       const buf = Buffer.alloc(st.size);
       let off = 0;
       while (off < st.size) {
-        const { bytesRead } = await guarded(abort, srcPath, fh.read(buf, off, st.size - off, off));
+        const { bytesRead } = await guarded(abort, 'source', srcPath, fh.read(buf, off, st.size - off, off));
         if (bytesRead <= 0) break;
         off += bytesRead;
       }
       const outPath = childPath(out, name);
       ensureLive(abort);
-      const outFh = await guarded(abort, outPath, fsp.open(outPath,
+      const outFh = await openGuarded(abort, 'write', outPath, fsp.open(outPath,
         fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | nofollow(),
         (st.mode & 0o111) ? 0o755 : 0o644));
       try {
         let written = 0;
         while (written < off) {
-          const { bytesWritten } = await guarded(abort, outPath, outFh.write(buf, written, off - written));
+          const { bytesWritten } = await guarded(abort, 'write', outPath, outFh.write(buf, written, off - written));
           if (bytesWritten <= 0) break;
           written += bytesWritten;
         }
@@ -499,9 +534,9 @@ async function copyManagedTree(
 
   const walk = async (src: Dir, out: Dir, rel: string, depth: number): Promise<void> => {
     if (depth > limits.maxDepth) throw new SnapshotLimitError(`deeper than ${limits.maxDepth} levels`);
-    abort.lastPath = src.path;
+    abort.sourcePath = src.path;
     await onRead(src.path);
-    const names = await guarded(abort, src.path, listDir(src));
+    const names = await guarded(abort, 'source', src.path, listDir(src));
     raceHookForTests?.(rel);
     for (const name of names) {
       const entryRel = rel ? `${rel}/${name}` : name;
@@ -510,7 +545,7 @@ async function copyManagedTree(
       const entryPath = join(src.path, name);
       let st: Stats;
       try {
-        st = await guarded(abort, entryPath, fsp.lstat(childPath(src, name)));
+        st = await guarded(abort, 'source', entryPath, fsp.lstat(childPath(src, name)));
       } catch (err) {
         if (isAbort(err) || abort.aborted) throw new SnapshotAbortedError('skill copy abandoned after its deadline');
         stats.skipped.push(`${entryRel} (vanished)`);
@@ -540,7 +575,7 @@ async function copyManagedTree(
       }
       try {
         const outChildPath = childPath(out, name);
-        await guarded(abort, outChildPath, fsp.mkdir(outChildPath, { mode: 0o755 }));
+        await guarded(abort, 'write', outChildPath, fsp.mkdir(outChildPath, { mode: 0o755 }));
         const outChild = await openSubdir(out, name);
         try { await walk(child, outChild, entryRel, depth + 1); } finally { await closeDir(outChild); }
       } finally {
@@ -554,8 +589,20 @@ async function copyManagedTree(
   return stats;
 }
 
-/** Actionable text for a skill whose read hit the per-skill deadline. */
-function snapshotTimeoutMessage(name: string, path: string, timeoutMs: number): string {
+/** Actionable text for a skill that hit the per-skill deadline. The remedy
+ *  depends on which side stalled: a source read is the macOS TCC shape, a
+ *  destination write is a local disk/permission problem. */
+function snapshotTimeoutMessage(
+  name: string,
+  stuck: { sourcePath?: string; writePath?: string },
+  fallbackPath: string,
+  timeoutMs: number,
+): string {
+  if (!stuck.sourcePath && stuck.writePath) {
+    return `skill "${name}" was not snapshotted: writing ${stuck.writePath} did not finish within ${timeoutMs}ms, so the session continues without it. `
+      + 'The source itself was read fine — check that the session runtime dir is writable and has free space.';
+  }
+  const path = stuck.sourcePath ?? fallbackPath;
   return `skill "${name}" was not snapshotted: reading ${path} did not finish within ${timeoutMs}ms, so the session continues without it. `
     + 'A read that never returns usually means macOS privacy protection (TCC) is blocking the folder that holds this skill: '
     + 'grant Full Disk Access to the program that runs botmux in System Settings > Privacy & Security, '
@@ -593,6 +640,30 @@ export async function snapshotSessionSkills(
   manifest: SessionSkillManifest,
   opts: { dataDir?: string; trust?: SkillSnapshotTrust; limits?: SkillSnapshotLimits; deadlineMs?: number } = {},
 ): Promise<SessionSkillSnapshotResult> {
+  // One generation per session at a time. A run can still be settling on a
+  // timed-out skill when the next spawn starts another one, and the settling
+  // tail unconditionally replaces (rm + rename) the session's snapshot root:
+  // serialised, the last run always wins instead of a slow old run deleting
+  // the snapshot a newer run already published.
+  const key = manifest.sessionId;
+  const run = (sessionSnapshotChains.get(key) ?? Promise.resolve())
+    .catch(() => undefined)
+    .then(() => snapshotSessionSkillsUnlocked(manifest, opts));
+  const tail = run.then(() => undefined, () => undefined);
+  sessionSnapshotChains.set(key, tail);
+  void tail.then(() => {
+    // Only the tail deletes the entry; a later run has installed a new tail.
+    if (sessionSnapshotChains.get(key) === tail) sessionSnapshotChains.delete(key);
+  });
+  return run;
+}
+
+const sessionSnapshotChains = new Map<string, Promise<void>>();
+
+async function snapshotSessionSkillsUnlocked(
+  manifest: SessionSkillManifest,
+  opts: { dataDir?: string; trust?: SkillSnapshotTrust; limits?: SkillSnapshotLimits; deadlineMs?: number } = {},
+): Promise<SessionSkillSnapshotResult> {
   const dataDir = opts.dataDir ?? config.session.dataDir;
   const trust = opts.trust ?? defaultSkillSnapshotTrust({ workingDir: manifest.workingDir, dataDir });
   const limits = opts.limits ?? DEFAULT_SKILL_SNAPSHOT_LIMITS;
@@ -624,14 +695,14 @@ export async function snapshotSessionSkills(
         let source: ReturnType<typeof decideManagedSkillSource>;
         try {
           const rootReal = await withinDeadline((async () => {
-            abort.lastPath = skill.rootDir;
+            abort.sourcePath = skill.rootDir;
             await sourceRead(skill.rootDir);
             return realOrNullAsync(skill.rootDir);
           })(), remaining(), abort);
           source = decideManagedSkillSource(skill, trust, rootReal);
         } catch (err) {
           if (err instanceof SnapshotTimeoutError) {
-            fail('skill_snapshot_timeout', snapshotTimeoutMessage(skill.name, err.path ?? skill.rootDir, deadlineMs));
+            fail('skill_snapshot_timeout', snapshotTimeoutMessage(skill.name, err, skill.rootDir, deadlineMs));
           } else {
             fail('skill_snapshot_failed', snapshotReadFailureMessage(skill.name, skill.rootDir, err));
           }
@@ -678,7 +749,7 @@ export async function snapshotSessionSkills(
               `skill "${skill.name}" exceeds the session snapshot limit (${limits.maxEntries} entries / ${limits.maxDirs} dirs / ${limits.maxFiles} files / ${limits.maxBytes} bytes / depth ${limits.maxDepth}): ${err.message}`);
           } else if (err instanceof SnapshotTimeoutError || err instanceof SnapshotAbortedError) {
             fail('skill_snapshot_timeout',
-              snapshotTimeoutMessage(skill.name, err instanceof SnapshotTimeoutError ? (err.path ?? source.root) : source.root, deadlineMs));
+              snapshotTimeoutMessage(skill.name, err instanceof SnapshotTimeoutError ? err : {}, source.root, deadlineMs));
           } else {
             fail('skill_snapshot_failed', snapshotReadFailureMessage(skill.name, source.root, err));
           }

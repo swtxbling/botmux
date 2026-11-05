@@ -31,8 +31,6 @@ export async function prepareSessionSkillPrompt(opts: {
   /** Test overrides; production uses the live botmux layout (snapshot.ts). */
   snapshotTrust?: SkillSnapshotTrust;
   snapshotLimits?: SkillSnapshotLimits;
-  /** Per-skill read/copy deadline; production default is 10s (snapshot.ts). */
-  snapshotDeadlineMs?: number;
 }): Promise<PreparedSessionSkillPrompt> {
   if (!opts.botPolicy && !opts.pluginSkills?.length) {
     removeSessionSkillRuntime(opts.sessionId);
@@ -63,7 +61,6 @@ export async function prepareSessionSkillPrompt(opts: {
   const snapshot = await snapshotSessionSkills(manifest, {
     trust: opts.snapshotTrust,
     limits: opts.snapshotLimits,
-    deadlineMs: opts.snapshotDeadlineMs,
   });
   const manifestOut = snapshot.manifest;
   writeSessionSkillManifest(manifestOut);
