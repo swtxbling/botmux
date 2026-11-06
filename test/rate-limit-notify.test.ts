@@ -65,6 +65,7 @@ import {
 } from '../src/core/worker-pool.js';
 import { usageLimitStateKey, type CliUsageLimitState } from '../src/utils/cli-usage-limit.js';
 import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
+import { __testOnly_resetRateLimitMentions } from '../src/services/rate-limit-mention.js';
 
 const APP_CARD_OFF = 'ratelimit_cardoff_app';
 const APP_CARD_ON = 'ratelimit_cardon_app';
@@ -131,6 +132,7 @@ function textReplies(sessionReply: ReturnType<typeof vi.fn>): string[] {
 describe('rate-limit proactive notification', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    __testOnly_resetRateLimitMentions();
     process.env.SESSION_DATA_DIR = mkdtempSync(join(tmpdir(), 'botmux-ratelimit-'));
     sessionStore.init(APP_CARD_OFF);
     registerBot({
@@ -436,5 +438,79 @@ describe('rate-limit proactive notification', () => {
     expect(texts).toHaveLength(1);
     expect(texts[0]).toContain(`<at id=${OWNER}>`);
     expect(ds.rateLimitNotifiedKey).toBe(usageLimitStateKey(limit));
+  });
+
+  it('同一 bot 多个话题同时撞上同一次限额：每个话题都有提示，但只 @ owner 一次', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    setupPool(sessionReply);
+    const workerA = makeFakeWorker();
+    const workerB = makeFakeWorker();
+    const dsA = makeDs({ worker: workerA, workerPort: 9999 });
+    const dsB = makeDs({ worker: workerB, workerPort: 9998, chatId: 'oc_y' });
+    dsB.session.chatId = 'oc_y';
+    setActiveSessionsRegistry(new Map([[activeSessionKey(dsA), dsA], [activeSessionKey(dsB), dsB]]));
+    __testOnly_setupWorkerHandlers(dsA, workerA);
+    __testOnly_setupWorkerHandlers(dsB, workerB);
+
+    const limit = rateLimitState({ kind: 'usage', retryLabel: '10:40 PM' });
+    workerA.emit('message', { type: 'screen_update', content: 'usage limit', status: 'limited', usageLimit: limit });
+    await flush();
+    workerB.emit('message', { type: 'screen_update', content: 'usage limit', status: 'limited', usageLimit: limit });
+    await flush();
+
+    const texts = textReplies(sessionReply);
+    expect(texts).toHaveLength(2);
+    expect(texts.filter(text => text.includes(`<at id=${OWNER}>`))).toHaveLength(1);
+    expect(texts.every(text => text.includes('10:40 PM'))).toBe(true);
+  });
+
+  it('@ 那条发送失败时把名额让出来，下一个撞限额的话题仍会 @ owner', async () => {
+    let calls = 0;
+    const sessionReply = vi.fn(async (..._args: unknown[]) => {
+      calls += 1;
+      if (calls === 1) throw new Error('lark unreachable');
+      return 'om_reply';
+    });
+    setupPool(sessionReply);
+    const workerA = makeFakeWorker();
+    const workerB = makeFakeWorker();
+    const dsA = makeDs({ worker: workerA, workerPort: 9999 });
+    const dsB = makeDs({ worker: workerB, workerPort: 9998, chatId: 'oc_y' });
+    dsB.session.chatId = 'oc_y';
+    setActiveSessionsRegistry(new Map([[activeSessionKey(dsA), dsA], [activeSessionKey(dsB), dsB]]));
+    __testOnly_setupWorkerHandlers(dsA, workerA);
+    __testOnly_setupWorkerHandlers(dsB, workerB);
+
+    const limit = rateLimitState();
+    workerA.emit('message', { type: 'screen_update', content: '429', status: 'limited', usageLimit: limit });
+    await flush();
+    workerB.emit('message', { type: 'screen_update', content: '429', status: 'limited', usageLimit: limit });
+    await flush();
+
+    const texts = textReplies(sessionReply);
+    expect(texts).toHaveLength(2);
+    expect(texts[1]).toContain(`<at id=${OWNER}>`);
+  });
+
+  it('不同 bot 各自撞限额：各自 @ owner 一次', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    setupPool(sessionReply);
+    const workerA = makeFakeWorker();
+    const workerB = makeFakeWorker();
+    const dsA = makeDs({ worker: workerA, workerPort: 9999 });
+    const dsB = makeDs({ worker: workerB, workerPort: 9998 }, APP_CARD_ON);
+    setActiveSessionsRegistry(new Map([[activeSessionKey(dsA), dsA], [activeSessionKey(dsB), dsB]]));
+    __testOnly_setupWorkerHandlers(dsA, workerA);
+    __testOnly_setupWorkerHandlers(dsB, workerB);
+
+    const limit = rateLimitState();
+    workerA.emit('message', { type: 'screen_update', content: '429', status: 'limited', usageLimit: limit });
+    await flush();
+    workerB.emit('message', { type: 'screen_update', content: '429', status: 'limited', usageLimit: limit });
+    await flush();
+
+    const texts = textReplies(sessionReply);
+    expect(texts).toHaveLength(2);
+    expect(texts.every(text => text.includes(`<at id=${OWNER}>`))).toBe(true);
   });
 });
