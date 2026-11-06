@@ -131,6 +131,7 @@ import {
 import type { CliLaunchMode } from './cli-launch-mode.js';
 import { traeHome } from '../services/traex-paths.js';
 import { botLocale, localeForBot, t as tr } from '../i18n/index.js';
+import { CrashNoticeBatcher, crashNoticeLabel, type CrashNoticeEntry } from './crash-notice.js';
 import { sandboxNamespaceNotice } from './system-bwrap.js';
 import { claudeJsonlPathForSession } from '../adapters/cli/claude-code.js';
 import { findUniqueClaudeSessionByCwd } from './session-discovery.js';
@@ -6843,6 +6844,50 @@ async function closeWithdrawnSessionIfLedgerEmpty(
 // ─── Restart rate-limiting ──────────────────────────────────────────────────
 
 export const restartCounts = new Map<string, { count: number; lastAt: number }>();
+
+// ─── Crash notice batching ──────────────────────────────────────────────────
+
+/** One batcher per daemon process: crash / auto-restart-stopped notices bound
+ *  for the same recipient are merged within a short window (see
+ *  `core/crash-notice.ts`). Different bots are different daemon processes, so
+ *  no cross-process state is needed — their notices have different recipients
+ *  anyway (different chat / topic). */
+let crashNoticeBatcher = newCrashNoticeBatcher();
+
+function newCrashNoticeBatcher(windowMs?: number, retryDelayMs?: number): CrashNoticeBatcher {
+  return new CrashNoticeBatcher({
+    ...(windowMs === undefined ? {} : { windowMs }),
+    ...(retryDelayMs === undefined ? {} : { retryDelayMs }),
+    log: {
+      warn: msg => logger.warn(msg),
+      error: msg => logger.error(msg),
+    },
+  });
+}
+
+/** Test seam: shrink the merge / retry windows and reset pending batches. */
+export function __testOnly_configureCrashNotices(opts: { windowMs?: number; retryDelayMs?: number } = {}): void {
+  crashNoticeBatcher.dispose();
+  crashNoticeBatcher = newCrashNoticeBatcher(opts.windowMs, opts.retryDelayMs);
+}
+
+/** Best-effort, bounded: push queued crash notices out before the daemon dies
+ *  (otherwise anything inside the merge window is silently lost). */
+export const CRASH_NOTICE_SHUTDOWN_FLUSH_TIMEOUT_MS = 1_500;
+export async function flushPendingCrashNotices(): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      crashNoticeBatcher.flushNow(),
+      new Promise<void>(resolve => {
+        timer = setTimeout(resolve, CRASH_NOTICE_SHUTDOWN_FLUSH_TIMEOUT_MS);
+        (timer as unknown as { unref?: () => void }).unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 // ─── Skills installation ────────────────────────────────────────────────────
 
@@ -19837,33 +19882,62 @@ function setupWorkerHandlers(
             killWorker(ds);
           }
           const cliName = sessionCliDisplayName(ds, botCfg);
-          // 卡片文案按停止原因分流：永久退出通道刻意跨 60s 窗口累计，两次崩溃
-          // 可能相隔很久，沿用「1 分钟内崩溃 N 次」会是假话。
-          const parts = [decision.reason === 'permanent_exit'
-            ? tr('worker.crash_permanent_exit_stopped', { cliName, code: msg.code ?? '?' }, loc)
-            : tr('worker.crash_loop_stopped', { cliName, count: rc.count }, loc)];
-          if (keepDiagnosticWorker) {
-            parts.push(tr('worker.crash_diagnostic_terminal', undefined, loc));
-          }
-          if (msg.sandboxNamespace) parts.push(sandboxNamespaceNotice(msg.sandboxNamespace, loc));
-          if (msg.logTail?.trim()) {
-            parts.push(`${tr('worker.crash_recent_output', undefined, loc)}\n${msg.logTail.trim()}`);
-          } else {
+          // One plain-language sentence + a folded terminal tail. Notices bound
+          // for the same recipient inside the merge window become one card
+          // naming every affected session (see core/crash-notice.ts) — crash
+          // storms otherwise paste a wall of near-identical terminal noise.
+          // 文案按停止原因分流：永久退出通道刻意跨 60s 窗口累计，两次崩溃可能
+          // 相隔很久，沿用「1 分钟内崩溃 N 次」会是假话。
+          const trimmedLogTail = msg.logTail?.trim() || undefined;
+          // The worker object that just crashed, captured before the notice is
+          // queued: the pty / failed-diagnostic path calls killWorker() below,
+          // whose exit handler legitimately bumps ds.workerGeneration. Holding
+          // a generation number here would therefore drop the only notice on
+          // exactly the backends without a Web Terminal.
+          const crashedWorker = ds.worker;
+          const entry: CrashNoticeEntry = {
+            sessionId: ds.session.sessionId,
+            sessionLabel: crashNoticeLabel(ds.session.title, ds.currentTurnTitle, cliName),
+            cliName,
+            reason: decision.reason === 'permanent_exit' ? 'permanent_exit' : 'crash_loop',
+            count: rc.count,
+            code: msg.code ?? null,
+            ...(trimmedLogTail ? { logTail: trimmedLogTail } : {}),
             // No worker-provided terminal tail (e.g. worker died before it could
             // scrape one): fall back to the daemon-side per-worker stderr ring.
-            const stderrTail = stderrRing.render({ maxLines: 10, maxChars: 1500 });
-            if (stderrTail) {
-              parts.push(`${tr('workerDiag.recentStderr', undefined, loc)}\n${stderrTail}`);
-            }
-          }
+            ...(trimmedLogTail ? {} : { workerStderrTail: stderrRing.render({ maxLines: 10, maxChars: 1500 }) || undefined }),
+            diagnosticAvailable: keepDiagnosticWorker,
+            ...(msg.sandboxNamespace ? { sandboxNotice: sandboxNamespaceNotice(msg.sandboxNamespace, loc) } : {}),
+          };
           if (!suppressExitUi) {
-            try {
-              await scopedReply(parts.join('\n\n'), 'text', undefined);
-            } catch (replyErr) {
-              if (replyErr instanceof MessageWithdrawnError && ownsLifecycleMutation()) {
-                await closeWithdrawnSessionIfLedgerEmpty(ds, 'Root message withdrawn while sending crash diagnostic');
-              }
-            }
+            // Merge key = reply anchor only: one thread/chat keeps its notice
+            // where people already look. Private-reply sessions deliver to a
+            // requester rather than the chat, so keep them apart. Each bot is a
+            // separate daemon posting into its own chats/topics, so cross-bot
+            // crashes are never merged (re-routing would move the notice).
+            const route = privateReplyEnabled(ds.session)
+              ? `${ds.larkAppId}|${sessionAnchorId(ds)}|${ds.session.sessionId}`
+              : `${ds.larkAppId}|${sessionAnchorId(ds)}`;
+            crashNoticeBatcher.enqueue(route, {
+              entry,
+              locale: loc,
+              send: cardJson => scopedReply(cardJson, 'interactive', undefined),
+              // The session must still be the thing that crashed when the
+              // window closes: closed / replaced sessions get a log line, not
+              // a stale notice in a thread that has moved on. A replacement
+              // worker is a different object, so it suppresses the notice; the
+              // regular exit fence (the pty / no-diagnostic stop path kills
+              // this worker, whose exit bumps ds.workerGeneration and nulls
+              // ds.worker) is the expected end of the crash, not a reason to
+              // drop the only notice the owner would get.
+              stillRelevant: () => ds.session.status === 'active'
+                && (ds.worker === null || ds.worker === crashedWorker),
+              onSendError: async (replyErr) => {
+                if (replyErr instanceof MessageWithdrawnError && ownsLifecycleMutation()) {
+                  await closeWithdrawnSessionIfLedgerEmpty(ds, 'Root message withdrawn while sending crash diagnostic');
+                }
+              },
+            });
           }
           break;
         }
