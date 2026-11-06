@@ -35,6 +35,13 @@ import { readBotAdminUnions } from '../../services/bot-admin-unions-store.js';
 import { isStewardSilentJoin } from '../../services/steward-auto-join.js';
 import { docWatchAnchor, getDocSubscription, putDocSubscription, removeDocSubscription, listAllDocSubscriptions, recordDocWatchActivity, setDocTitle, settleDocCommentWsDelivery, type DocSubscription, type DocWatchOutcome } from '../../services/doc-subs-store.js';
 import { wasPendingReviewNotified, markPendingReviewNotified } from '../../services/under-review-notify-store.js';
+import {
+  clearStartupNotice,
+  markStartupNoticeSent,
+  startupNoticeDigest,
+  wasStartupNoticeSent,
+  type StartupNoticeKind,
+} from '../../services/startup-notice-store.js';
 import { getDocComment, isBotAuthoredReply, hasBotSentinel, commentTriggerAllowed, fetchDocTitle, BOT_REPLY_SENTINEL, addCommentReactionChecked } from './doc-comment.js';
 import {
   BOTMUX_REQUIRED_SCOPES,
@@ -255,6 +262,46 @@ async function dmAdmin(larkAppId: string, adminOpenId: string, content: string, 
 }
 
 /**
+ * 启动自检类私信的统一入口：**同一种提醒、同样的内容只说一次**。
+ *
+ * 启动自检（`checkRequiredScopes` / `ensureVcMeetingEventsSubscribed`）每次 daemon
+ * 启动都跑一遍，而「缺一个权限」能挂几个月 —— 主人管 15 个 bot，每重启一次就是 15 条
+ * 一模一样的私信。这里的去重状态落盘（`startup-notice-store`），key = 提醒种类 +
+ * 内容摘要：内容变了（缺的 scope 集合变了、失败原因换了一类）就该重新说；问题解决了
+ * 则调用方 {@link clearStartupNotice} 清掉记录，下次复发还能再提醒。
+ *
+ * ⚠️ 只有真的发出去了才记账：先记后发的话，一次网络失败就把这条提醒永久静音了。
+ */
+async function dmAdminOnce(
+  larkAppId: string,
+  adminOpenId: string,
+  content: string,
+  contextTag: string,
+  kind: StartupNoticeKind,
+  digest: string,
+): Promise<boolean> {
+  const dataDir = config.session.dataDir;
+  // 收件人算进 key：「已经说过」是对**这个人**说过了。换了管理员（allowedUsers 改人）
+  // 就该重新说一遍，否则新接手的人永远不会收到这条提醒。
+  const target = startupNoticeDigest([digest, adminOpenId]);
+  if (wasStartupNoticeSent(dataDir, larkAppId, kind, target)) {
+    logger.info(`[${larkAppId}] ${contextTag}: 已经提醒过（内容未变），本次不重复私信`);
+    return false;
+  }
+  const delivered = await dmAdmin(larkAppId, adminOpenId, content, contextTag);
+  if (delivered) {
+    // 记账是 best-effort：磁盘写失败最坏是下次重启多发一条，绝不能因此把
+    // checkRequiredScopes 剩下的自检项（后面的权限判定）整段跳过。
+    try {
+      markStartupNoticeSent(dataDir, larkAppId, kind, target);
+    } catch (err: any) {
+      logger.warn(`[${larkAppId}] 记录「已提醒」状态失败（下次启动可能重复提醒）：${err?.message ?? err}`);
+    }
+  }
+  return delivered;
+}
+
+/**
  * Try to auto-fix missing scopes using the same Open Platform web-session
  * automation that powers `botmux setup`. If ~/.botmux/feishu-session.json holds
  * a valid cached session, this adds all botmux-required scopes and publishes
@@ -409,7 +456,7 @@ async function tryAutoFixScopes(
               ? `新版本已提交，但需要**人工审批**（审批人：${result.approvalHumanApprovers.join('、')}），`
                 + '通过后权限才生效——不用重复提交，等审批即可。'
               : '新版本已发布。';
-        await dmAdmin(
+        await dmAdminOnce(
           larkAppId,
           adminOpenId,
           (autoFixEffective && !result.versionWarning
@@ -419,6 +466,15 @@ async function tryAutoFixScopes(
           `${scopeDetail}，${versionLine}\n` +
           `权限变更可能需要 1-2 分钟生效。如仍有问题执行 \`botmux restart\`。`,
           autoFixEffective ? `auto-fixed ${fixedList.length} scopes` : `auto-fix could not apply ${fixedList.length} scopes`,
+          'scope_autofix_result',
+          // versionWarning 也要进摘要：权限写进了清单但版本没发布 ⟹ 权限不会生效，
+          // 「下一步该做什么」跟发布成功完全不同，是同一条提醒里的不同内容。
+          startupNoticeDigest([
+            'autofix',
+            autoFixEffective ? 'ok' : 'partial',
+            result.versionWarning ? 'warn' : 'clean',
+            ...fixedList.map(s => s.name).sort(),
+          ]),
         );
       }
       return { kind: 'fixed' };
@@ -524,9 +580,13 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
         `**操作步骤（点链接 → 申请开通 → 重启 daemon）**：\n` +
         `1. 开通 ${SELF_MANAGE_SCOPE}（免审批，自动通过）：\n   ${selfManageAuthUrl}\n\n` +
         `2. 顺便确认/开通真正的目标权限 ${REQUIRED_BOT_AT_SCOPE}（"获取群组中其他机器人和用户@当前机器人的消息"，免审批，自动通过）：\n   ${targetAuthUrl}\n\n` +
-        `3. \`botmux restart\`，启动后 botmux 会自动复核，结果会再次发到这里。\n\n` +
+        `3. \`botmux restart\`，启动后 botmux 会自动复核；情况有变化时会再私信你。\n\n` +
         `**为什么需要**：botmux 多机器人协作（A 机器人 @ B 机器人）依赖目标权限把跨 bot 事件推送过来；不开通则跨 bot @ 完全失效。`;
-      await dmAdmin(larkAppId, adminOpenId, dm, 'self_manage scope (auto-approved) missing');
+      await dmAdminOnce(
+        larkAppId, adminOpenId, dm, 'self_manage scope (auto-approved) missing',
+        'scope_self_manage_missing',
+        startupNoticeDigest(['self_manage', SELF_MANAGE_SCOPE, REQUIRED_BOT_AT_SCOPE]),
+      );
       return;
     }
 
@@ -548,6 +608,9 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
     const grantedScopes = new Set(
       scopesRaw.map(s => typeof s === 'string' ? s : s?.scope).filter(Boolean) as string[],
     );
+    // scope 列表这次读到了 ⟹ 应用身份已经不再卡在 99991672（缺 self_manage），
+    // 之前那条提醒的问题算是解决了：清掉记录，将来再坏能重新提醒。
+    clearStartupNotice(config.session.dataDir, larkAppId, 'scope_self_manage_missing');
 
     // 按 token 类型分桶的已授权集合，专供 automation 的「无变更短路」按桶做差用。
     // application/v6 每个 scope 条目自带 token_types:(tenant|user)[]（SDK 类型可查）。
@@ -592,15 +655,28 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
           const adminDoc = getAdminOpenId(bot);
           if (adminDoc) {
             const lines = missingDoc.map((s, i) => `${i + 1}. **${s.desc}** (\`${s.name}\`)\n   ${buildScopeDeepLink(bot.config.larkAppId, s.name, brand)}`).join('\n\n');
-            await dmAdmin(larkAppId, adminDoc,
+            await dmAdminOnce(larkAppId, adminDoc,
               `⚠️ 机器人 "${bot.botName ?? larkAppId}" 已通过 ${featureLabel} 绑定 ${docSubs.length} 个飞书文档，但缺少对应权限：\n\n${lines}\n\n` +
               `另外请确认开发者后台「事件订阅」里已添加 **\`${DOC_COMMENT_EVENT}\`**（云文档新增评论）事件——该事件无法被自动检测，缺它则评论永远收不到。\n\n开通 + 订阅事件后执行 \`botmux restart\`。`,
-              `missing doc-feature scopes: ${missingDoc.map(s => s.name).join(',')}`);
+              `missing doc-feature scopes: ${missingDoc.map(s => s.name).join(',')}`,
+              'docs_scopes_missing',
+              startupNoticeDigest(['docs', featureLabel, ...missingDoc.map(s => s.name).sort()]));
+          } else {
+            // 没有 resolved 的管理员 open_id：这条提醒根本发不出去，不该留着任何记录
+            // （上次可能发给的是另一个已被移除的管理员）。
+            logger.warn(`[${larkAppId}] 缺 ${missingDoc.length} 项文档权限，但没有 resolved 的 admin open_id，仅记日志`);
+            clearStartupNotice(config.session.dataDir, larkAppId, 'docs_scopes_missing');
           }
         } else {
           // 权限齐了——事件订阅查不了，仅 info 记一条提醒（不 DM 免重启刷屏）。
           logger.info(`[${larkAppId}] ${featureLabel} 文档权限齐全（${docSubs.length} 绑定）；请确保后台已订阅事件 ${DOC_COMMENT_EVENT}（无法自动检测）`);
+          clearStartupNotice(config.session.dataDir, larkAppId, 'docs_scopes_missing');
         }
+      } else {
+        // 一个文档订阅都没有 ⟹ 这项自检对这个 bot 不成立（跟 VC 权限那块的 else 同款）。
+        // 不清的话：退掉最后一个绑定、再重新绑上同样的文档、缺的还是同一批权限 ——
+        // 摘要一模一样，那条提醒就永远发不出去了。
+        clearStartupNotice(config.session.dataDir, larkAppId, 'docs_scopes_missing');
       }
     } catch (err: any) {
       logger.debug(`[${larkAppId}] doc-feature readiness check errored: ${err?.message ?? err}`);
@@ -636,19 +712,26 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
           const adminVc = getAdminOpenId(bot);
           if (adminVc) {
             const lines = missingVc.map((s, i) => `${i + 1}. **${s.desc}** (\`${s.name}\`)\n   ${buildScopeDeepLink(bot.config.larkAppId, s.name, brand)}`).join('\n\n');
-            await dmAdmin(larkAppId, adminVc,
+            await dmAdminOnce(larkAppId, adminVc,
               `⚠️ 机器人 "${bot.botName ?? larkAppId}" 已启用 \`vcMeetingAgent\`，但缺少会议智能体所需权限：\n\n${lines}\n\n` +
               `另外请确认开发者后台「事件订阅」里已添加这 3 个事件：${eventList}\n\n` +
               `事件订阅页：${eventSubUrl}\n\n` +
               `注意：飞书目前没有公开 API 可自动确认这 3 个事件是否已订阅/发布；缺事件时 daemon 只会收不到 push，不会有运行时错误。开通 + 发布后执行 \`botmux restart\`。`,
-              `missing vc-meeting scopes: ${missingVc.map(s => s.name).join(',')}`);
+              `missing vc-meeting scopes: ${missingVc.map(s => s.name).join(',')}`,
+              'vc_scopes_missing',
+              startupNoticeDigest(['vc-scopes', ...missingVc.map(s => s.name).sort()]));
           }
         } else {
           logger.info(
             `[${larkAppId}] vcMeetingAgent VC 权限齐全；请确保后台事件订阅页已添加 ${VC_MEETING_BOT_EVENTS.join(', ')} ` +
             `并已发布（无法自动检测）：${eventSubUrl}`,
           );
+          clearStartupNotice(config.session.dataDir, larkAppId, 'vc_scopes_missing');
         }
+      } else {
+        // 这台 bot 现在不该做 VC 权限体检（功能关了 / 全局监听 bot 是别人）——
+        // 之前那条「缺 VC 权限」的提醒对这个 bot 已不成立，清掉，将来重新开启再缺能再提醒。
+        clearStartupNotice(config.session.dataDir, larkAppId, 'vc_scopes_missing');
       }
     } catch (err: any) {
       logger.debug(`[${larkAppId}] vc-meeting readiness check errored: ${err?.message ?? err}`);
@@ -662,6 +745,10 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
     const missingOptional = BOTMUX_REQUIRED_SCOPES.filter(s => !s.critical && !grantedScopes.has(s.name));
 
     if (missingCritical.length === 0) {
+      // 必需权限齐了 ⟹ 之前「缺权限 / 自动补齐没能落地」那两条提醒的问题已解决，
+      // 清掉记录；将来再缺（或补齐又没落地）时能重新提醒。
+      clearStartupNotice(config.session.dataDir, larkAppId, 'required_scopes_missing');
+      clearStartupNotice(config.session.dataDir, larkAppId, 'scope_autofix_result');
       // All critical scopes present. If an opt-in feature added a non-critical
       // scope that isn't granted yet, top it up SILENTLY — but only when a cached
       // Feishu web session already exists (disableQrLogin makes a missing session
@@ -766,8 +853,12 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
       `⚠️ botmux 启动检查发现机器人 "${bot.botName ?? larkAppId}" 缺少 ${missingCritical.length} 项必需权限\n\n` +
       `**操作步骤（点链接 → 申请开通 → 重启 daemon）**：\n\n` +
       `${criticalLines}\n\n` +
-      `开通完成后执行 \`botmux restart\`，botmux 会再次自检并把结果发到这里。${optionalBlock}`;
-    await dmAdmin(larkAppId, adminOpenId, dm, `missing scopes: ${missingCritical.map(s => s.name).join(',')}`);
+      `开通完成后执行 \`botmux restart\`。缺的权限有变化时 botmux 会再私信你，没变化就不再重复打扰。${optionalBlock}`;
+    await dmAdminOnce(
+      larkAppId, adminOpenId, dm, `missing scopes: ${missingCritical.map(s => s.name).join(',')}`,
+      'required_scopes_missing',
+      startupNoticeDigest(['critical', ...missingCritical.map(s => s.name).sort()]),
+    );
   } catch (err: any) {
     logger.debug(`[${larkAppId}] scope check errored: ${err?.message ?? err}`);
   }
@@ -790,8 +881,17 @@ export async function ensureVcMeetingEventsSubscribed(larkAppId: string): Promis
   const brand = normalizeBrand(bot.config.brand);
   // Open-platform automation only supports feishu.cn tenants. Skip apiOnly and
   // VC-inactive bots — vcMeetingAgentConfigActive fail-closes both.
-  if (brand !== 'feishu') return;
-  if (!vcMeetingAgentConfigActive(bot.config)) return;
+  // 这两种「这台 bot 根本不该订阅 VC 事件」的情况要清掉旧记录：否则关掉再打开、
+  // 失败类别还是同一类时，那条提醒就永远发不出去了（和 vc_scopes_missing 对称）。
+  // 注意 probe 不可用（登录态缺失）**不能**清 —— 那时并不知道问题还在不在。
+  if (brand !== 'feishu') {
+    clearStartupNotice(config.session.dataDir, larkAppId, 'vc_event_subscribe_failed');
+    return;
+  }
+  if (!vcMeetingAgentConfigActive(bot.config)) {
+    clearStartupNotice(config.session.dataDir, larkAppId, 'vc_event_subscribe_failed');
+    return;
+  }
   try {
     const probe = await probeVcMeetingEventSubscription(larkAppId);
     if (!probe.ok) {
@@ -805,6 +905,7 @@ export async function ensureVcMeetingEventsSubscribed(larkAppId: string): Promis
     }
     if (probe.missingVcEvents.length === 0 && probe.eventModeReady) {
       logger.info(`[${larkAppId}] VC meeting events already subscribed (long-connection mode)`);
+      clearStartupNotice(config.session.dataDir, larkAppId, 'vc_event_subscribe_failed');
       return;
     }
     logger.info(
@@ -822,6 +923,7 @@ export async function ensureVcMeetingEventsSubscribed(larkAppId: string): Promis
     });
     if (result.ok) {
       logger.info(`[${larkAppId}] VC events auto-subscribed: ${result.subscribedEventCount} events, version ${result.versionId ?? 'n/a'} published`);
+      clearStartupNotice(config.session.dataDir, larkAppId, 'vc_event_subscribe_failed');
       return;
     }
     // Automation failed (session expired mid-run / api error). Log; DM the admin
@@ -838,7 +940,7 @@ export async function ensureVcMeetingEventsSubscribed(larkAppId: string): Promis
     }
     const adminOpenId = getAdminOpenId(bot);
     if (adminOpenId) {
-      await dmAdmin(
+      await dmAdminOnce(
         larkAppId,
         adminOpenId,
         `⚠️ botmux 想在启动时自动为机器人 "${bot.botName ?? larkAppId}" 订阅视频会议事件（vc.bot.meeting_*），以便它被拉进会时能自动进会，但自动配置失败：${result.message}\n\n` +
@@ -851,6 +953,10 @@ export async function ensureVcMeetingEventsSubscribed(larkAppId: string): Promis
             + '看审批详情修掉不合规项 → 点 **Withdraw** 撤回 → 执行 `botmux restart` 重试。不改配置直接撤回重提会被同一条规则再拦。'
           : '请运行 `botmux setup` 刷新飞书开放平台登录态后重启 daemon，botmux 会自动重试。'),
         underReview ? 'vc event auto-subscribe deferred (under review)' : 'vc event auto-subscribe failed',
+        'vc_event_subscribe_failed',
+        // 摘要只取「失败属于哪一类」，不带 result.message：错误文本每次可能不同
+        // （超时秒数、请求 id），带上就等于每次都算新内容，去重白做。
+        startupNoticeDigest(['vc-events', underReview ? 'under_review' : 'failed', result.reason]),
       );
     }
   } catch (err: any) {
