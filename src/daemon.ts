@@ -34665,6 +34665,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       `[session-owner-reminder] send failed session=${ds.session.sessionId}: `
       + `${error instanceof Error ? error.message : String(error)}`,
     ),
+    onSaveError: error => logger.warn(
+      '[session-owner-reminder] persist failed, keeping in-memory state: '
+      + `${error instanceof Error ? error.message : String(error)}`,
+    ),
   });
   let sessionOwnerReminderScanInFlight = false;
   const scanSessionOwnerReminders = async (): Promise<void> => {

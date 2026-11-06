@@ -154,6 +154,7 @@ export interface SessionOwnerReminderControllerDeps {
   send(ds: DaemonSession, text: string, uuid: string): Promise<void>;
   canSend(ds: DaemonSession): boolean;
   onError?(ds: DaemonSession, error: unknown): void;
+  onSaveError?(error: unknown): void;
 }
 
 function recordsSnapshot(value: unknown): string {
@@ -174,17 +175,40 @@ export function sessionOwnerReminderDeliveryUuid(
 
 /** Durable, deterministic scan engine. Scheduling and Lark IO are injected. */
 export class SessionOwnerReminderController {
+  /**
+   * In-process authoritative copy of the records. Reloading from disk on every
+   * tick would make a failing `save` catastrophic in both directions: a lost
+   * `mentionCount` bump re-@s the owner on the next tick, and a lost record
+   * rebuild re-arms the whole budget. Once loaded, this process owns the state;
+   * disk is the restart-recovery copy.
+   */
+  private records?: SessionOwnerReminderRecords;
+
   constructor(private readonly deps: SessionOwnerReminderControllerDeps) {}
+
+  private persist(records: SessionOwnerReminderRecords): void {
+    try {
+      this.deps.save(records);
+    } catch (error) {
+      // Keep the in-memory state authoritative: the next tick continues from it,
+      // so a broken disk neither silences the reminder nor duplicates a mention.
+      this.deps.onSaveError?.(error);
+    }
+  }
 
   async scan(
     sessions: Iterable<DaemonSession>,
     config: SessionOwnerReminderConfig,
     now: number = Date.now(),
   ): Promise<void> {
-    const current = this.deps.load();
+    const current = this.records ?? this.deps.load();
+    this.records = current;
     const before = recordsSnapshot(current);
     if (!config.enabled || config.states.length === 0) {
-      if (Object.keys(current).length > 0) this.deps.save({});
+      if (Object.keys(current).length > 0) {
+        for (const sessionId of Object.keys(current)) delete current[sessionId];
+        this.persist(current);
+      }
       return;
     }
 
@@ -206,7 +230,13 @@ export class SessionOwnerReminderController {
       const projectedStates = deriveSessionOwnerReminderStates(ds);
       const matched = projectedStates.filter(state => configured.has(state));
       if (matched.length === 0) {
-        delete current[sessionId];
+        // Not actionable right now. This is usually a transient bot-driven blip
+        // (idle → working → idle), so keeping the record is what makes the spend
+        // budget survive it: only sessions that already spent part of the budget
+        // are carried; the rest are dropped exactly as before so the store never
+        // fills up with "nothing to remind" sessions.
+        if ((current[sessionId]?.mentionCount ?? 0) > 0) seen.add(sessionId);
+        else delete current[sessionId];
         continue;
       }
       seen.add(sessionId);
@@ -217,17 +247,22 @@ export class SessionOwnerReminderController {
       // same-category signal replacing a resolved one resets the timer instead
       // of inheriting the old quiet period — see the fingerprint helper above.
       const stateFingerprint = sessionOwnerReminderObservationFingerprint(ds, projectedStates);
-      const activityAt = Number.isFinite(ds.lastMessageAt) ? ds.lastMessageAt : 0;
+      // Only HUMAN input re-arms the cycle. `ds.lastMessageAt` also moves for the
+      // bot's own turns (scheduled fires, workflow nodes, follow-up dispatches),
+      // so keying on it let machine traffic reset the budget forever — ten @s in
+      // six hours in the reported probe. `lastObservedActivityAt` therefore holds
+      // the last HUMAN activity (field name kept so existing records still load).
+      const humanActivityAt = Number.isFinite(ds.lastHumanMessageAt) ? ds.lastHumanMessageAt! : 0;
       let record = current[sessionId];
 
       if (!record
         || record.stateFingerprint !== stateFingerprint
-        || activityAt > record.lastObservedActivityAt) {
+        || humanActivityAt > record.lastObservedActivityAt) {
         record = current[sessionId] = {
           sessionId,
           stateFingerprint,
-          actionableSince: Math.max(now, activityAt),
-          lastObservedActivityAt: activityAt,
+          actionableSince: Math.max(now, humanActivityAt),
+          lastObservedActivityAt: humanActivityAt,
         };
         continue;
       }
@@ -258,6 +293,6 @@ export class SessionOwnerReminderController {
     for (const sessionId of Object.keys(current)) {
       if (!seen.has(sessionId)) delete current[sessionId];
     }
-    if (recordsSnapshot(current) !== before) this.deps.save(current);
+    if (recordsSnapshot(current) !== before) this.persist(current);
   }
 }

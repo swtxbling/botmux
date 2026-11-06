@@ -32,6 +32,7 @@ function session(overrides: Record<string, unknown> = {}): any {
     worker: { killed: false },
     lastScreenStatus: 'idle',
     lastMessageAt: 1_000,
+    lastHumanMessageAt: 1_000,
   };
   return Object.assign(base, overrides);
 }
@@ -84,7 +85,7 @@ describe('session owner reminder state projection', () => {
 });
 
 describe('SessionOwnerReminderController', () => {
-  it('waits one interval, repeats, and resets after inbound activity', async () => {
+  it('waits one interval, repeats, and resets after human activity', async () => {
     let records: Record<string, SessionOwnerReminderRecord> = {};
     const send = vi.fn().mockResolvedValue(undefined);
     const controller = new SessionOwnerReminderController({
@@ -107,6 +108,7 @@ describe('SessionOwnerReminderController', () => {
     expect(send).toHaveBeenCalledTimes(2);
 
     ds.lastMessageAt = 10_000 + 61 * 60_000;
+    ds.lastHumanMessageAt = ds.lastMessageAt;
     await controller.scan([ds], enabled, 10_000 + 61 * 60_000);
     await controller.scan([ds], enabled, 10_000 + 90 * 60_000);
     expect(send).toHaveBeenCalledTimes(2);
@@ -145,6 +147,7 @@ describe('SessionOwnerReminderController', () => {
     const ds = session({
       lastScreenStatus: 'working',
       lastMessageAt: 0,
+      lastHumanMessageAt: 0,
       agentAttention: { kind: 'blocked', reason: 'first', at: 0 },
     });
     await controller.scan([ds], cfg, 0);
@@ -169,7 +172,7 @@ describe('SessionOwnerReminderController', () => {
       canSend: () => true,
     });
     const cfg = { enabled: true, intervalMinutes: 30, text: 'ping', states: ['tui_prompt'] as const };
-    const ds = session({ lastScreenStatus: 'working', lastMessageAt: 0, tuiPromptCardId: 'om_prompt_1' });
+    const ds = session({ lastScreenStatus: 'working', lastMessageAt: 0, lastHumanMessageAt: 0, tuiPromptCardId: 'om_prompt_1' });
     await controller.scan([ds], cfg, 0);
     ds.tuiPromptCardId = 'om_prompt_2'; // old prompt answered, a new one appeared
     await controller.scan([ds], cfg, 30 * 60_000);
@@ -190,7 +193,7 @@ describe('SessionOwnerReminderController', () => {
       canSend: () => true,
     });
     const cfg = { enabled: true, intervalMinutes: 30, text: 'ping', states: ['tui_prompt'] as const };
-    const ds = session({ lastScreenStatus: 'working', lastMessageAt: 0, stuckWarningCardId: 'om_stuck_1' });
+    const ds = session({ lastScreenStatus: 'working', lastMessageAt: 0, lastHumanMessageAt: 0, stuckWarningCardId: 'om_stuck_1' });
     await controller.scan([ds], cfg, 0);
     await controller.scan([ds], cfg, 30 * 60_000);
     expect(send).toHaveBeenCalledTimes(1);
@@ -219,6 +222,7 @@ describe('SessionOwnerReminderController', () => {
     const ds = session({
       lastScreenStatus: 'working',
       lastMessageAt: 0,
+      lastHumanMessageAt: 0,
       agentAttention: { kind: 'blocked', reason: 'stable', at: 0 },
     });
     await controller.scan([ds], cfg, 0);
@@ -378,6 +382,7 @@ describe('SessionOwnerReminderController', () => {
     // The owner answers (inbound activity) → fresh cycle, budget re-armed.
     const answeredAt = start + 21 * interval;
     ds.lastMessageAt = answeredAt;
+    ds.lastHumanMessageAt = answeredAt;
     await controller.scan([ds], enabled, answeredAt);
     await spendBudget(answeredAt);
     expect(send).toHaveBeenCalledTimes(SESSION_OWNER_REMINDER_MAX_MENTIONS * 2);
@@ -416,6 +421,123 @@ describe('SessionOwnerReminderController', () => {
     expect(send).toHaveBeenCalledTimes(2);
     expect(send.mock.calls.map(call => call[0].session.rootMessageId).sort()).toEqual(['om_root', 'om_root_2']);
   });
+
+  it('does not let bot-driven blips reset the mention budget', async () => {
+    // The session dips into `working` for one minute every 35 minutes because the
+    // bot's own scheduled turns run. Those turns move `lastMessageAt`; they must
+    // NOT hand the owner a fresh budget — only a human reply may.
+    let records: Record<string, SessionOwnerReminderRecord> = {};
+    const send = vi.fn().mockResolvedValue(undefined);
+    const controller = new SessionOwnerReminderController({
+      load: () => records,
+      save: next => { records = structuredClone(next); },
+      send,
+      canSend: () => true,
+    });
+    const ds = session();
+    const base = 1_000;
+    const minute = 60_000;
+    const scanMinute = (m: number) => controller.scan([ds], enabled, base + m * minute);
+
+    for (let m = 0; m <= 360; m++) {
+      ds.lastScreenStatus = m % 35 === 0 ? 'working' : 'idle';
+      ds.lastMessageAt = base + m * minute; // machine traffic only
+      await scanMinute(m);
+    }
+    expect(send).toHaveBeenCalledTimes(SESSION_OWNER_REMINDER_MAX_MENTIONS);
+
+    // A human reply is a new cycle: the next quiet stretch may ping again.
+    const humanAt = base + 361 * minute;
+    ds.lastMessageAt = humanAt;
+    ds.lastHumanMessageAt = humanAt;
+    ds.lastScreenStatus = 'idle';
+    for (let m = 361; m <= 460; m++) {
+      ds.lastMessageAt = base + m * minute;
+      await scanMinute(m);
+    }
+    expect(send).toHaveBeenCalledTimes(SESSION_OWNER_REMINDER_MAX_MENTIONS * 2);
+  });
+
+  it('keeps the in-memory budget when every store write fails', async () => {
+    // A dead disk must not be able to re-arm the budget every tick (silencing the
+    // reminder) nor re-@ the owner because the count vanished.
+    let disk: Record<string, SessionOwnerReminderRecord> = {};
+    const saveErrors: unknown[] = [];
+    const send = vi.fn().mockResolvedValue(undefined);
+    const controller = new SessionOwnerReminderController({
+      load: () => structuredClone(disk),
+      save: () => { throw new Error('EACCES'); },
+      send,
+      canSend: () => true,
+      onSaveError: error => saveErrors.push(error),
+    });
+    const ds = session();
+    const interval = 30 * 60_000;
+    await controller.scan([ds], enabled, 1_000);
+    for (let tick = 1; tick <= SESSION_OWNER_REMINDER_MAX_MENTIONS * 3; tick++) {
+      await controller.scan([ds], enabled, 1_000 + tick * interval);
+    }
+    expect(send).toHaveBeenCalledTimes(SESSION_OWNER_REMINDER_MAX_MENTIONS);
+    expect(saveErrors.length).toBeGreaterThan(0);
+    expect(disk).toEqual({});
+  });
+
+  it('does not re-@ when the write right after the last mention fails', async () => {
+    // One-off failure at the worst moment: the count that would have stopped the
+    // pings never reached disk. The in-memory copy must still stop them.
+    let disk: Record<string, SessionOwnerReminderRecord> = {};
+    let failNextSave = false;
+    const send = vi.fn().mockResolvedValue(undefined);
+    const controller = new SessionOwnerReminderController({
+      load: () => structuredClone(disk),
+      save: next => {
+        if (failNextSave) { failNextSave = false; throw new Error('ENOSPC'); }
+        disk = structuredClone(next);
+      },
+      send,
+      canSend: () => true,
+    });
+    const ds = session();
+    const interval = 30 * 60_000;
+    const ticks = SESSION_OWNER_REMINDER_MAX_MENTIONS;
+    await controller.scan([ds], enabled, 1_000);
+    for (let tick = 1; tick <= ticks; tick++) {
+      if (tick === ticks) failNextSave = true; // the save carrying the final count dies
+      await controller.scan([ds], enabled, 1_000 + tick * interval);
+    }
+    expect(send).toHaveBeenCalledTimes(ticks);
+    for (let tick = ticks + 1; tick <= ticks * 3; tick++) {
+      await controller.scan([ds], enabled, 1_000 + tick * interval);
+    }
+    expect(send).toHaveBeenCalledTimes(ticks);
+  });
+
+  it('does not spend the mention budget on a failed send', async () => {
+    let records: Record<string, SessionOwnerReminderRecord> = {};
+    const send = vi.fn().mockRejectedValueOnce(new Error('lark down')).mockResolvedValue(undefined);
+    const controller = new SessionOwnerReminderController({
+      load: () => records,
+      save: next => { records = structuredClone(next); },
+      send,
+      canSend: () => true,
+    });
+    const ds = session();
+    const start = 1_000;
+    const interval = 30 * 60_000;
+
+    await controller.scan([ds], enabled, start);
+    await controller.scan([ds], enabled, start + interval); // attempt 1 fails
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(records.s1.mentionCount ?? 0).toBe(0);
+
+    // Retry after the 5-minute backoff succeeds → delivered mention #1.
+    await controller.scan([ds], enabled, start + interval + 5 * 60_000 + 1);
+    for (let tick = 2; tick <= SESSION_OWNER_REMINDER_MAX_MENTIONS * 2; tick++) {
+      await controller.scan([ds], enabled, start + tick * interval);
+    }
+    // One failed attempt + exactly the full budget of delivered mentions.
+    expect(send).toHaveBeenCalledTimes(1 + SESSION_OWNER_REMINDER_MAX_MENTIONS);
+  });
 });
 
 describe('session owner reminder durable store', () => {
@@ -438,6 +560,26 @@ describe('session owner reminder durable store', () => {
 
       writeFileSync(sessionOwnerReminderStorePath(dir, 'cli_app'), '{broken');
       expect(loadSessionOwnerReminderRecords(dir, 'cli_app')).toEqual({});
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('loads a corrupt mention budget as zero instead of carrying it forward', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-owner-reminder-budget-'));
+    try {
+      for (const bad of ['3', 1.5, -1]) {
+        writeFileSync(sessionOwnerReminderStorePath(dir, 'cli_app'), JSON.stringify({
+          s1: {
+            sessionId: 's1',
+            stateFingerprint: 'idle',
+            actionableSince: 1_000,
+            lastObservedActivityAt: 900,
+            mentionCount: bad,
+          },
+        }));
+        expect(loadSessionOwnerReminderRecords(dir, 'cli_app').s1?.mentionCount ?? 0).toBe(0);
+      }
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
