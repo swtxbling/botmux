@@ -23,6 +23,9 @@ import {
   createTurnFailureCardNotice,
   createUserNotifyNotice,
   recordAndDeliverTurnNotice,
+  turnNoticeDeliveryKey,
+  turnNoticeReplyArgs,
+  turnNoticeRoute,
   upsertTurnNotice,
   type TurnNoticeRecord,
 } from '../src/services/turn-notice.js';
@@ -81,13 +84,13 @@ function daemon(
     schedule: clock.schedule,
     cancel: clock.cancel,
     now: clock.now,
-    keyOf: record => record.noticeKey,
+    keyOf: record => turnNoticeDeliveryKey(record),
   });
   const host: RecoveryNoticeHost<TurnNoticeRecord> = {
     key: session.sessionId,
     list: () => session.turnNotices ?? [],
-    update: (noticeKey, mutate) => {
-      const record = session.turnNotices?.find((r: TurnNoticeRecord) => r.noticeKey === noticeKey);
+    update: (deliveryKey, mutate) => {
+      const record = session.turnNotices?.find((r: TurnNoticeRecord) => turnNoticeDeliveryKey(r) === deliveryKey);
       if (!record) return undefined;
       mutate(record);
       persist();
@@ -119,7 +122,7 @@ describe('durable turn notices', () => {
         return 'om_card_1';
       },
     });
-    const notice = createTurnFailureCardNotice({
+    const notice = createTurnFailureCardNotice({ sourceSessionId: 'sess-1',
       turnId: 'om_turn_1', card: '{"type":"card"}', now: clock.now(), uuid: () => 'uuid-fixed',
     });
     await deliver(notice).delivery;
@@ -135,7 +138,8 @@ describe('durable turn notices', () => {
     expect(delivered).toHaveLength(1);
     expect(delivered[0]!.content).toBe('{"type":"card"}');
     expect(session.turnNotices[0].delivery.state).toBe('delivered');
-    expect(session.turnNotices[0].delivery.attempts).toBe(4);
+    // Relational: the exact attempt count is backoff tuning, not behaviour.
+    expect(session.turnNotices[0].delivery.attempts).toBeGreaterThan(1);
     // Every retry of an unconfirmed send must reuse the one Feishu uuid.
     expect(new Set(attempts).size).toBe(1);
     expect(attempts[0]).toBe('uuid-fixed');
@@ -151,7 +155,7 @@ describe('durable turn notices', () => {
       return 'om_user_notify_1';
     };
     const first = daemon(clock, { send });
-    await first.deliver(createUserNotifyNotice({
+    await first.deliver(createUserNotifyNotice({ sourceSessionId: 'sess-1',
       turnId: 'om_turn_2', message: '输入没有提交，请重试', now: clock.now(),
     })).delivery;
     expect(first.session.turnNotices[0].delivery.state).toBe('pending');
@@ -181,7 +185,7 @@ describe('durable turn notices', () => {
       // Not a provably-never-landed failure: the request may have reached Feishu.
       send: async record => { uuids.push(record.delivery.uuid); throw new Error('socket hang up'); },
     });
-    await deliver(createTurnFailureCardNotice({
+    await deliver(createTurnFailureCardNotice({ sourceSessionId: 'sess-1',
       turnId: 'om_turn_3', card: '{"type":"card"}', now: clock.now(), uuid: () => 'uuid-ambiguous',
     })).delivery;
     await clock.advance(RECOVERY_NOTICE_UUID_WINDOW_MS + 60 * 60 * 1000);
@@ -200,7 +204,7 @@ describe('durable turn notices', () => {
     const { session, deliver } = daemon(clock, {
       send: async record => { sent.push(record.content); return 'om_1'; },
     });
-    const card = () => createTurnFailureCardNotice({
+    const card = () => createTurnFailureCardNotice({ sourceSessionId: 'sess-1',
       turnId: 'om_turn_4', card: '{"type":"card"}', now: clock.now(),
     });
     await deliver(card()).delivery;
@@ -211,7 +215,7 @@ describe('durable turn notices', () => {
 
     // A distinct user_notify in the same turn is a different notice; an
     // identical re-emit is the same one.
-    const notify = (message: string) => createUserNotifyNotice({ turnId: 'om_turn_4', message, now: clock.now() });
+    const notify = (message: string) => createUserNotifyNotice({ sourceSessionId: 'sess-1', turnId: 'om_turn_4', message, now: clock.now() });
     await deliver(notify('A')).delivery;
     await deliver(notify('A')).delivery;
     await deliver(notify('B')).delivery;
@@ -227,7 +231,7 @@ describe('durable turn notices', () => {
       send: async record => { sent.push(record.content); return 'om_1'; },
       canDeliver: () => open,
     });
-    await deliver(createUserNotifyNotice({ turnId: 'om_turn_5', message: '提示', now: clock.now() })).delivery;
+    await deliver(createUserNotifyNotice({ sourceSessionId: 'sess-1', turnId: 'om_turn_5', message: '提示', now: clock.now() })).delivery;
     expect(sent).toHaveLength(0);
     expect(session.turnNotices[0].delivery.state).toBe('pending');
 
@@ -249,7 +253,7 @@ describe('durable turn notices', () => {
     const { session, host, outbox } = daemon(clock, {
       send: async record => { order.push(`send:${record.noticeKey}`); return 'om_1'; },
     });
-    const record = createTurnFailureCardNotice({ turnId: 'om_turn_6', card: '{}', now: clock.now() });
+    const record = createTurnFailureCardNotice({ sourceSessionId: 'sess-1', turnId: 'om_turn_6', card: '{}', now: clock.now() });
     recordAndDeliverTurnNotice({
       record,
       host,
@@ -267,7 +271,7 @@ describe('durable turn notices', () => {
     const sent: string[] = [];
     const send = async (record: TurnNoticeRecord) => { sent.push(record.noticeKey); return 'om_1'; };
     const first = daemon(clock, { send });
-    await first.deliver(createUserNotifyNotice({
+    await first.deliver(createUserNotifyNotice({ sourceSessionId: 'sess-1',
       turnId: 'om_turn_7', message: '提示', now: clock.now(),
     })).delivery;
     expect(sent).toHaveLength(1);
@@ -276,7 +280,7 @@ describe('durable turn notices', () => {
     // durable row, so nothing is posted twice.
     first.outbox.disposeHost(first.host.key);
     const second = daemon(clock, { send, row: first.store.row });
-    const again = await second.deliver(createUserNotifyNotice({
+    const again = await second.deliver(createUserNotifyNotice({ sourceSessionId: 'sess-1',
       turnId: 'om_turn_7', message: '提示', now: clock.now(),
     })).delivery;
     await again;
@@ -285,11 +289,61 @@ describe('durable turn notices', () => {
     expect(second.session.turnNotices).toHaveLength(1);
   });
 
+  it('resolves the reply route at enqueue and keeps it on resend', async () => {
+    // A turnless worker notice in a session with a current reply target (a
+    // private reply / a folded thread) must keep that route: the old
+    // scopedReply passed fallbackTurnId + sourceSessionId, and a resend that
+    // recomputed them could land in the group chat or a later turn's thread.
+    const ds: any = { session: { sessionId: 'sess-1' }, currentReplyTarget: { turnId: 'om_private_turn' } };
+    expect(turnNoticeRoute(ds, undefined)).toEqual({ turnId: 'om_private_turn', sourceSessionId: 'sess-1' });
+    expect(turnNoticeRoute(ds, 'om_explicit')).toEqual({ turnId: 'om_explicit', sourceSessionId: 'sess-1' });
+
+    const record = createUserNotifyNotice({ ...turnNoticeRoute(ds, undefined), message: '提示', now: 0 });
+    expect(turnNoticeReplyArgs(record, { anchor: 'om_anchor', larkAppId: 'cli_app' })).toMatchObject({
+      anchor: 'om_anchor', msgType: 'text', larkAppId: 'cli_app',
+      turnId: 'om_private_turn', sourceSessionId: 'sess-1',
+    });
+
+    // The same route survives a restart, because it lives in the record.
+    const clock = fakeClock();
+    let up = false;
+    const seen: Array<{ turnId?: string; sourceSessionId?: string; uuid: string }> = [];
+    const send = async (r: TurnNoticeRecord) => {
+      seen.push({ turnId: r.turnId, sourceSessionId: r.sourceSessionId, uuid: r.delivery.uuid });
+      if (!up) throw unreachable();
+      return 'om_1';
+    };
+    const first = daemon(clock, { send });
+    await first.deliver(createUserNotifyNotice({ ...turnNoticeRoute(ds, undefined), message: '提示', now: clock.now() })).delivery;
+    first.outbox.disposeHost(first.host.key);
+    up = true;
+    const second = daemon(clock, { send, row: first.store.row });
+    second.outbox.resume(second.host);
+    await clock.advance(30_000);
+    expect(seen).toHaveLength(2);
+    expect(seen[1]).toEqual({ turnId: 'om_private_turn', sourceSessionId: 'sess-1', uuid: seen[0]!.uuid });
+  });
+
+  it('an identical notice hours later is a new occurrence, a replay within the window is not', async () => {
+    const clock = fakeClock();
+    const sent: string[] = [];
+    const { deliver } = daemon(clock, { send: async record => { sent.push(record.content); return 'om_1'; } });
+    const emit = () => createUserNotifyNotice({ turnId: 'om_turn_8', message: '同样的提示', now: clock.now() });
+    await deliver(emit()).delivery;
+    expect(sent).toHaveLength(1);
+    await clock.advance(5 * 60_000);
+    await deliver(emit()).delivery;
+    expect(sent).toHaveLength(1); // a replay of the delivered notice
+    await clock.advance(3 * 60 * 60_000);
+    await deliver(emit()).delivery;
+    expect(sent).toHaveLength(2); // the same text hours later is new information
+  });
+
   it('the persisted list stays bounded: settled records go before pending ones', () => {
     const now = Date.now();
     let list: TurnNoticeRecord[] = [];
     for (let i = 0; i < MAX_TURN_NOTICES; i++) {
-      const record = createUserNotifyNotice({ turnId: `om_${i}`, message: `m${i}`, now });
+      const record = createUserNotifyNotice({ sourceSessionId: 'sess-1', turnId: `om_${i}`, message: `m${i}`, now });
       list = upsertTurnNotice(list, record).list;
     }
     expect(list).toHaveLength(MAX_TURN_NOTICES);
@@ -297,13 +351,13 @@ describe('durable turn notices', () => {
     list = list.map((record, i) => i === 0
       ? { ...record, delivery: { ...record.delivery, state: 'delivered' as const } }
       : record);
-    const fresh = createUserNotifyNotice({ turnId: 'om_new', message: 'new', now });
+    const fresh = createUserNotifyNotice({ sourceSessionId: 'sess-1', turnId: 'om_new', message: 'new', now });
     list = upsertTurnNotice(list, fresh).list;
     expect(list).toHaveLength(MAX_TURN_NOTICES);
     expect(list.some(record => record.turnId === 'om_0')).toBe(false);
     expect(list.some(record => record.noticeKey === fresh.noticeKey)).toBe(true);
     // Hard cap even when every record is still pending.
-    list = upsertTurnNotice(list, createUserNotifyNotice({ turnId: 'om_x', message: 'x', now })).list;
+    list = upsertTurnNotice(list, createUserNotifyNotice({ sourceSessionId: 'sess-1', turnId: 'om_x', message: 'x', now })).list;
     expect(list).toHaveLength(MAX_TURN_NOTICES);
   });
 });

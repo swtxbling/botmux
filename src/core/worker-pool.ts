@@ -768,6 +768,9 @@ import {
   createTurnFailureCardNotice,
   createUserNotifyNotice,
   recordAndDeliverTurnNotice,
+  turnNoticeDeliveryKey,
+  turnNoticeReplyArgs,
+  turnNoticeRoute,
   type TurnNoticeRecord,
 } from '../services/turn-notice.js';
 import {
@@ -2594,39 +2597,46 @@ const turnNoticeOutbox = new RecoveryNoticeOutbox<ReturnType<typeof setTimeout>,
   },
   cancel: timer => clearTimeout(timer),
   log: (level, message) => logger[level](`[turn-notice] ${message}`),
-  keyOf: record => record.noticeKey,
+  keyOf: record => turnNoticeDeliveryKey(record),
 });
 
 function turnNoticeHost(ds: DaemonSession): RecoveryNoticeHost<TurnNoticeRecord> {
-  const find = (noticeKey: string) => ds.session.turnNotices
-    ?.find(entry => entry.noticeKey === noticeKey);
+  const find = (deliveryKey: string) => ds.session.turnNotices
+    ?.find(entry => turnNoticeDeliveryKey(entry) === deliveryKey);
   return {
     key: ds.session.sessionId,
     list: () => ds.session.turnNotices ?? [],
-    update: (noticeKey, mutate) => {
-      const record = find(noticeKey);
+    update: (deliveryKey, mutate) => {
+      const record = find(deliveryKey);
       if (!record) return undefined;
       mutate(record);
       sessionStore.updateSession(ds.session);
-      return find(noticeKey);
+      return find(deliveryKey);
     },
-    send: record => requireCallbacks().sessionReply(
-      sessionAnchorId(ds),
-      record.content,
-      record.contentType,
-      ds.larkAppId,
-      record.turnId,
-      { uuid: record.delivery.uuid },
-    ),
-    // A closed / replaced session must not be resurrected by a late notice;
-    // the record stays pending and the next attach resumes it.
-    canDeliver: () => ds.session.status === 'active',
+    // Route (turn id + source session) is the enqueue-time value, verbatim:
+    // recomputing `fallbackTurnId` here would move a late turnless notice into
+    // whatever turn is current by then (or out of a private reply).
+    send: record => {
+      const args = turnNoticeReplyArgs(record, { anchor: sessionAnchorId(ds), larkAppId: ds.larkAppId });
+      return requireCallbacks().sessionReply(
+        args.anchor, args.content, args.msgType, args.larkAppId, args.turnId,
+        { uuid: args.uuid, sourceSessionId: args.sourceSessionId },
+      );
+    },
+    // A closed / replaced / no-longer-owned session must not be resurrected by
+    // a late notice; the record stays pending and the next attach resumes it.
+    canDeliver: () => ordinaryTurnRecoveryStillOwnsSession(ds),
   };
 }
 
 /** Persist a notice then deliver it, retrying on the outbox from there. */
-function enqueueTurnNotice(ds: DaemonSession, record: TurnNoticeRecord): Promise<void> {
-  const { delivery } = recordAndDeliverTurnNotice({
+async function enqueueTurnNotice(
+  ds: DaemonSession,
+  record: TurnNoticeRecord,
+  /** Old log line's subject, kept so an outage is still visible in the log. */
+  failureLabel: string,
+): Promise<void> {
+  const { created, delivery } = recordAndDeliverTurnNotice({
     record,
     host: turnNoticeHost(ds),
     outbox: turnNoticeOutbox,
@@ -2643,7 +2653,17 @@ function enqueueTurnNotice(ds: DaemonSession, record: TurnNoticeRecord): Promise
     },
     log: (level, message) => logger[level](`[${tag(ds)}] [turn-notice] ${message}`),
   });
-  return delivery;
+  if (!created) return;
+  await delivery;
+  // The single-shot send's old error line stays visible: first attempt failed,
+  // the notice is now queued for retry (not silently dropped).
+  const current = turnNoticeHost(ds).list()
+    .find(entry => turnNoticeDeliveryKey(entry) === turnNoticeDeliveryKey(record));
+  if (current?.delivery.state === 'pending') {
+    logger.error(`[${tag(ds)}] Failed to deliver ${failureLabel}: `
+      + `${current.delivery.lastError ?? 'not confirmed'}; queued for retry `
+      + `(attempt ${current.delivery.attempts})`);
+  }
 }
 
 /** Re-arm pending notices of a (re)attached session from their persisted next
@@ -20252,11 +20272,11 @@ function setupWorkerHandlers(
         // instead of logged and dropped; a duplicate event dedups by key.
         try {
           await enqueueTurnNotice(ds, createUserNotifyNotice({
-            ...(msg.turnId ? { turnId: msg.turnId } : {}),
+            ...turnNoticeRoute(ds, msg.turnId),
             ...(msg.kind ? { kind: msg.kind } : {}),
             message: msg.message,
             now: Date.now(),
-          }));
+          }), 'user_notify to Lark');
         } catch (err: any) {
           logger.error(`[${t}] Failed to deliver user_notify to Lark: ${err?.message ?? String(err)}`);
         }
@@ -20574,15 +20594,17 @@ function setupWorkerHandlers(
           // Feishu outage no longer turns this turn silent — the outbox retries
           // (fixed uuid) and resumes after a daemon restart. One card per turn.
           try {
+            const route = turnNoticeRoute(ds, msg.turnId);
             await enqueueTurnNotice(ds, createTurnFailureCardNotice({
-              turnId: msg.turnId,
+              turnId: route.turnId ?? msg.turnId,
+              sourceSessionId: route.sourceSessionId,
               card: buildSessionTurnFailedCard(ds, {
                 status: msg.status === 'ambiguous' ? 'ambiguous' : 'failed',
                 ...(msg.errorCode !== undefined ? { errorCode: msg.errorCode } : {}),
                 ...(msg.retryable !== undefined ? { retryable: msg.retryable } : {}),
               }),
               now: Date.now(),
-            }));
+            }), 'turn failure card');
           } catch (err) {
             logger.error(
               `[${t}] Failed to deliver turn failure card: `
