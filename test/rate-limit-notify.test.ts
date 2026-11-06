@@ -62,6 +62,7 @@ import {
   __testOnly_setupWorkerHandlers,
   clearUsageLimitState,
   setActiveSessionsRegistry,
+  rateLimitMentionAccountKeyForSession,
 } from '../src/core/worker-pool.js';
 import { usageLimitStateKey, type CliUsageLimitState } from '../src/utils/cli-usage-limit.js';
 import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
@@ -512,5 +513,94 @@ describe('rate-limit proactive notification', () => {
     const texts = textReplies(sessionReply);
     expect(texts).toHaveLength(2);
     expect(texts.every(text => text.includes(`<at id=${OWNER}>`))).toBe(true);
+  });
+});
+
+
+describe('@owner 跨进程去重（同账号的多个 bot）', () => {
+  const APP_SHARED_A = 'ratelimit_acct_a';
+  const APP_SHARED_B = 'ratelimit_acct_b';
+  const UNION = 'on_same_owner';
+
+  function registerSharedAccountBots(configDir: string): void {
+    for (const app of [APP_SHARED_A, APP_SHARED_B]) {
+      registerBot({
+        larkAppId: app,
+        larkAppSecret: 's',
+        cliId: 'claude-code',
+        cliConfigDir: configDir,
+        allowedUsers: ['ou_o'],
+        disableStreamingCard: true,
+      });
+    }
+  }
+
+  it('两个 bot 共用一份 CLI 账号配置、同一人：同一次限流只 @ 一次', async () => {
+    registerSharedAccountBots(mkdtempSync(join(tmpdir(), 'botmux-acct-')));
+    const sessionReply = vi.fn(async () => 'om_reply');
+    setupPool(sessionReply);
+
+    const workerA = makeFakeWorker();
+    const workerB = makeFakeWorker();
+    const dsA = makeDs({ worker: workerA, workerPort: 9999 }, APP_SHARED_A);
+    const dsB = makeDs({ worker: workerB, workerPort: 9998 }, APP_SHARED_B);
+    // Same person, different app-scoped open_ids — union_id is the only key
+    // that can recognise them across bots.
+    dsA.session.ownerOpenId = 'ou_owner_in_a';
+    dsA.session.ownerUnionId = UNION;
+    dsB.session.ownerOpenId = 'ou_owner_in_b';
+    dsB.session.ownerUnionId = UNION;
+    setActiveSessionsRegistry(new Map([[activeSessionKey(dsA), dsA], [activeSessionKey(dsB), dsB]]));
+    __testOnly_setupWorkerHandlers(dsA, workerA);
+    __testOnly_setupWorkerHandlers(dsB, workerB);
+
+    const limit = rateLimitState();
+    workerA.emit('message', { type: 'screen_update', content: '429', status: 'limited', usageLimit: limit });
+    await flush();
+    workerB.emit('message', { type: 'screen_update', content: '429', status: 'limited', usageLimit: limit });
+    await flush();
+
+    const texts = textReplies(sessionReply);
+    expect(texts).toHaveLength(2);
+    expect(texts.filter(text => text.includes('<at id='))).toHaveLength(1);
+  });
+
+  describe('rateLimitMentionAccountKeyForSession', () => {
+    const claudeDs = (over: Partial<DaemonSession['session']> = {}): DaemonSession => {
+      const session: any = { ownerOpenId: 'ou_x', ownerUnionId: UNION, ...over };
+      return { session, larkAppId: APP_SHARED_A } as unknown as DaemonSession;
+    };
+
+    it('Claude Code：同配置目录 → 同账号；不同目录 → 不同账号', () => {
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-acct-key-'));
+      const key = rateLimitMentionAccountKeyForSession(claudeDs(), { cliId: 'claude-code', cliConfigDir: dir }, 'claude-code');
+      expect(key).toBeDefined();
+      expect(rateLimitMentionAccountKeyForSession(claudeDs(), { cliId: 'claude-code', cliConfigDir: dir }, 'claude-code')).toBe(key);
+      expect(rateLimitMentionAccountKeyForSession(claudeDs(), { cliId: 'claude-code', cliConfigDir: join(dir, 'other') }, 'claude-code')).not.toBe(key);
+    });
+
+    it('Claude Code：自己带凭证 / 认证环境变量覆盖时不按配置目录归账号', () => {
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-acct-key-'));
+      const cfg = { cliId: 'claude-code' as const, cliConfigDir: dir };
+      expect(rateLimitMentionAccountKeyForSession(claudeDs(), { ...cfg, credentialsSourceDir: dir }, 'claude-code')).toBeUndefined();
+      expect(rateLimitMentionAccountKeyForSession(claudeDs(), { ...cfg, env: { ANTHROPIC_AUTH_TOKEN: 't' } }, 'claude-code')).toBeUndefined();
+      expect(rateLimitMentionAccountKeyForSession(claudeDs(), { ...cfg, env: { ANTHROPIC_API_KEY: 'k' } }, 'claude-code')).toBeUndefined();
+      expect(rateLimitMentionAccountKeyForSession(claudeDs(), { ...cfg, env: { ANTHROPIC_BASE_URL: 'https://gw' } }, 'claude-code')).toBeUndefined();
+      expect(rateLimitMentionAccountKeyForSession(claudeDs(), { ...cfg, envUnset: ['ANTHROPIC_AUTH_TOKEN'] }, 'claude-code')).toBeUndefined();
+      expect(rateLimitMentionAccountKeyForSession(claudeDs(), { ...cfg, env: { HTTPS_PROXY: 'http://p' } }, 'claude-code')).toBeDefined();
+    });
+
+    it('Codex：按冻结的实例 home 归账号；没绑定就不猜', () => {
+      const home = mkdtempSync(join(tmpdir(), 'botmux-acct-codex-'));
+      const binding = { version: 1, source: 'pool', instanceId: 'i', cliId: 'codex', codexHome: home, authMode: 'isolated' } as any;
+      const bound = claudeDs({ cliInstanceBinding: binding });
+      expect(rateLimitMentionAccountKeyForSession(bound, { cliId: 'codex' }, 'codex'))
+        .toBe(rateLimitMentionAccountKeyForSession(bound, { cliId: 'codex' }, 'codex'));
+      expect(rateLimitMentionAccountKeyForSession(claudeDs(), { cliId: 'codex' }, 'codex')).toBeUndefined();
+    });
+
+    it('其它 CLI 不猜账号', () => {
+      expect(rateLimitMentionAccountKeyForSession(claudeDs(), { cliId: 'cursor' as any }, 'cursor' as any)).toBeUndefined();
+    });
   });
 });
