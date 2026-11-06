@@ -765,6 +765,12 @@ import {
   type RecoveryNoticeHost,
 } from '../services/ordinary-recovery-notice.js';
 import {
+  createTurnFailureCardNotice,
+  createUserNotifyNotice,
+  recordAndDeliverTurnNotice,
+  type TurnNoticeRecord,
+} from '../services/turn-notice.js';
+import {
   attachReadonlyTaskContinuation,
   beginReadonlyTaskContinuationDelivery,
   cancelReadonlyTaskContinuationForUserInput,
@@ -2572,7 +2578,80 @@ const ordinaryRecoveryNoticeOutbox = new RecoveryNoticeOutbox<ReturnType<typeof 
   },
   cancel: timer => clearTimeout(timer),
   log: (level, message) => logger[level](`[recovery-notice] ${message}`),
+  keyOf: record => record.logicalTurnId,
 });
+
+/** Durable delivery for the turn failure card and worker `user_notify` notices
+ *  (10-31 DNS outage: both were tried once, logged and dropped, leaving the
+ *  failed turn silent after Feishu came back). Same outbox, same backoff, same
+ *  fixed-uuid de-duplication as the recovery card; records are keyed by
+ *  (turn, notice kind) and persisted on the session. */
+const turnNoticeOutbox = new RecoveryNoticeOutbox<ReturnType<typeof setTimeout>, TurnNoticeRecord>({
+  schedule: (delayMs, run) => {
+    const timer = setTimeout(run, delayMs);
+    timer.unref?.();
+    return timer;
+  },
+  cancel: timer => clearTimeout(timer),
+  log: (level, message) => logger[level](`[turn-notice] ${message}`),
+  keyOf: record => record.noticeKey,
+});
+
+function turnNoticeHost(ds: DaemonSession): RecoveryNoticeHost<TurnNoticeRecord> {
+  const find = (noticeKey: string) => ds.session.turnNotices
+    ?.find(entry => entry.noticeKey === noticeKey);
+  return {
+    key: ds.session.sessionId,
+    list: () => ds.session.turnNotices ?? [],
+    update: (noticeKey, mutate) => {
+      const record = find(noticeKey);
+      if (!record) return undefined;
+      mutate(record);
+      sessionStore.updateSession(ds.session);
+      return find(noticeKey);
+    },
+    send: record => requireCallbacks().sessionReply(
+      sessionAnchorId(ds),
+      record.content,
+      record.contentType,
+      ds.larkAppId,
+      record.turnId,
+      { uuid: record.delivery.uuid },
+    ),
+    // A closed / replaced session must not be resurrected by a late notice;
+    // the record stays pending and the next attach resumes it.
+    canDeliver: () => ds.session.status === 'active',
+  };
+}
+
+/** Persist a notice then deliver it, retrying on the outbox from there. */
+function enqueueTurnNotice(ds: DaemonSession, record: TurnNoticeRecord): Promise<void> {
+  const { delivery } = recordAndDeliverTurnNotice({
+    record,
+    host: turnNoticeHost(ds),
+    outbox: turnNoticeOutbox,
+    saveList: list => {
+      ds.session.turnNotices = list;
+      try {
+        sessionStore.updateSession(ds.session);
+      } catch (err) {
+        // A failed write reloads the durable row; keep the notice in memory so
+        // this process still delivers it (a restart then cannot resume it).
+        ds.session.turnNotices = list;
+        throw err;
+      }
+    },
+    log: (level, message) => logger[level](`[${tag(ds)}] [turn-notice] ${message}`),
+  });
+  return delivery;
+}
+
+/** Re-arm pending notices of a (re)attached session from their persisted next
+ *  attempt (daemon restart, worker re-attach). Delivered/abandoned records are
+ *  inert, so an already-delivered notice is never re-sent. */
+export function ensureTurnNoticeDeliveryAttached(ds: DaemonSession): void {
+  turnNoticeOutbox.resume(turnNoticeHost(ds));
+}
 
 function enqueueOrdinaryRecoveryNotice(
   ds: DaemonSession,
@@ -16729,6 +16808,9 @@ function setupWorkerHandlers(
   const loc = botLocale(botCfg);
   ensureOrdinaryTurnRecoveryAttached(ds, botCfg);
   ensureReadonlyTaskContinuationAttached(ds, botCfg);
+  // Notices owed from before this worker generation continue from their
+  // persisted next attempt (delivered ones stay inert).
+  ensureTurnNoticeDeliveryAttached(ds);
   const notifyStartupFailure = async (
     reason: string,
     turnId?: string,
@@ -20166,10 +20248,17 @@ function setupWorkerHandlers(
             break;
           }
         }
+        // Durable: Feishu unreachable ⇒ the notice is retried (fixed uuid)
+        // instead of logged and dropped; a duplicate event dedups by key.
         try {
-          await scopedReply(msg.message, 'text', msg.turnId);
+          await enqueueTurnNotice(ds, createUserNotifyNotice({
+            ...(msg.turnId ? { turnId: msg.turnId } : {}),
+            ...(msg.kind ? { kind: msg.kind } : {}),
+            message: msg.message,
+            now: Date.now(),
+          }));
         } catch (err: any) {
-          logger.error(`[${t}] Failed to deliver user_notify to Lark: ${err.message}`);
+          logger.error(`[${t}] Failed to deliver user_notify to Lark: ${err?.message ?? String(err)}`);
         }
         break;
       }
@@ -20481,16 +20570,19 @@ function setupWorkerHandlers(
             errorCode: failureCode,
             turnId: msg.turnId,
           });
+          // Durable: the card payload is persisted before the first send, so a
+          // Feishu outage no longer turns this turn silent — the outbox retries
+          // (fixed uuid) and resumes after a daemon restart. One card per turn.
           try {
-            await scopedReply(
-              buildSessionTurnFailedCard(ds, {
+            await enqueueTurnNotice(ds, createTurnFailureCardNotice({
+              turnId: msg.turnId,
+              card: buildSessionTurnFailedCard(ds, {
                 status: msg.status === 'ambiguous' ? 'ambiguous' : 'failed',
                 ...(msg.errorCode !== undefined ? { errorCode: msg.errorCode } : {}),
                 ...(msg.retryable !== undefined ? { retryable: msg.retryable } : {}),
               }),
-              'interactive',
-              msg.turnId,
-            );
+              now: Date.now(),
+            }));
           } catch (err) {
             logger.error(
               `[${t}] Failed to deliver turn failure card: `
