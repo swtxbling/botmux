@@ -327,6 +327,51 @@ describe('crash notice merge and folded terminal tail', () => {
     const warned = vi.mocked(logger.warn).mock.calls.map(call => String(call[0])).join('\n');
     expect(warned).toContain('sid-closed-in-window');
   });
+  it('still notifies when the crashed worker exits inside the merge window', async () => {
+    __testOnly_configureCrashNotices({ windowMs: 5_000, retryDelayMs: 5 });
+    const worker = makeFakeWorker();
+    const ds = makeDs('sid-worker-exit', worker, { title: 'exit-bot', scope: 'chat' });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    // Crash-stop keeps the worker for the diagnostic park; the notice is queued.
+    await crashToStop(worker, 'TAIL_EXIT');
+    expect(ds.worker).toBe(worker);
+    const generationBeforeExit = ds.workerGeneration;
+
+    // That worker dies before the merge window closes: the exit fence nulls
+    // ds.worker and bumps the generation. That is the end of the crash, not a
+    // reason to drop the only notice the owner would get.
+    worker.emit('exit', 1, null);
+    await new Promise(r => setTimeout(r, 10));
+    expect(ds.workerGeneration).not.toBe(generationBeforeExit);
+    expect(ds.worker).toBeNull();
+
+    await flushPendingCrashNotices();
+
+    // The abrupt exit also owes the user a startup-failure line (plain text);
+    // the crash notice itself is the interactive card.
+    const crashCards = sessionReplyMock.mock.calls
+      .filter((call: any[]) => call[2] === 'interactive')
+      .map((call: any[]) => JSON.parse(call[1]));
+    expect(crashCards).toHaveLength(1);
+    expect(panelMarkdown(crashCards[0])).toContain('TAIL_EXIT');
+  });
+
+  it('drops a queued notice when a replacement worker took over inside the window', async () => {
+    __testOnly_configureCrashNotices({ windowMs: 5_000, retryDelayMs: 5 });
+    const worker = makeFakeWorker();
+    const ds = makeDs('sid-replaced-in-window', worker, { title: 'replaced-bot', scope: 'chat' });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    await crashToStop(worker, 'TAIL_REPLACED');
+    // A new worker took over the session while the notice was still queued.
+    ds.worker = makeFakeWorker();
+    await flushPendingCrashNotices();
+
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+    const warned = vi.mocked(logger.warn).mock.calls.map(call => String(call[0])).join('\n');
+    expect(warned).toContain('sid-replaced-in-window');
+  });
 });
 
 describe('crash notice card rendering', () => {

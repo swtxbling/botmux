@@ -19823,7 +19823,12 @@ function setupWorkerHandlers(
           // 文案按停止原因分流：永久退出通道刻意跨 60s 窗口累计，两次崩溃可能
           // 相隔很久，沿用「1 分钟内崩溃 N 次」会是假话。
           const trimmedLogTail = msg.logTail?.trim() || undefined;
-          const noticeGeneration = ds.workerGeneration;
+          // The worker object that just crashed, captured before the notice is
+          // queued: the pty / failed-diagnostic path calls killWorker() below,
+          // whose exit handler legitimately bumps ds.workerGeneration. Holding
+          // a generation number here would therefore drop the only notice on
+          // exactly the backends without a Web Terminal.
+          const crashedWorker = ds.worker;
           const entry: CrashNoticeEntry = {
             sessionId: ds.session.sessionId,
             sessionLabel: crashNoticeLabel(ds.session.title, ds.currentTurnTitle, cliName),
@@ -19853,8 +19858,14 @@ function setupWorkerHandlers(
               send: cardJson => scopedReply(cardJson, 'interactive', undefined),
               // The session must still be the thing that crashed when the
               // window closes: closed / replaced sessions get a log line, not
-              // a stale notice in a thread that has moved on.
-              stillRelevant: () => ds.session.status === 'active' && ds.workerGeneration === noticeGeneration,
+              // a stale notice in a thread that has moved on. A replacement
+              // worker is a different object, so it suppresses the notice; the
+              // regular exit fence (the pty / no-diagnostic stop path kills
+              // this worker, whose exit bumps ds.workerGeneration and nulls
+              // ds.worker) is the expected end of the crash, not a reason to
+              // drop the only notice the owner would get.
+              stillRelevant: () => ds.session.status === 'active'
+                && (ds.worker === null || ds.worker === crashedWorker),
               onSendError: async (replyErr) => {
                 if (replyErr instanceof MessageWithdrawnError && ownsLifecycleMutation()) {
                   await closeWithdrawnSessionIfLedgerEmpty(ds, 'Root message withdrawn while sending crash diagnostic');
