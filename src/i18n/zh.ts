@@ -2210,8 +2210,6 @@ export const messages: Record<string, string> = {
   // Scheduler announcements
   'decisionBoard.batch_banner': '📥 决策看板：收到 {count} 项决定（批次 #{id}），管家开始处理',
   'scheduler.task_started': '🕐 定时任务「{name}」开始执行',
-  'scheduler.task_triggered_target_chat': '🕐 定时任务「{name}」已在目标群聊触发\n打开目标群聊：{link}',
-  'scheduler.task_triggered_target_thread': '🕐 定时任务「{name}」已在目标话题触发\n打开目标话题：{link}',
   'scheduler.run_prompt_undelivered': '⚠️ 定时任务「{name}」本次没有执行：{cliName} 启动后一直没有收下任务提示词，这次运行已结束。下次触发会重新启动；可在 Dashboard 的执行记录里查看。',
   'scheduler.run_prompt_undelivered_log': '{cliName} 启动后一直没有收下任务提示词，本次运行未执行',
   // Scheduled-task identity claim card
