@@ -26,7 +26,20 @@ export interface SessionOwnerReminderRecord {
   lastObservedActivityAt: number;
   lastRemindedAt?: number;
   retryAfterAt?: number;
+  /** @-mentions already delivered in THIS cycle. Persisted so a daemon restart
+   *  continues the count instead of resetting it to zero and resuming the ping. */
+  mentionCount?: number;
 }
+
+/**
+ * How many times one unchanged actionable item may @ the owner. The record is
+ * dropped or rebuilt on activity / state change, so "same item" means "same
+ * fingerprint and no new inbound message". After the last mention we stop
+ * sending entirely rather than keep a quiet line: the reminder body is a fixed
+ * text that is always rendered WITH the mention (`buildSessionOwnerMention`),
+ * so there is no quiet variant to fall back to.
+ */
+export const SESSION_OWNER_REMINDER_MAX_MENTIONS = 3;
 
 export type SessionOwnerReminderRecords = Record<string, SessionOwnerReminderRecord>;
 
@@ -222,6 +235,10 @@ export class SessionOwnerReminderController {
       const dueBase = record.lastRemindedAt ?? record.actionableSince;
       if (now - dueBase < intervalMs) continue;
       if (record.retryAfterAt !== undefined && now < record.retryAfterAt) continue;
+      // Bounded pings: one unchanged item gets at most N @-mentions. A send that
+      // failed does not consume the budget (retryAfterAt above drives the retry),
+      // so a transient Lark outage cannot silently swallow the last reminder.
+      if ((record.mentionCount ?? 0) >= SESSION_OWNER_REMINDER_MAX_MENTIONS) continue;
 
       try {
         await this.deps.send(
@@ -231,6 +248,7 @@ export class SessionOwnerReminderController {
         );
         record.lastRemindedAt = now;
         record.retryAfterAt = undefined;
+        record.mentionCount = (record.mentionCount ?? 0) + 1;
       } catch (error) {
         record.retryAfterAt = now + Math.max(60_000, Math.min(intervalMs, FAILURE_RETRY_MAX_MS));
         this.deps.onError?.(ds, error);

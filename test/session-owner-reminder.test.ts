@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import {
+  SESSION_OWNER_REMINDER_MAX_MENTIONS,
   SessionOwnerReminderController,
   deriveSessionOwnerReminderStates,
   normalizeSessionOwnerReminderConfig,
@@ -293,6 +294,128 @@ describe('SessionOwnerReminderController', () => {
     await controller.scan(all, { ...enabled, enabled: false }, 1_000 + 31 * 60_000);
     expect(records).toEqual({});
   });
+
+  it('stops @-mentioning after the per-item mention budget is spent', async () => {
+    // The old behavior pinged an unchanged idle session forever: every 30m, on
+    // every bot, until the owner answered. One item now gets a bounded number of
+    // @-mentions, then the reminder goes quiet on its own.
+    let records: Record<string, SessionOwnerReminderRecord> = {};
+    const send = vi.fn().mockResolvedValue(undefined);
+    const controller = new SessionOwnerReminderController({
+      load: () => records,
+      save: next => { records = structuredClone(next); },
+      send,
+      canSend: () => true,
+    });
+    const ds = session();
+    const start = 1_000;
+    const interval = 30 * 60_000;
+
+    await controller.scan([ds], enabled, start);
+    for (let tick = 1; tick <= SESSION_OWNER_REMINDER_MAX_MENTIONS; tick++) {
+      await controller.scan([ds], enabled, start + tick * interval);
+    }
+    expect(send).toHaveBeenCalledTimes(SESSION_OWNER_REMINDER_MAX_MENTIONS);
+
+    // Ten more hours of the SAME unanswered item: no further @, no queue growth.
+    for (let tick = SESSION_OWNER_REMINDER_MAX_MENTIONS + 1; tick <= 20; tick++) {
+      await controller.scan([ds], enabled, start + tick * interval);
+    }
+    expect(send).toHaveBeenCalledTimes(SESSION_OWNER_REMINDER_MAX_MENTIONS);
+  });
+
+  it('keeps the spent mention budget across a daemon restart', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-owner-reminder-cap-'));
+    try {
+      const load = () => loadSessionOwnerReminderRecords(dir, 'cli_app');
+      const save = (next: Record<string, SessionOwnerReminderRecord>) =>
+        saveSessionOwnerReminderRecords(dir, 'cli_app', next);
+      const first = vi.fn().mockResolvedValue(undefined);
+      const before = new SessionOwnerReminderController({ load, save, send: first, canSend: () => true });
+      const ds = session();
+      const interval = 30 * 60_000;
+      await before.scan([ds], enabled, 1_000);
+      for (let tick = 1; tick <= SESSION_OWNER_REMINDER_MAX_MENTIONS; tick++) {
+        await before.scan([ds], enabled, 1_000 + tick * interval);
+      }
+      expect(first).toHaveBeenCalledTimes(SESSION_OWNER_REMINDER_MAX_MENTIONS);
+
+      // Restart: a fresh controller reads the persisted records back from disk.
+      const after = vi.fn().mockResolvedValue(undefined);
+      const restarted = new SessionOwnerReminderController({ load, save, send: after, canSend: () => true });
+      for (let tick = SESSION_OWNER_REMINDER_MAX_MENTIONS + 1; tick <= 10; tick++) {
+        await restarted.scan([ds], enabled, 1_000 + tick * interval);
+      }
+      expect(after).not.toHaveBeenCalled();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('re-arms the mention budget when the item is updated or changes state', async () => {
+    let records: Record<string, SessionOwnerReminderRecord> = {};
+    const send = vi.fn().mockResolvedValue(undefined);
+    const controller = new SessionOwnerReminderController({
+      load: () => records,
+      save: next => { records = structuredClone(next); },
+      send,
+      canSend: () => true,
+    });
+    const ds = session();
+    const interval = 30 * 60_000;
+    const start = 1_000;
+    const spendBudget = async (base: number) => {
+      for (let tick = 1; tick <= SESSION_OWNER_REMINDER_MAX_MENTIONS; tick++) {
+        await controller.scan([ds], enabled, base + tick * interval);
+      }
+    };
+
+    await controller.scan([ds], enabled, start);
+    await spendBudget(start);
+    await controller.scan([ds], enabled, start + 20 * interval);
+    expect(send).toHaveBeenCalledTimes(SESSION_OWNER_REMINDER_MAX_MENTIONS);
+
+    // The owner answers (inbound activity) → fresh cycle, budget re-armed.
+    const answeredAt = start + 21 * interval;
+    ds.lastMessageAt = answeredAt;
+    await controller.scan([ds], enabled, answeredAt);
+    await spendBudget(answeredAt);
+    expect(send).toHaveBeenCalledTimes(SESSION_OWNER_REMINDER_MAX_MENTIONS * 2);
+
+    // A runtime state change (a new TUI choice card) also re-arms the budget.
+    const changedAt = answeredAt + 20 * interval;
+    ds.tuiPromptCardId = 'om_prompt_after_update';
+    await controller.scan([ds], enabled, changedAt);
+    await spendBudget(changedAt);
+    expect(send).toHaveBeenCalledTimes(SESSION_OWNER_REMINDER_MAX_MENTIONS * 3);
+  });
+
+  it('sends one reminder per due item per tick, never one per matching state', async () => {
+    // Two sessions become due on the same tick: each thread gets exactly one
+    // reminder for the cycle, not one per configured state it happens to match.
+    let records: Record<string, SessionOwnerReminderRecord> = {};
+    const send = vi.fn().mockResolvedValue(undefined);
+    const controller = new SessionOwnerReminderController({
+      load: () => records,
+      save: next => { records = structuredClone(next); },
+      send,
+      canSend: () => true,
+    });
+    const bothStates = { ...enabled, states: ['idle', 'agent_attention'] as const };
+    const a = session();
+    const b = session({
+      session: { ...session().session, sessionId: 's2', rootMessageId: 'om_root_2' },
+      agentAttention: { kind: 'blocked', reason: 'need input', at: 500 },
+    });
+    // `a` matches both configured states; it must still produce ONE message.
+    a.agentAttention = { kind: 'blocked', reason: 'also waiting', at: 600 };
+
+    const interval = 30 * 60_000;
+    await controller.scan([a, b], bothStates, 1_000);
+    await controller.scan([a, b], bothStates, 1_000 + interval);
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(send.mock.calls.map(call => call[0].session.rootMessageId).sort()).toEqual(['om_root', 'om_root_2']);
+  });
 });
 
 describe('session owner reminder durable store', () => {
@@ -306,6 +429,7 @@ describe('session owner reminder durable store', () => {
           actionableSince: 1_000,
           lastObservedActivityAt: 900,
           lastRemindedAt: 2_000,
+          mentionCount: 2,
         },
       };
       saveSessionOwnerReminderRecords(dir, 'cli_app', records);
