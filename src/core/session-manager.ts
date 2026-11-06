@@ -109,7 +109,6 @@ import {
   renderScheduleTopicTitle,
 } from './schedule-topic-title.js';
 import { escapeXmlTagLikeTokens } from '../utils/xml.js';
-import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { initialLinkRefSources } from './link-ref-turn.js';
 import type { LinkRefMode, LinkRefSourceType } from '../services/link-ref-types.js';
 import { writePromptContext } from '../services/prompt-context-store.js';
@@ -4591,37 +4590,6 @@ export function resolveScheduledTaskExecutionPosition(
   return task.scope !== 'chat' && task.rootMessageId ? 'topic' : 'top-level';
 }
 
-async function buildScheduledTargetNotice(params: {
-  kind: 'chat' | 'thread';
-  taskName: string;
-  targetAppId: string;
-  targetChatId: string;
-  targetRootMessageId?: string;
-  targetBrand?: unknown;
-  locale?: Locale;
-}): Promise<string> {
-  const { getMessageThreadId } = await import('../im/lark/client.js');
-  const brand = normalizeBrand(params.targetBrand);
-  let link = chatAppLink(params.targetChatId, brand);
-  if (params.kind === 'thread' && params.targetRootMessageId) {
-    try {
-      const threadId = await getMessageThreadId(params.targetAppId, params.targetRootMessageId);
-      if (threadId) link = threadAppLink(params.targetChatId, threadId, brand);
-    } catch (err: any) {
-      logger.warn(
-        `[scheduler] Failed to resolve target topic ${params.targetRootMessageId}; falling back to chat link (${err.message})`,
-      );
-    }
-  }
-  return t(
-    params.kind === 'thread'
-      ? 'scheduler.task_triggered_target_thread'
-      : 'scheduler.task_triggered_target_chat',
-    { name: params.taskName, link },
-    params.locale,
-  );
-}
-
 /**
  * forkWorker refused a system-started session (a scheduled fire, a decision
  * board batch) because the directory it would start in is gone
@@ -4704,7 +4672,7 @@ export async function executeScheduledTask(
   const executionPosition = resolveScheduledTaskExecutionPosition(task);
   const scope = resolveScheduledTaskScope(task);
 
-  // Silent execution posts no "🕐 task started" banner / creator notice.
+  // Silent execution posts no "🕐 task started" banner.
   // A silent fresh-topic run receives a durable virtual anchor below; its real
   // Lark root is materialized only by the first successful `botmux send`.
   const silent = task.silent === true;
@@ -4731,9 +4699,14 @@ export async function executeScheduledTask(
   // Decide where to route the "🕐 task started" notification and where the
   // session conversation lands.
   //
+  // A cross-thread fire never posts back into the creator's thread: the target
+  // chat/topic is where the run happens, and a per-fire "it ran over there"
+  // notice is pure noise for the owner. Repeated failures still alert the bot
+  // admin, and reach the creator too when the task was created with --notify.
+  //
   // Thread-scope (legacy and current default):
-  //   - cross-thread (creator != target): notify creator's thread; deliver
-  //     execution into target rootMessageId
+  //   - cross-thread (creator != target): deliver execution into target
+  //     rootMessageId; no creator-side message
   //   - same-thread:                       notify into the bound thread,
   //     which doubles as the session anchor
   //   - missing rootMessageId:             fall back to a fresh top-level
@@ -4753,25 +4726,6 @@ export async function executeScheduledTask(
       anchor = `schedule-run:${task.id}:${scheduledTurnId.slice(scheduledTurnId.lastIndexOf(':') + 1)}`;
       isContinuation = false;
     } else {
-      if (task.creatorRootMessageId && task.creatorChatId !== task.chatId) {
-        const creatorAppId = task.creatorLarkAppId ?? larkAppId;
-        buildScheduledTargetNotice({
-          kind: 'chat',
-          taskName: task.name,
-          targetAppId: larkAppId,
-          targetChatId: task.chatId,
-          targetBrand: bot.config.brand,
-          locale: localeForBot(creatorAppId),
-        }).then(content => replyMessage(
-          creatorAppId,
-          task.creatorRootMessageId!,
-          content,
-          'text',
-          true,
-        )).catch((err: any) => {
-          logger.warn(`[scheduler] Failed to notify creator thread ${task.creatorRootMessageId} (${err.message})`);
-        });
-      }
       // A custom title is the actual text root; without one the localized
       // task-start notice remains the backwards-compatible seed.
       const topicSeed = topicTitle
@@ -4814,25 +4768,6 @@ export async function executeScheduledTask(
           if (existingRoot) {
             return { anchor: existingRoot, rootMessageId: existingRoot, isContinuation: true };
           }
-          if (task.creatorRootMessageId && task.creatorChatId !== task.chatId) {
-            const creatorAppId = task.creatorLarkAppId ?? larkAppId;
-            buildScheduledTargetNotice({
-              kind: 'chat',
-              taskName: task.name,
-              targetAppId: larkAppId,
-              targetChatId: task.chatId,
-              targetBrand: bot.config.brand,
-              locale: localeForBot(creatorAppId),
-            }).then(content => replyMessage(
-              creatorAppId,
-              task.creatorRootMessageId!,
-              content,
-              'text',
-              true,
-            )).catch((err: any) => {
-              logger.warn(`[scheduler] Failed to notify creator thread ${task.creatorRootMessageId} (${err.message})`);
-            });
-          }
           // Dedicated tasks use the same rendered fire-time title contract as
           // new-topic runs, but persist this first root for later continuations.
           const topicSeed = topicTitle
@@ -4856,31 +4791,12 @@ export async function executeScheduledTask(
     const chatMode = await getChatMode(larkAppId, task.chatId, { forceRefresh: true });
     let topLevelTriggerId: string | undefined;
     if (silent) {
-      // No banner / creator notice — the chat itself is the anchor.
+      // No banner — the chat itself is the anchor.
     } else {
-      // A cross-chat task keeps the creator informed, but the target chat must
-      // still receive its own top-level trigger. Besides making the execution
-      // visible where it runs, that message is the anchor required by the
-      // target bot/chat's shared or independent-topic regular-group mode.
-      if (task.creatorRootMessageId && task.creatorChatId !== task.chatId) {
-        const creatorAppId = task.creatorLarkAppId ?? larkAppId;
-        buildScheduledTargetNotice({
-          kind: 'chat',
-          taskName: task.name,
-          targetAppId: larkAppId,
-          targetChatId: task.chatId,
-          targetBrand: bot.config.brand,
-          locale: localeForBot(creatorAppId),
-        }).then(content => replyMessage(
-          creatorAppId,
-          task.creatorRootMessageId!,
-          content,
-          'text',
-          true,
-        )).catch((err: any) => {
-          logger.warn(`[scheduler] Failed to notify creator thread ${task.creatorRootMessageId} (${err.message})`);
-        });
-      }
+      // The target chat must still receive its own top-level trigger: besides
+      // making the execution visible where it runs, that message is the anchor
+      // required by the target bot/chat's shared or independent-topic
+      // regular-group mode.
       try {
         topLevelTriggerId = await sendMessage(larkAppId, task.chatId, t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId)));
       } catch (err: any) {
@@ -4912,9 +4828,9 @@ export async function executeScheduledTask(
     // thread-scope path (existing logic)
     // A follow-active task moves its landing point by design, so "creator root
     // ≠ landing root" would read as cross-thread forever after the first move
-    // (a notice into the closed creation topic on every fire, and no banner in
-    // the topic it actually landed in). For those, only a different CHAT is
-    // "somewhere else"; inside the creator's chat the fire is in-thread.
+    // (suppressing the in-thread banner in the topic it actually landed in).
+    // For those, only a different CHAT is "somewhere else"; inside the
+    // creator's chat the fire is in-thread.
     const isCrossThread = task.followActive === true
       ? (!!task.creatorRootMessageId && !!task.creatorChatId && task.creatorChatId !== task.chatId)
       : (!!task.creatorRootMessageId &&
@@ -4922,26 +4838,6 @@ export async function executeScheduledTask(
         task.creatorRootMessageId !== task.rootMessageId);
 
     if (isCrossThread) {
-      if (!silent) {
-        const creatorAppId = task.creatorLarkAppId ?? larkAppId;
-        buildScheduledTargetNotice({
-          kind: 'thread',
-          taskName: task.name,
-          targetAppId: larkAppId,
-          targetChatId: task.chatId,
-          targetRootMessageId: task.rootMessageId,
-          targetBrand: bot.config.brand,
-          locale: localeForBot(creatorAppId),
-        }).then(content => replyMessage(
-          creatorAppId,
-          task.creatorRootMessageId!,
-          content,
-          'text',
-          true,
-        )).catch((err: any) => {
-          logger.warn(`[scheduler] Failed to notify creator thread ${task.creatorRootMessageId} (${err.message})`);
-        });
-      }
       anchor = task.rootMessageId!;
       isContinuation = true;
     } else if (task.rootMessageId) {

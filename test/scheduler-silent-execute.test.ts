@@ -2,7 +2,7 @@
  * scheduler-silent-execute.test.ts
  *
  * Behavioral tests for executeScheduledTask's silent mode (ScheduledTask.silent):
- *  - silent thread fire: no "🕐 task started" banner / creator notice, anchor
+ *  - silent thread fire: no "🕐 task started" banner, anchor
  *    reuses task.rootMessageId, spawned session carries a turn-exact silent id and
  *    the CLI prompt is wrapped with the silent-schedule hint
  *  - loud fire keeps posting the banner (control)
@@ -11,6 +11,8 @@
  *    visible Lark root until the first botmux send
  *  - chat-scope fires honor the bot/chat regular-group mode for flat, shared,
  *    and independent-topic routing
+ *  - cross-chat / cross-thread fires deliver into the target chat or topic but
+ *    never post a per-fire notice back into the creator's thread
  *  - live-session injection: silent id follows the queued turn even when busy
  *  - converted-topic regression: chat-scope task in a topic-converted group
  *    anchors at rootMessageId (previously clobbered by the trailing
@@ -476,6 +478,23 @@ describe('executeScheduledTask — fresh-topic execution', () => {
     expect(active.get(sessionKey('om_banner_123', APP))?.scope).toBe('thread');
   });
 
+  it('a cross-chat fresh-topic fire seeds the target chat without posting back to the creator thread', async () => {
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({
+      executionPosition: 'new-topic',
+      chatType: 'group',
+      creatorChatId: 'oc_creator_chat',
+      creatorRootMessageId: 'om_creator_root',
+    }), active, refreshCliVersion);
+
+    expect(sendMessageMock).toHaveBeenCalledTimes(1);
+    expect(sendMessageMock.mock.calls[0][1]).toBe(CHAT);
+    expect(active.get(sessionKey('om_banner_123', APP))?.scope).toBe('thread');
+    // Let a reintroduced fire-and-forget creator notice land before asserting.
+    await new Promise(r => setTimeout(r, 20));
+    expect(replyMessageMock).not.toHaveBeenCalled();
+  });
+
   it('starts fresh-topic + silent at an isolated virtual anchor without a visible seed', async () => {
     const active = new Map<string, DaemonSession>();
     await executeScheduledTask(baseTask({
@@ -736,7 +755,7 @@ describe('executeScheduledTask — task position (dedicated per-task topic)', ()
     expect(active.get(sessionKey('om_banner_123', APP))?.scope).toBe('thread');
   });
 
-  it('non-silent first fire in a cross-chat task still notifies its creator thread', async () => {
+  it('a cross-chat task-position first fire seeds the target topic without posting back to the creator thread', async () => {
     const active = new Map<string, DaemonSession>();
     await executeScheduledTask(baseTask({
       executionPosition: 'task',
@@ -746,15 +765,12 @@ describe('executeScheduledTask — task position (dedicated per-task topic)', ()
     }), active, refreshCliVersion);
 
     expect(sendMessageMock).toHaveBeenCalledTimes(1);
-    await vi.waitFor(() => {
-      expect(replyMessageMock).toHaveBeenCalledWith(
-        APP,
-        'om_creator_root',
-        expect.stringContaining('https://applink.feishu.cn/client/chat/open?openChatId=oc_chat'),
-        'text',
-        true,
-      );
-    });
+    expect(sendMessageMock.mock.calls[0][0]).toBe(APP);
+    expect(sendMessageMock.mock.calls[0][1]).toBe(CHAT);
+    expect(active.get(sessionKey('om_banner_123', APP))?.scope).toBe('thread');
+    // Let a reintroduced fire-and-forget creator notice land before asserting.
+    await new Promise(r => setTimeout(r, 20));
+    expect(replyMessageMock).not.toHaveBeenCalled();
   });
 
   it('concurrent rootless non-silent fires seed the topic ONCE and share its session', async () => {
@@ -932,7 +948,7 @@ describe('executeScheduledTask — silent chat-scope fire', () => {
     expect(ds.silentScheduledTurns?.has(forkedTurnId())).toBe(true);
   });
 
-  it('suppresses the cross-chat creator notice too', async () => {
+  it('posts no creator notice and no banner for a cross-chat silent fire', async () => {
     const active = new Map<string, DaemonSession>();
     await executeScheduledTask(baseTask({
       scope: 'chat', silent: true,
@@ -946,7 +962,7 @@ describe('executeScheduledTask — silent chat-scope fire', () => {
 });
 
 describe('executeScheduledTask — chat-scope regular-group mode', () => {
-  it('cross-chat loud execution notifies the creator and still uses a target-chat trigger', async () => {
+  it('cross-chat loud execution posts the target-chat trigger without posting back to the creator thread', async () => {
     (BOT.config as typeof BOT.config & { regularGroupReplyMode?: string }).regularGroupReplyMode = 'new-topic';
     const active = new Map<string, DaemonSession>();
 
@@ -957,18 +973,12 @@ describe('executeScheduledTask — chat-scope regular-group mode', () => {
       creatorRootMessageId: 'om_creator_root',
     }), active, refreshCliVersion);
 
-    await vi.waitFor(() => {
-      expect(replyMessageMock).toHaveBeenCalledWith(
-        APP,
-        'om_creator_root',
-        expect.any(String),
-        'text',
-        true,
-      );
-    });
     expect(sendMessageMock).toHaveBeenCalledWith(APP, CHAT, expect.any(String));
     expect(active.get(sessionKey(CHAT, APP))).toBeUndefined();
     expect(active.get(sessionKey('om_banner_123', APP))?.scope).toBe('thread');
+    // Let a reintroduced fire-and-forget creator notice land before asserting.
+    await new Promise(r => setTimeout(r, 20));
+    expect(replyMessageMock).not.toHaveBeenCalled();
   });
 
   it('new-topic mode uses the top-level banner as a fresh thread/session anchor', async () => {
@@ -1022,8 +1032,8 @@ describe('executeScheduledTask — chat-scope regular-group mode', () => {
   });
 });
 
-describe('executeScheduledTask — cross-target notice', () => {
-  it('links a cross-thread creator notice to the exact target topic', async () => {
+describe('executeScheduledTask — cross-target delivery without a creator notice', () => {
+  it('a cross-thread fire lands in the target topic and posts nothing to the creator topic', async () => {
     const active = new Map<string, DaemonSession>();
 
     await executeScheduledTask(baseTask({
@@ -1033,63 +1043,10 @@ describe('executeScheduledTask — cross-target notice', () => {
       creatorRootMessageId: 'om_creator_root',
     }), active, refreshCliVersion);
 
-    await vi.waitFor(() => {
-      expect(getMessageThreadIdMock).toHaveBeenCalledWith(APP, ROOT);
-      expect(replyMessageMock).toHaveBeenCalledWith(
-        APP,
-        'om_creator_root',
-        expect.stringContaining(
-          'https://applink.feishu.cn/client/thread/open?open_chat_id=oc_chat&open_thread_id=omt_target_thread',
-        ),
-        'text',
-        true,
-      );
-    });
-    expect(active.get(sessionKey(ROOT, APP))).toBeTruthy();
-  });
-
-  it('links a cross-chat creator notice to the target chat', async () => {
-    (BOT.config as typeof BOT.config & { regularGroupReplyMode?: string }).regularGroupReplyMode = 'new-topic';
-    const active = new Map<string, DaemonSession>();
-
-    await executeScheduledTask(baseTask({
-      scope: 'chat',
-      chatType: 'group',
-      creatorChatId: 'oc_creator_chat',
-      creatorRootMessageId: 'om_creator_root',
-    }), active, refreshCliVersion);
-
-    await vi.waitFor(() => {
-      expect(replyMessageMock).toHaveBeenCalledWith(
-        APP,
-        'om_creator_root',
-        expect.stringContaining('https://applink.feishu.cn/client/chat/open?openChatId=oc_chat'),
-        'text',
-        true,
-      );
-    });
-  });
-
-  it('falls back to the target chat link when topic resolution fails', async () => {
-    getMessageThreadIdMock.mockRejectedValueOnce(new Error('lookup failed'));
-    const active = new Map<string, DaemonSession>();
-
-    await executeScheduledTask(baseTask({
-      rootMessageId: ROOT,
-      scope: 'thread',
-      creatorChatId: CHAT,
-      creatorRootMessageId: 'om_creator_root',
-    }), active, refreshCliVersion);
-
-    await vi.waitFor(() => {
-      expect(replyMessageMock).toHaveBeenCalledWith(
-        APP,
-        'om_creator_root',
-        expect.stringContaining('https://applink.feishu.cn/client/chat/open?openChatId=oc_chat'),
-        'text',
-        true,
-      );
-    });
+    expect(active.get(sessionKey(ROOT, APP))?.session.rootMessageId).toBe(ROOT);
+    // Let a reintroduced fire-and-forget creator notice land before asserting.
+    await new Promise(r => setTimeout(r, 20));
+    expect(replyMessageMock).not.toHaveBeenCalled();
   });
 });
 
@@ -1099,7 +1056,7 @@ describe('executeScheduledTask — follow-active landing', () => {
     status: 'active', createdAt: '2026-01-01T00:00:00.000Z', lastHumanMessageAt: '2026-01-01T09:00:00.000Z',
   });
 
-  it('a moved landing point inside the creator chat is in-thread: banner there, no notice to the old topic', async () => {
+  it('a moved landing point inside the creator chat is in-thread: banner there, no cross-thread treatment', async () => {
     findActiveThreadSessionsByChatMock.mockImplementation(() => [humanHeld(ROOT)]);
     const active = new Map<string, DaemonSession>();
     await executeScheduledTask(baseTask({
@@ -1114,20 +1071,20 @@ describe('executeScheduledTask — follow-active landing', () => {
     expect(active.get(sessionKey(ROOT, APP))?.session.rootMessageId).toBe(ROOT);
   });
 
-  it('control: the same shape without followActive is cross-thread — notice to the creator topic, no banner', async () => {
+  it('control: the same shape without followActive is cross-thread — no banner in the target topic, no creator notice', async () => {
     const active = new Map<string, DaemonSession>();
     await executeScheduledTask(baseTask({
       rootMessageId: ROOT, scope: 'thread', executionPosition: 'topic',
       creatorChatId: CHAT, creatorRootMessageId: 'om_creator_root',
     }), active, refreshCliVersion);
 
-    await vi.waitFor(() => {
-      expect(replyMessageMock).toHaveBeenCalledWith(APP, 'om_creator_root', expect.any(String), 'text', true);
-    });
-    expect(replyMessageMock.mock.calls.map(c => c[1])).not.toContain(ROOT);
+    expect(active.get(sessionKey(ROOT, APP))?.session.rootMessageId).toBe(ROOT);
+    // Let a reintroduced fire-and-forget creator notice land before asserting.
+    await new Promise(r => setTimeout(r, 20));
+    expect(replyMessageMock).not.toHaveBeenCalled();
   });
 
-  it('a follow-active task created from another chat still notifies its creator there', async () => {
+  it('a follow-active task created from another chat fires there without a creator notice', async () => {
     findActiveThreadSessionsByChatMock.mockImplementation(() => [humanHeld(ROOT)]);
     const active = new Map<string, DaemonSession>();
     await executeScheduledTask(baseTask({
@@ -1135,10 +1092,10 @@ describe('executeScheduledTask — follow-active landing', () => {
       creatorChatId: 'oc_creator_chat', creatorRootMessageId: 'om_creator_root',
     }), active, refreshCliVersion);
 
-    await vi.waitFor(() => {
-      expect(replyMessageMock).toHaveBeenCalledWith(APP, 'om_creator_root', expect.any(String), 'text', true);
-    });
     expect(active.get(sessionKey(ROOT, APP))).toBeTruthy();
+    // Let a reintroduced fire-and-forget creator notice land before asserting.
+    await new Promise(r => setTimeout(r, 20));
+    expect(replyMessageMock).not.toHaveBeenCalled();
   });
 
   it('a bot-only landing point yields to the topic where a human is: fires there and persists it', async () => {

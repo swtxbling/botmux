@@ -30,6 +30,11 @@ function normalizeRecord(sessionId: string, raw: unknown): SessionOwnerReminderR
   for (const key of ['lastRemindedAt', 'retryAfterAt'] as const) {
     if (Number.isFinite(value[key])) record[key] = value[key] as number;
   }
+  // Persisted @-mention budget for the current cycle: without it a restart would
+  // reset the count and resume pinging the owner forever.
+  if (Number.isInteger(value.mentionCount) && (value.mentionCount as number) >= 0) {
+    record.mentionCount = value.mentionCount as number;
+  }
   return record;
 }
 
