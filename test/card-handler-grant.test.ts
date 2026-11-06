@@ -466,3 +466,52 @@ describe('card-handler grant actions — request card forwarded to the approver 
     expect(sendMock).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * 申请卡待批期间暂存的机器人消息：管理员批准后，原消息在前、暂存消息按到达顺序跟在后，
+ * 一次交给 replayGrantedMessages 串行重放；拒绝路径不重放。
+ */
+describe('card-handler grant replay — messages held while the card was pending', () => {
+  const event = (id: string) => ({
+    message: { message_id: id, chat_id: 'oc_1', chat_type: 'group', content: `{"text":"task ${id}"}` },
+    sender: { sender_id: { open_id: 'ou_g' }, sender_type: 'bot' },
+  });
+
+  it('approval replays the original message then the held ones, in arrival order', async () => {
+    const { pending, handler } = await fresh();
+    const first = event('om_1');
+    const nonce = pending.openPending('h1', 'oc_1', 'ou_g', 3, first, 60 * 60 * 1000);
+    pending.markPendingDelivered('h1', 'oc_1', ['ou_g'], nonce);
+    expect(pending.queuePendingMessage('h1', 'oc_1', 'ou_g', event('om_2'))).toBe('queued');
+    expect(pending.queuePendingMessage('h1', 'oc_1', 'ou_g', event('om_3'))).toBe('queued');
+
+    const replayGrantedMessages = vi.fn();
+    const res = await handler.handleCardAction(
+      action('grant_chat', { nonce }, 'om_card'),
+      { ...deps, replayGrantedMessages },
+      'h1',
+    );
+    expect(res?.toast).toBeUndefined();
+    expect(replayGrantedMessages).toHaveBeenCalledTimes(1);
+    const [messages, app] = replayGrantedMessages.mock.calls[0]!;
+    expect(app).toBe('h1');
+    expect(messages.map((m: any) => m.message.message_id)).toEqual(['om_1', 'om_2', 'om_3']);
+  });
+
+  it('denial replays nothing and the held messages are gone', async () => {
+    const { pending, handler } = await fresh();
+    const nonce = pending.openPending('h1', 'oc_1', 'ou_g', 3, event('om_1'), 60 * 60 * 1000);
+    pending.markPendingDelivered('h1', 'oc_1', ['ou_g'], nonce);
+    pending.queuePendingMessage('h1', 'oc_1', 'ou_g', event('om_2'));
+
+    const replayGrantedMessages = vi.fn();
+    const replayGrantedMessage = vi.fn();
+    await handler.handleCardAction(
+      action('grant_deny', { nonce }, 'om_card'),
+      { ...deps, replayGrantedMessages, replayGrantedMessage },
+      'h1',
+    );
+    expect(replayGrantedMessages).not.toHaveBeenCalled();
+    expect(replayGrantedMessage).not.toHaveBeenCalled();
+  });
+});
