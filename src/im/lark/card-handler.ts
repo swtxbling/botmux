@@ -172,6 +172,9 @@ export interface CardHandlerDeps {
   scheduleIdentityClaimCardAction?: (data: CardActionData, larkAppId: string) => Promise<any>;
   /** 授权成功后重放之前被拦截的消息，让用户无需再 @ 一遍。 */
   replayGrantedMessage?: (data: any, larkAppId: string) => void;
+  /** 同上，但一次交一批：申请卡待批期间暂存的后续消息按到达顺序重放，必须逐条串行处理，
+   *  否则异步路由可能把第 3 条排到第 2 条前面。未接线时退回逐条调用 replayGrantedMessage。 */
+  replayGrantedMessages?: (datas: any[], larkAppId: string) => void;
   /** 把 passthrough 命令（如 /compact）透传到仍存活的会话。由 daemon 接线到
    *  deliverPassthroughToExistingSession（raw_input 透传，含完整 turn 绑定/卡片冻结/
    *  turn-starting 逻辑）。未接线时 compact_session 走 unsupported toast 兜底。 */
@@ -1857,10 +1860,22 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         .catch(err => logger.error(`grant post-callback background tasks failed: ${err}`));
     }
     // 授权成功后重放触发本次申请的原始消息，用户无需再 @ 一遍。
-    // replayGrantedMessage 内部异步执行（setImmediate），不阻塞 callback 响应。
-    if (pendingMessage && deps.replayGrantedMessage) {
+    // 卡片待批期间暂存的后续消息（bot 发送方，见 maybeSendGrantRequestCard 的 holdWhileThrottled）
+    // 排在它后面依序重放；replayGrantedMessages 内部串行处理，保证到达顺序。
+    // 重放是异步的（setImmediate），不阻塞 callback 响应。
+    const replayMessages = [
+      ...(pendingMessage !== undefined ? [pendingMessage] : []),
+      ...(claim.queuedMessages ?? []),
+    ];
+    if (claim.queuedMessages?.length) {
+      logger.info(`[grant:${larkAppId}] replaying ${claim.queuedMessages.length} held message(s) after approval in ${grantChatId.substring(0, 12)}`);
+    }
+    if (replayMessages.length > 0) {
       try {
-        deps.replayGrantedMessage(pendingMessage, larkAppId);
+        if (deps.replayGrantedMessages) deps.replayGrantedMessages(replayMessages, larkAppId);
+        else if (deps.replayGrantedMessage) {
+          for (const msg of replayMessages) deps.replayGrantedMessage(msg, larkAppId);
+        }
       } catch (err) {
         logger.warn(`replay granted message failed (grant still applied): ${err}`);
       }

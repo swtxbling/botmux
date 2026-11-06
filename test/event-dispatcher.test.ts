@@ -251,7 +251,7 @@ import {
 } from '../src/vc-agent/push-source.js';
 // grant-pending is a real (unmocked) module-level table; reset it per test so the
 // grant-card throttle state never leaks across cases (it backs the @blocked card path).
-import { getPendingGrantLimits, _resetForTest as _resetGrantPending } from '../src/im/lark/grant-pending.js';
+import { claimPendingGrant, getPendingGrantLimits, _resetForTest as _resetGrantPending } from '../src/im/lark/grant-pending.js';
 import { localeForBot, t } from '../src/i18n/index.js';
 import { hasTriggeredMessage } from '../src/services/triggered-message-store.js';
 import { logger } from '../src/utils/logger.js';
@@ -10010,6 +10010,58 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic,
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
     // 同 (chat, sender) 在节流窗口内只发一次卡（isThrottled 复用人分支同款节流表）
     expect(mockReplyMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('暂存的机器人消息在授权后按到达顺序重放，且不被 receive 路径的 seen 去重吞掉', async () => {
+    // 端到端-ish：走真实 receive 入口 → 陌生 bot 第 1 条发卡（带 pending messageData）、
+    // 第 2 条因节流被暂存 → 模拟管理员批准（claim + 写 chatGrants）→ replayMessageEvents
+    // 逐条重放。两条 message_id 在首次到达时都已被 receive 路径 claim，重放必须绕过
+    // seen-message 去重才能真的进 handler；同时必须串行，否则第 2 条会插到第 1 条前面。
+    setupAutoTopicBotSender(true, false);
+    const e1 = makeBotTopicSeed('msg-bot-hold-1', 'chat-bot-hold');
+    const e2 = makeBotTopicSeed('msg-bot-hold-2', 'chat-bot-hold');
+
+    await capturedHandlers['im.message.receive_v1'](e1);
+    await flushEventWork();
+    await capturedHandlers['im.message.receive_v1'](e2);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(mockReplyMessage).toHaveBeenCalledTimes(1);
+
+    // 从授权卡按钮的 value 里取出 nonce（卡片是 JSON 字符串，value 本身又被转义成字符串）。
+    const cardJson = String(mockReplyMessage.mock.calls[0]![2]);
+    const nonce = cardJson.match(/nonce[^0-9a-z]{1,12}([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/)?.[1];
+    expect(nonce).toBeTruthy();
+
+    // 管理员的批准动作：核销 pending（第一条是 messageData，第二条在 queuedMessages 里）。
+    const claim = claimPendingGrant(MY_APP_ID, 'chat-bot-hold', [OTHER_BOT_OPEN_ID], nonce!);
+    expect(claim.ok).toBe(true);
+    expect(claim.messageData?.message?.message_id).toBe('msg-bot-hold-1');
+    expect((claim.queuedMessages ?? []).map((m: any) => m.message.message_id)).toEqual(['msg-bot-hold-2']);
+
+    // 授权真实落库后就读这个字段（event-dispatcher 的 hasChatGrant）。
+    mockGetBot().config.chatGrants = { 'chat-bot-hold': [OTHER_BOT_OPEN_ID] };
+
+    // 把第 1 条的重放卡住：串行实现下第 2 条必须等它结束（并发实现会先跑到 handler）。
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    handlers.handleNewTopic.mockImplementationOnce(async () => { await gate; });
+
+    handlers.replayMessageEvents!([claim.messageData, ...(claim.queuedMessages ?? [])]);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledTimes(1);
+    expect(handlers.handleNewTopic.mock.calls[0]![0].message.message_id).toBe('msg-bot-hold-1');
+    // 重放走的是完整准入路径：放行后不再弹第二张卡。
+    expect(mockReplyMessage).toHaveBeenCalledTimes(1);
+
+    release();
+    await flushEventWork();
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic.mock.calls.map(c => c[0].message.message_id))
+      .toEqual(['msg-bot-hold-1', 'msg-bot-hold-2']);
   });
 
   it('open 模式（空 allowlist，默认态）陌生 bot 开新话题（未 @）→ 自动开工（open 腿放行，无需授权卡）', async () => {

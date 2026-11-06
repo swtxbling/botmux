@@ -39,6 +39,9 @@ const PRUNE_INTERVAL_MS = 60 * 1000;
 const FILE_PREFIX = 'grant-pending-';
 const FILE_SUFFIX = '.json';
 const FILE_VERSION = 1;
+/** 卡片待批期间同一发送方（机器人）后续消息的暂存上限：批准后依序重放，拒绝 / 过期时整队丢弃并记日志。
+ *  按 (chat,target) 计，超出上限的消息照旧丢弃（有日志），不会把 pending 撑成无限队列。 */
+export const MAX_QUEUED_GRANT_MESSAGES = 20;
 
 type Entry = {
   state: 'pending' | 'denied';
@@ -47,6 +50,9 @@ type Entry = {
   quota?: number;
   durationMs?: number;
   messageData?: any;
+  /** 卡片待批期间同一发送方又来、被节流挡下的消息（按到达顺序）。只有 pending 才可能有；
+   *  跟 pending 一起落盘，管理员重启后才点卡也能依序重放。 */
+  queuedMessages?: any[];
   /** 卡片已确认送达。只有送达的 pending 才落盘（denied 不看这个字段）。 */
   delivered?: boolean;
   /** 卡片作为申请人那条消息的回复发在原会话里：卡片本身就写着在等管理员处理，申请人看得见，
@@ -79,6 +85,17 @@ function isPersisted(e: Entry): boolean {
   return e.state === 'denied' || e.delivered === true;
 }
 
+/** 丢掉暂存消息时记一条 info：拒绝 / 过期 / 被新卡覆盖都会让它们永远不重放，
+ *  这是排查「bot 说发出去了、接收方没执行」的唯一线索。计数为 0 时静默。 */
+function logQueueDrop(larkAppId: string, k: string, e: Entry | undefined, reason: string): void {
+  const n = e?.queuedMessages?.length ?? 0;
+  if (n === 0) return;
+  const sep = k.indexOf(':');
+  const chatId = sep >= 0 ? k.slice(0, sep) : k;
+  const target = sep >= 0 ? k.slice(sep + 1) : '';
+  logger.info(`[grant:${larkAppId}] dropping ${n} held message(s) from ${target.substring(0, 12) || '?'} in ${chatId.substring(0, 12)}: ${reason}`);
+}
+
 /** 磁盘条目 → 内存条目；形状不对返回 null（整条丢弃）。 */
 function parseEntry(raw: unknown): Entry | null {
   if (!isJsonObject(raw)) return null;
@@ -97,6 +114,11 @@ function parseEntry(raw: unknown): Entry | null {
   if (shownToRequester === true) e.shownToRequester = true;
   // 重放用的原始消息只是锦上添花：坏了就不重放，卡片照样能点。
   if (isJsonObject(messageData)) e.messageData = messageData;
+  const queued = raw.queuedMessages;
+  if (Array.isArray(queued)) {
+    const valid = queued.filter(isJsonObject).slice(0, MAX_QUEUED_GRANT_MESSAGES);
+    if (valid.length > 0) e.queuedMessages = valid;
+  }
   return e;
 }
 
@@ -119,6 +141,7 @@ function load(larkAppId: string): Map<string, Entry> {
     const e = parseEntry(raw);
     if (!e) { malformed++; continue; }
     if (!isExpired(e, now)) map.set(k, e);
+    else logQueueDrop(larkAppId, k, e, 'expired before recovery after restart');
   }
   if (malformed > 0) logger.warn(`[grant-pending:${larkAppId}] dropped ${malformed} malformed entries from ${path}`);
   return map;
@@ -147,6 +170,7 @@ function serialize(map: Map<string, Entry>, withMessageData: boolean): string {
           quota: e.quota,
           durationMs: e.durationMs,
           ...(e.shownToRequester ? { shownToRequester: true } : {}),
+          ...(e.queuedMessages?.length ? { queuedMessages: e.queuedMessages } : {}),
           ...(withMessageData && e.messageData !== undefined ? { messageData: e.messageData } : {}),
         };
   }
@@ -228,9 +252,12 @@ export type PendingWriteResult = 'ok' | 'stale' | 'unsaved';
 function pruneStale(now: number): void {
   if (now - lastPrunedAt < PRUNE_INTERVAL_MS) return;
   lastPrunedAt = now;
-  for (const map of tables.values()) {
+  for (const [larkAppId, map] of tables) {
     for (const [k, e] of map) {
-      if (isExpired(e, now)) map.delete(k);
+      if (isExpired(e, now)) {
+        logQueueDrop(larkAppId, k, e, 'pending expired without a decision');
+        map.delete(k);
+      }
     }
   }
   pruneOwnerDmSent(now);
@@ -274,6 +301,7 @@ export function openPendingMulti(
     const k = key(chatId, target);
     const prev = map.get(k);
     if (prev && isPersisted(prev)) replacedPersisted = true;
+    if (prev?.state === 'pending') logQueueDrop(larkAppId, k, prev, 'replaced by a new request card');
     map.set(k, { state: 'pending', nonce, ts, quota, durationMs, messageData });
   }
   // 盘上可能残留旧 nonce 时也趁这次写一遍，别等到处置时才撤（期间重启的话旧卡会复活）。
@@ -352,6 +380,9 @@ export type PendingClaim =
       quota?: number;
       durationMs?: number;
       messageData?: any;
+      /** 待批期间同一发送方被节流挡下、暂存在这条 pending 上的消息（按到达顺序）。
+       *  批准后由调用方在 messageData 之后依序重放。 */
+      queuedMessages?: any[];
       /** 授权全部落库失败时调用：把 pending 放回去，管理员可以再点原卡重试。 */
       restore: () => void;
     }
@@ -381,11 +412,15 @@ export function claimPendingGrant(
     return { ok: false, reason: 'unsaved' };
   }
   const first = claimed[0]!;
+  // 多目标卡（owner 一次 /grant 多个目标）每个 target 各有一条 entry：按 target 顺序
+  // 摊平各自暂存的消息，不能只取第一个 target，否则其余 target 的暂存消息无声消失。
+  const queuedMessages = claimed.flatMap(e => e.queuedMessages ?? []);
   return {
     ok: true,
     quota: first.quota,
     durationMs: first.durationMs,
     messageData: first.messageData,
+    ...(queuedMessages.length ? { queuedMessages } : {}),
     restore: () => {
       let restored = false;
       keys.forEach((k, i) => {
@@ -405,6 +440,28 @@ export function getPendingMessage(larkAppId: string, chatId: string, target: str
   return e && e.state === 'pending' ? e.messageData : undefined;
 }
 
+/** 待批期间同一条发送方又来消息（机器人路径，见 event-dispatcher 的 holdWhileThrottled）：
+ *  按到达顺序挂到这张 pending 上，批准后依序重放；拒绝 / 过期时整队丢弃并记日志。
+ *  返回 'no_pending'（已处置 / 已拒绝）、'duplicate'（同 message_id 已在队里）、
+ *  'full'（达到 MAX_QUEUED_GRANT_MESSAGES）表示没入队，调用方按「仍然丢了」记日志。 */
+export function queuePendingMessage(
+  larkAppId: string, chatId: string, target: string, messageData: any,
+): 'queued' | 'no_pending' | 'duplicate' | 'full' {
+  const map = tableFor(larkAppId);
+  const e = map.get(key(chatId, target));
+  if (!e || e.state !== 'pending') return 'no_pending';
+  const q = e.queuedMessages ?? (e.queuedMessages = []);
+  // 同一条事件被再次投递（飞书 at-least-once）时不重复入队，否则批准后会执行两次。
+  const messageId = messageData?.message?.message_id;
+  if (messageId && q.some(m => m?.message?.message_id === messageId)) return 'duplicate';
+  if (q.length >= MAX_QUEUED_GRANT_MESSAGES) return 'full';
+  q.push(messageData);
+  // pending 尚未确认送达时不落盘（markPendingDelivered 会连同队列一起写）；
+  // 已送达的卡必须把新入队的消息写下去，否则重启后卡片还在、消息没了。
+  if (isPersisted(e)) persist(larkAppId, false);
+  return 'queued';
+}
+
 /** 卡片处置前校验：必须仍 pending 且 nonce 匹配。 */
 export function checkNonce(larkAppId: string, chatId: string, target: string, nonce: string): boolean {
   const e = tableFor(larkAppId).get(key(chatId, target));
@@ -422,6 +479,7 @@ export function clearPending(larkAppId: string, chatId: string, target: string):
     map.set(k, prev);
     return false;
   }
+  logQueueDrop(larkAppId, k, prev, 'request card withdrawn before it was delivered');
   return true;
 }
 
@@ -444,6 +502,9 @@ export function denyPending(larkAppId: string, chatId: string, targets: string[]
       else map.delete(k);
     });
     return false;
+  }
+  for (let i = 0; i < keys.length; i++) {
+    if (prev[i]?.state === 'pending') logQueueDrop(larkAppId, keys[i]!, prev[i], 'request denied by the admin');
   }
   return true;
 }
@@ -485,6 +546,7 @@ export function throttleReason(
   // 落了盘，daemon 重启也清不掉），单一发送方反复 @ 会被永久静默压死、owner 永远看不到卡片。
   // 冷却已过的 denied 不再节流，且无任何用途 → 顺手删除，避免「每个被拒用户」永久占位。
   if (!isExpired(e, Date.now())) return e.state;
+  logQueueDrop(larkAppId, k, e, 'pending expired without a decision');
   map.delete(k);
   return null;
 }
