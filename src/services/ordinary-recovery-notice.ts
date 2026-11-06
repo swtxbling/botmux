@@ -74,6 +74,23 @@ export function isRecoveryRetryTurnId(turnId: string | undefined): turnId is str
 
 export type RecoveryNoticeDeliveryState = 'pending' | 'delivered' | 'abandoned' | 'skipped';
 
+/** Delivery bookkeeping shared by every notice the durable outbox sends (the
+ *  recovery card and the ordinary turn notices in `turn-notice.ts`). */
+export interface RecoveryNoticeDelivery {
+  state: RecoveryNoticeDeliveryState;
+  attempts: number;
+  /** Stable Feishu message uuid: a retried send after an unconfirmed one is
+   *  de-duplicated by Feishu instead of posting a second card. */
+  uuid: string;
+  nextAttemptAt?: number;
+  deliveredAt?: number;
+  messageId?: string;
+  lastError?: string;
+  /** First failed send whose outcome is unknown (it may have landed). From
+   *  then on retries stay inside Feishu's uuid de-duplication window. */
+  uncertainSince?: number;
+}
+
 export interface OrdinaryRecoveryNoticeRecord {
   logicalTurnId: string;
   /** Epoch ms the recovery settled as failed (= notice created). */
@@ -90,20 +107,7 @@ export interface OrdinaryRecoveryNoticeRecord {
   task?: string;
   /** Re-delivery material. Absent ⇒ the card offers no retry button. */
   retry?: { cliInput: string; trustedCaller: TrustedCaller };
-  delivery: {
-    state: RecoveryNoticeDeliveryState;
-    attempts: number;
-    /** Stable Feishu message uuid: a retried send after an unconfirmed one is
-     *  de-duplicated by Feishu instead of posting a second card. */
-    uuid: string;
-    nextAttemptAt?: number;
-    deliveredAt?: number;
-    messageId?: string;
-    lastError?: string;
-    /** First failed send whose outcome is unknown (it may have landed). From
-     *  then on retries stay inside Feishu's uuid de-duplication window. */
-    uncertainSince?: number;
-  };
+  delivery: RecoveryNoticeDelivery;
   /** Set once the card's retry button re-delivered the message. */
   retried?: {
     byOpenId: string;
@@ -198,7 +202,7 @@ export function recoveryNoticeRetryDelayMs(attempts: number): number {
   return RECOVERY_NOTICE_RETRY_DELAYS_MS[index]!;
 }
 
-export function recoveryNoticeExpired(record: OrdinaryRecoveryNoticeRecord, now: number): boolean {
+export function recoveryNoticeExpired(record: DurableNoticeRecord, now: number): boolean {
   return now - record.createdAt > RECOVERY_NOTICE_MAX_AGE_MS;
 }
 
@@ -367,28 +371,38 @@ export function recoveryRetryPermitted(input: {
 
 // ─── Outbox ──────────────────────────────────────────────────────────────────
 
+/** The outbox's minimum view of a record: the age cutoff and the delivery
+ *  bookkeeping. The dedup key lives outside the record shape (`keyOf`) so the
+ *  same outbox can deliver recovery cards and ordinary turn notices. */
+export interface DurableNoticeRecord {
+  createdAt: number;
+  delivery: RecoveryNoticeDelivery;
+}
+
 /** One session's view of its notice records. `update` must re-read the record
  *  from the live session (the session store refreshes nested objects on every
  *  write), apply the mutation, persist, and return the fresh record. */
-export interface RecoveryNoticeHost {
+export interface RecoveryNoticeHost<TRecord extends DurableNoticeRecord = OrdinaryRecoveryNoticeRecord> {
   readonly key: string;
-  list(): readonly OrdinaryRecoveryNoticeRecord[];
+  list(): readonly TRecord[];
   update(
-    logicalTurnId: string,
-    mutate: (record: OrdinaryRecoveryNoticeRecord) => void,
-  ): OrdinaryRecoveryNoticeRecord | undefined;
-  /** Post the card; resolves with the Feishu message id, rejects on failure. */
-  send(record: OrdinaryRecoveryNoticeRecord): Promise<string | undefined>;
+    recordKey: string,
+    mutate: (record: TRecord) => void,
+  ): TRecord | undefined;
+  /** Post the notice; resolves with the Feishu message id, rejects on failure. */
+  send(record: TRecord): Promise<string | undefined>;
   /** False while the session cannot post (closed / replaced); the record stays
    *  pending and the next attach resumes it. */
   canDeliver(): boolean;
 }
 
-export interface RecoveryNoticeOutboxDeps<TTimer = unknown> {
+export interface RecoveryNoticeOutboxDeps<TTimer = unknown, TRecord extends DurableNoticeRecord = OrdinaryRecoveryNoticeRecord> {
   schedule: (delayMs: number, run: () => void) => TTimer;
   cancel: (timer: TTimer) => void;
   now?: () => number;
   log?: (level: 'info' | 'warn' | 'error', message: string) => void;
+  /** Stable dedup key of a record inside its session's list. */
+  keyOf: (record: TRecord) => string;
 }
 
 function errorText(error: unknown): string {
@@ -396,19 +410,19 @@ function errorText(error: unknown): string {
   return text.length > 200 ? `${text.slice(0, 200)}…` : text;
 }
 
-export class RecoveryNoticeOutbox<TTimer = unknown> {
+export class RecoveryNoticeOutbox<TTimer = unknown, TRecord extends DurableNoticeRecord = OrdinaryRecoveryNoticeRecord> {
   private readonly timers = new Map<string, TTimer>();
   private readonly inFlight = new Set<string>();
   private readonly now: () => number;
 
-  constructor(private readonly deps: RecoveryNoticeOutboxDeps<TTimer>) {
+  constructor(private readonly deps: RecoveryNoticeOutboxDeps<TTimer, TRecord>) {
     this.now = deps.now ?? (() => Date.now());
   }
 
   /** Attempt delivery of one pending record now. */
-  deliver(host: RecoveryNoticeHost, logicalTurnId: string): Promise<void> {
-    this.clearTimer(host.key, logicalTurnId);
-    return this.attempt(host, logicalTurnId);
+  deliver(host: RecoveryNoticeHost<TRecord>, recordKey: string): Promise<void> {
+    this.clearTimer(host.key, recordKey);
+    return this.attempt(host, recordKey);
   }
 
   /** Re-arm every pending record of a (re)attached session at its persisted
@@ -416,14 +430,15 @@ export class RecoveryNoticeOutbox<TTimer = unknown> {
    *  existing timer is replaced so it always runs against the latest host (a
    *  timer armed for a replaced session object would otherwise find it unable
    *  to deliver and stop). */
-  resume(host: RecoveryNoticeHost): void {
+  resume(host: RecoveryNoticeHost<TRecord>): void {
     for (const record of host.list()) {
       if (record.delivery.state !== 'pending') continue;
-      const key = this.keyOf(host.key, record.logicalTurnId);
+      const recordKey = this.deps.keyOf(record);
+      const key = this.keyOf(host.key, recordKey);
       if (this.inFlight.has(key)) continue;
-      this.clearTimer(host.key, record.logicalTurnId);
+      this.clearTimer(host.key, recordKey);
       const delayMs = Math.max(0, (record.delivery.nextAttemptAt ?? this.now()) - this.now());
-      this.arm(host, record.logicalTurnId, delayMs);
+      this.arm(host, recordKey, delayMs);
     }
   }
 
@@ -436,59 +451,59 @@ export class RecoveryNoticeOutbox<TTimer = unknown> {
     }
   }
 
-  private keyOf(hostKey: string, logicalTurnId: string): string {
-    return `${hostKey}\u0000${logicalTurnId}`;
+  private keyOf(hostKey: string, recordKey: string): string {
+    return `${hostKey}\u0000${recordKey}`;
   }
 
-  private clearTimer(hostKey: string, logicalTurnId: string): void {
-    const key = this.keyOf(hostKey, logicalTurnId);
+  private clearTimer(hostKey: string, recordKey: string): void {
+    const key = this.keyOf(hostKey, recordKey);
     const timer = this.timers.get(key);
     if (timer !== undefined) this.deps.cancel(timer);
     this.timers.delete(key);
   }
 
-  private arm(host: RecoveryNoticeHost, logicalTurnId: string, delayMs: number): void {
-    const key = this.keyOf(host.key, logicalTurnId);
+  private arm(host: RecoveryNoticeHost<TRecord>, recordKey: string, delayMs: number): void {
+    const key = this.keyOf(host.key, recordKey);
     this.timers.set(key, this.deps.schedule(delayMs, () => {
       this.timers.delete(key);
-      void this.attempt(host, logicalTurnId);
+      void this.attempt(host, recordKey);
     }));
   }
 
   private safeUpdate(
-    host: RecoveryNoticeHost,
-    logicalTurnId: string,
-    mutate: (record: OrdinaryRecoveryNoticeRecord) => void,
-  ): OrdinaryRecoveryNoticeRecord | undefined {
+    host: RecoveryNoticeHost<TRecord>,
+    recordKey: string,
+    mutate: (record: TRecord) => void,
+  ): TRecord | undefined {
     try {
-      return host.update(logicalTurnId, mutate);
+      return host.update(recordKey, mutate);
     } catch (error) {
-      this.deps.log?.('error', `recovery notice ${logicalTurnId.slice(0, 16)}: persist failed: ${errorText(error)}`);
+      this.deps.log?.('error', `recovery notice ${recordKey.slice(0, 16)}: persist failed: ${errorText(error)}`);
       return undefined;
     }
   }
 
-  private async attempt(host: RecoveryNoticeHost, logicalTurnId: string): Promise<void> {
-    const key = this.keyOf(host.key, logicalTurnId);
+  private async attempt(host: RecoveryNoticeHost<TRecord>, recordKey: string): Promise<void> {
+    const key = this.keyOf(host.key, recordKey);
     if (this.inFlight.has(key)) return;
-    const record = host.list().find(entry => entry.logicalTurnId === logicalTurnId);
+    const record = host.list().find(entry => this.deps.keyOf(entry) === recordKey);
     if (!record || record.delivery.state !== 'pending') return;
     const now = this.now();
     if (recoveryNoticeExpired(record, now)) {
-      this.safeUpdate(host, logicalTurnId, entry => {
+      this.safeUpdate(host, recordKey, entry => {
         if (entry.delivery.state === 'pending') entry.delivery.state = 'abandoned';
       });
-      this.deps.log?.('warn', `recovery notice ${logicalTurnId.slice(0, 16)} abandoned after `
+      this.deps.log?.('warn', `recovery notice ${recordKey.slice(0, 16)} abandoned after `
         + `${record.delivery.attempts} attempt(s): delivery window closed`);
       return;
     }
     const uncertainSince = record.delivery.uncertainSince;
     if (uncertainSince !== undefined && now - uncertainSince > RECOVERY_NOTICE_UUID_WINDOW_MS) {
       // A retry now could post a second card next to one that already landed.
-      this.safeUpdate(host, logicalTurnId, entry => {
+      this.safeUpdate(host, recordKey, entry => {
         if (entry.delivery.state === 'pending') entry.delivery.state = 'abandoned';
       });
-      this.deps.log?.('warn', `recovery notice ${logicalTurnId.slice(0, 16)} abandoned after `
+      this.deps.log?.('warn', `recovery notice ${recordKey.slice(0, 16)} abandoned after `
         + `${record.delivery.attempts} attempt(s): an earlier send may have landed and Feishu's `
         + 'de-duplication window has closed');
       return;
@@ -510,7 +525,7 @@ export class RecoveryNoticeOutbox<TTimer = unknown> {
           return windowLeft > 0 ? Math.min(delay, windowLeft) : delay;
         };
         let delayMs = 0;
-        this.safeUpdate(host, logicalTurnId, entry => {
+        this.safeUpdate(host, recordKey, entry => {
           if (entry.delivery.state !== 'pending') return;
           entry.delivery.attempts += 1;
           entry.delivery.lastError = errorText(error);
@@ -521,13 +536,13 @@ export class RecoveryNoticeOutbox<TTimer = unknown> {
         if (delayMs === 0) {
           delayMs = planDelay(record.delivery.attempts + 1, record.delivery.uncertainSince ?? (uncertain ? failedAt : undefined));
         }
-        this.deps.log?.('warn', `recovery notice ${logicalTurnId.slice(0, 16)} not delivered `
+        this.deps.log?.('warn', `recovery notice ${recordKey.slice(0, 16)} not delivered `
           + `(${errorText(error)}); retrying in ${Math.round(delayMs / 1000)}s`);
-        this.arm(host, logicalTurnId, delayMs);
+        this.arm(host, recordKey, delayMs);
         return;
       }
       const deliveredAt = this.now();
-      this.safeUpdate(host, logicalTurnId, entry => {
+      this.safeUpdate(host, recordKey, entry => {
         entry.delivery.state = 'delivered';
         entry.delivery.attempts += 1;
         entry.delivery.deliveredAt = deliveredAt;
@@ -535,7 +550,7 @@ export class RecoveryNoticeOutbox<TTimer = unknown> {
         entry.delivery.lastError = undefined;
         if (messageId) entry.delivery.messageId = messageId;
       });
-      this.deps.log?.('info', `recovery notice ${logicalTurnId.slice(0, 16)} delivered`);
+      this.deps.log?.('info', `recovery notice ${recordKey.slice(0, 16)} delivered`);
     } finally {
       this.inFlight.delete(key);
     }

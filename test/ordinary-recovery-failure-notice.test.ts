@@ -89,7 +89,7 @@ function daemonProcess(opts: {
 }) {
   const { clock, session, store } = opts;
   const persist = () => { store.row = structuredClone(session); };
-  const outbox = new RecoveryNoticeOutbox<number>({ schedule: clock.schedule, cancel: clock.cancel, now: clock.now });
+  const outbox = new RecoveryNoticeOutbox<number>({ schedule: clock.schedule, cancel: clock.cancel, now: clock.now, keyOf: record => record.logicalTurnId });
   const host: RecoveryNoticeHost = {
     key: session.sessionId,
     list: () => session.ordinaryRecoveryNotices ?? [],
