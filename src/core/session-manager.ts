@@ -4701,8 +4701,8 @@ export async function executeScheduledTask(
   //
   // A cross-thread fire never posts back into the creator's thread: the target
   // chat/topic is where the run happens, and a per-fire "it ran over there"
-  // notice is pure noise for the owner. Repeated failures still reach them
-  // through the separate failure-alert path.
+  // notice is pure noise for the owner. Repeated failures still alert the bot
+  // admin, and reach the creator too when the task was created with --notify.
   //
   // Thread-scope (legacy and current default):
   //   - cross-thread (creator != target): deliver execution into target
