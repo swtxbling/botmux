@@ -290,7 +290,15 @@ async function dmAdminOnce(
     return false;
   }
   const delivered = await dmAdmin(larkAppId, adminOpenId, content, contextTag);
-  if (delivered) markStartupNoticeSent(dataDir, larkAppId, kind, target);
+  if (delivered) {
+    // 记账是 best-effort：磁盘写失败最坏是下次重启多发一条，绝不能因此把
+    // checkRequiredScopes 剩下的自检项（后面的权限判定）整段跳过。
+    try {
+      markStartupNoticeSent(dataDir, larkAppId, kind, target);
+    } catch (err: any) {
+      logger.warn(`[${larkAppId}] 记录「已提醒」状态失败（下次启动可能重复提醒）：${err?.message ?? err}`);
+    }
+  }
   return delivered;
 }
 
@@ -460,7 +468,14 @@ async function tryAutoFixScopes(
           `权限变更可能需要 1-2 分钟生效。如仍有问题执行 \`botmux restart\`。`,
           autoFixEffective ? `auto-fixed ${fixedList.length} scopes` : `auto-fix could not apply ${fixedList.length} scopes`,
           'scope_autofix_result',
-          startupNoticeDigest(['autofix', autoFixEffective ? 'ok' : 'partial', ...fixedList.map(s => s.name).sort()]),
+          // versionWarning 也要进摘要：权限写进了清单但版本没发布 ⟹ 权限不会生效，
+          // 「下一步该做什么」跟发布成功完全不同，是同一条提醒里的不同内容。
+          startupNoticeDigest([
+            'autofix',
+            autoFixEffective ? 'ok' : 'partial',
+            result.versionWarning ? 'warn' : 'clean',
+            ...fixedList.map(s => s.name).sort(),
+          ]),
         );
       }
       return { kind: 'fixed' };
@@ -647,12 +662,22 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
               `missing doc-feature scopes: ${missingDoc.map(s => s.name).join(',')}`,
               'docs_scopes_missing',
               startupNoticeDigest(['docs', featureLabel, ...missingDoc.map(s => s.name).sort()]));
+          } else {
+            // 没有 resolved 的管理员 open_id：这条提醒根本发不出去，不该留着任何记录
+            // （上次可能发给的是另一个已被移除的管理员）。
+            logger.warn(`[${larkAppId}] 缺 ${missingDoc.length} 项文档权限，但没有 resolved 的 admin open_id，仅记日志`);
+            clearStartupNotice(config.session.dataDir, larkAppId, 'docs_scopes_missing');
           }
         } else {
           // 权限齐了——事件订阅查不了，仅 info 记一条提醒（不 DM 免重启刷屏）。
           logger.info(`[${larkAppId}] ${featureLabel} 文档权限齐全（${docSubs.length} 绑定）；请确保后台已订阅事件 ${DOC_COMMENT_EVENT}（无法自动检测）`);
           clearStartupNotice(config.session.dataDir, larkAppId, 'docs_scopes_missing');
         }
+      } else {
+        // 一个文档订阅都没有 ⟹ 这项自检对这个 bot 不成立（跟 VC 权限那块的 else 同款）。
+        // 不清的话：退掉最后一个绑定、再重新绑上同样的文档、缺的还是同一批权限 ——
+        // 摘要一模一样，那条提醒就永远发不出去了。
+        clearStartupNotice(config.session.dataDir, larkAppId, 'docs_scopes_missing');
       }
     } catch (err: any) {
       logger.debug(`[${larkAppId}] doc-feature readiness check errored: ${err?.message ?? err}`);
@@ -857,8 +882,17 @@ export async function ensureVcMeetingEventsSubscribed(larkAppId: string): Promis
   const brand = normalizeBrand(bot.config.brand);
   // Open-platform automation only supports feishu.cn tenants. Skip apiOnly and
   // VC-inactive bots — vcMeetingAgentConfigActive fail-closes both.
-  if (brand !== 'feishu') return;
-  if (!vcMeetingAgentConfigActive(bot.config)) return;
+  // 这两种「这台 bot 根本不该订阅 VC 事件」的情况要清掉旧记录：否则关掉再打开、
+  // 失败类别还是同一类时，那条提醒就永远发不出去了（和 vc_scopes_missing 对称）。
+  // 注意 probe 不可用（登录态缺失）**不能**清 —— 那时并不知道问题还在不在。
+  if (brand !== 'feishu') {
+    clearStartupNotice(config.session.dataDir, larkAppId, 'vc_event_subscribe_failed');
+    return;
+  }
+  if (!vcMeetingAgentConfigActive(bot.config)) {
+    clearStartupNotice(config.session.dataDir, larkAppId, 'vc_event_subscribe_failed');
+    return;
+  }
   try {
     const probe = await probeVcMeetingEventSubscription(larkAppId);
     if (!probe.ok) {
