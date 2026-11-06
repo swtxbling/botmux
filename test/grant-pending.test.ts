@@ -10,15 +10,18 @@ import {
   openPendingMulti,
   checkNonce,
   clearPending,
+  claimPendingGrant,
   getPendingGrantLimits,
   getPendingMessage,
   markDenied,
   markPendingDelivered,
   isThrottled,
+  queuePendingMessage,
   throttleReason,
   updatePendingGrantLimits,
   tryReserveOwnerDmSlot,
   releaseOwnerDmSlot,
+  MAX_QUEUED_GRANT_MESSAGES,
   OWNER_DM_MAX_PER_WINDOW,
   _resetForTest,
   _simulateRestartForTest,
@@ -26,6 +29,7 @@ import {
   _filePathForTest,
   _ownerDmKeyCountForTest,
 } from '../src/im/lark/grant-pending.js';
+import { logger } from '../src/utils/logger.js';
 
 beforeEach(() => { _resetForTest(); vi.useFakeTimers(); });
 afterEach(() => vi.useRealTimers());
@@ -359,5 +363,100 @@ describe('grant-pending — survives daemon restart', () => {
     markDenied('a1', 'oc_1', 'ou_denied');
     const persisted = JSON.parse(readFileSync(_filePathForTest('a1'), 'utf-8'));
     expect(Object.keys(persisted.entries).sort()).toEqual(['oc_1:ou_denied', 'oc_1:ou_sent']);
+  });
+});
+
+// ─── 待批期间机器人消息暂存：批准后依序重放，拒绝 / 过期丢弃并记日志 ──────────────
+describe('grant-pending — held messages while a request card is pending', () => {
+  const HOUR = 60 * 60 * 1000;
+  const held = (id: string) => ({
+    message: { message_id: id, chat_id: 'oc_1', content: `{"text":"task ${id}"}` },
+    sender: { sender_id: { open_id: 'ou_bot' } },
+  });
+
+  function pendingCard(messageData = held('om_1')): string {
+    const nonce = openPending('a1', 'oc_1', 'ou_bot', 3, messageData, HOUR);
+    markPendingDelivered('a1', 'oc_1', ['ou_bot'], nonce);
+    return nonce;
+  }
+
+  it('holds later messages and returns them in arrival order when the card is approved', () => {
+    const first = held('om_1');
+    const nonce = pendingCard(first);
+    expect(queuePendingMessage('a1', 'oc_1', 'ou_bot', held('om_2'))).toBe('queued');
+    expect(queuePendingMessage('a1', 'oc_1', 'ou_bot', held('om_3'))).toBe('queued');
+
+    const claim = claimPendingGrant('a1', 'oc_1', ['ou_bot'], nonce);
+    expect(claim.ok).toBe(true);
+    if (!claim.ok) return;
+    expect(claim.messageData).toEqual(first);
+    expect(claim.queuedMessages?.map(m => m.message.message_id)).toEqual(['om_2', 'om_3']);
+  });
+
+  it('persists held messages with the card so approval after a restart still replays them', () => {
+    const nonce = pendingCard();
+    queuePendingMessage('a1', 'oc_1', 'ou_bot', held('om_2'));
+    queuePendingMessage('a1', 'oc_1', 'ou_bot', held('om_3'));
+    _simulateRestartForTest();
+
+    const claim = claimPendingGrant('a1', 'oc_1', ['ou_bot'], nonce);
+    expect(claim.ok).toBe(true);
+    if (!claim.ok) return;
+    expect(claim.queuedMessages?.map(m => m.message.message_id)).toEqual(['om_2', 'om_3']);
+  });
+
+  it('persists messages queued before the delivery ack once the ack lands', () => {
+    const nonce = openPending('a1', 'oc_1', 'ou_bot', 3, held('om_1'), HOUR);
+    expect(queuePendingMessage('a1', 'oc_1', 'ou_bot', held('om_2'))).toBe('queued');
+    markPendingDelivered('a1', 'oc_1', ['ou_bot'], nonce);
+    _simulateRestartForTest();
+    const claim = claimPendingGrant('a1', 'oc_1', ['ou_bot'], nonce);
+    expect(claim.ok).toBe(true);
+    if (!claim.ok) return;
+    expect(claim.queuedMessages?.map(m => m.message.message_id)).toEqual(['om_2']);
+  });
+
+  it('refuses to hold without a live pending card and after a denial (terminal decision)', () => {
+    expect(queuePendingMessage('a1', 'oc_1', 'ou_bot', held('om_x'))).toBe('no_pending');
+    const nonce = pendingCard();
+    markDenied('a1', 'oc_1', 'ou_bot');
+    expect(queuePendingMessage('a1', 'oc_1', 'ou_bot', held('om_y'))).toBe('no_pending');
+    expect(claimPendingGrant('a1', 'oc_1', ['ou_bot'], nonce)).toEqual({ ok: false, reason: 'stale' });
+  });
+
+  it('caps the hold queue instead of letting one sender grow it without bound', () => {
+    pendingCard();
+    for (let i = 0; i < MAX_QUEUED_GRANT_MESSAGES; i++) {
+      expect(queuePendingMessage('a1', 'oc_1', 'ou_bot', held(`om_cap_${i}`))).toBe('queued');
+    }
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => {});
+    expect(queuePendingMessage('a1', 'oc_1', 'ou_bot', held('om_overflow'))).toBe('full');
+    info.mockRestore();
+  });
+
+  it('does not hold the same message twice (at-least-once redelivery)', () => {
+    pendingCard();
+    expect(queuePendingMessage('a1', 'oc_1', 'ou_bot', held('om_dup'))).toBe('queued');
+    expect(queuePendingMessage('a1', 'oc_1', 'ou_bot', held('om_dup'))).toBe('duplicate');
+  });
+
+  it('drops held messages with an info log when the admin denies the card', () => {
+    pendingCard();
+    queuePendingMessage('a1', 'oc_1', 'ou_bot', held('om_2'));
+    queuePendingMessage('a1', 'oc_1', 'ou_bot', held('om_3'));
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => {});
+    expect(markDenied('a1', 'oc_1', 'ou_bot')).toBe(true);
+    expect(info.mock.calls.some(c => String(c[0]).includes('dropping 2 held message(s)'))).toBe(true);
+    info.mockRestore();
+  });
+
+  it('drops held messages with an info log when the pending card expires', () => {
+    pendingCard();
+    queuePendingMessage('a1', 'oc_1', 'ou_bot', held('om_2'));
+    vi.advanceTimersByTime(24 * HOUR + 1);
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => {});
+    expect(isThrottled('a1', 'oc_1', 'ou_bot')).toBe(false);
+    expect(info.mock.calls.some(c => String(c[0]).includes('dropping 1 held message(s)'))).toBe(true);
+    info.mockRestore();
   });
 });

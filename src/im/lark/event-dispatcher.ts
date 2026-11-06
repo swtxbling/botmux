@@ -60,7 +60,7 @@ import { tryHandleMentionModeCommand } from './mention-mode-command.js';
 import { isChatManager } from '../../services/chat-manager.js';
 import { tryHandleSubstituteCommand } from './substitute-command.js';
 import { buildGrantCard } from './card-builder.js';
-import { openPending, isThrottled, clearPending, markPendingDelivered, tryReserveOwnerDmSlot, releaseOwnerDmSlot, claimThrottleNotice } from './grant-pending.js';
+import { openPending, isThrottled, clearPending, markPendingDelivered, tryReserveOwnerDmSlot, releaseOwnerDmSlot, claimThrottleNotice, queuePendingMessage } from './grant-pending.js';
 import { resolveGrantApprover, resolveGrantRequestRoute, type GrantRequestRoute } from './grant-owner.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import {
@@ -2466,9 +2466,10 @@ export function canRunDaemonCommand(
  * 受 grant-pending 节流：pending 中 / deny 冷却期内不再发卡。真人路径的调用方传
  * `notifyThrottledRequester`，申请人在这期间再来找 bot 时回一句原因（同一张卡 / 同一次拒绝
  * 只回一次，见 claimThrottleNotice）；卡片就回复在申请人自己消息下面时不回（卡片本身就是说明），
- * 只有转投管理员私聊、申请人看不见卡的情况才提示「还在等」。bot 发送方不传，保持静默，免得两个
- * bot 互相回话。
- * 开放模式（无 owner）兜底不发。关了 autoGrantRequestCards 是文档写明的静默拦截，不回话。
+ * 只有转投管理员私聊、申请人看不见卡的情况才提示「还在等」。bot 发送方传 `holdWhileThrottled`：
+ * 不回话（免得两个 bot 互相回话），但把消息按到达顺序暂存到这张 pending 上，管理员批准后依序重放，
+ * 拒绝 / 过期时丢弃并记 info 日志——绝不静默丢消息。不传该选项（旧调用方）在节流命中时只记一条
+ * info 日志再返回。开放模式（无 owner）兜底不发。关了 autoGrantRequestCards 是文档写明的静默拦截，不回话。
  *
  * 默认（grantRequestToOwnerDm 未开）：卡片回复在原会话、正文 @ resolveGrantApprover 选出的管理员；
  * p2p 不发卡。开启 grantRequestToOwnerDm 后投递位置见 resolveGrantRequestRoute：会话里有管理员 →
@@ -2479,7 +2480,7 @@ export function canRunDaemonCommand(
  */
 export async function maybeSendGrantRequestCard(
   larkAppId: string, message: any, chatId: string, requesterOpenId: string | undefined, messageData?: any,
-  opts?: { notifyThrottledRequester?: boolean },
+  opts?: { notifyThrottledRequester?: boolean; holdWhileThrottled?: boolean },
 ): Promise<void> {
   // 黑名单用户静默：不弹授权申请卡、不开 pending、不触发任何回复（P1c）。
   // 必须在 autoGrantRequestCards / owner / 节流等一切判定之前短路。
@@ -2497,6 +2498,18 @@ export async function maybeSendGrantRequestCard(
   }
   if (isThrottled(larkAppId, chatId, requesterOpenId)) {
     if (opts?.notifyThrottledRequester) await replyThrottledRequester(larkAppId, message, chatId, requesterOpenId);
+    else if (opts?.holdWhileThrottled && messageData !== undefined) {
+      // 机器人发送方：不回话（避免两个 bot 互相回话），但把这条消息挂到 pending 上，
+      // 管理员批准后依序重放；拒绝 / 过期时由 grant-pending 丢弃并记日志。
+      const outcome = queuePendingMessage(larkAppId, chatId, requesterOpenId, messageData);
+      if (outcome === 'queued') {
+        logger.info(`[grant:${larkAppId}] holding message from ${requesterOpenId.substring(0, 12)} in ${chatId.substring(0, 12)} until the pending card is handled`);
+      } else if (outcome !== 'duplicate') {
+        logSilentGrantDrop(larkAppId, chatId, requesterOpenId, `throttled and hold failed (${outcome})`);
+      }
+    } else {
+      logSilentGrantDrop(larkAppId, chatId, requesterOpenId, 'throttled (no hold requested)');
+    }
     return;
   }
   const chatType: 'p2p' | 'group' = message?.chat_type === 'p2p' ? 'p2p' : 'group';
@@ -3766,6 +3779,8 @@ export interface EventHandlers {
   /** 授权成功后重放之前被拦截的消息，让用户无需再 @ 一遍。
    *  由 startLarkEventDispatcher 内部注入，daemon 的 cardDeps.replayGrantedMessage 调用。 */
   replayMessageEvent?: (data: any) => void;
+  /** 同 replayMessageEvent 的批量版：逐条串行处理，保证暂存消息按到达顺序重放。 */
+  replayMessageEvents?: (datas: any[]) => void;
 }
 
 /** 一条已通过订阅 + 触发范围 + 自触发过滤的文档评论，交给 daemon 投递。 */
@@ -5302,7 +5317,7 @@ export function createLarkEventDispatcherRuntime(
                   `[auto-start:新话题] ${chatId.substring(0, 12)} 其他机器人开新话题但未授权（restricted）→ 发授权卡不自动开工 ` +
                   `msg=${messageId.substring(0, 12)} sender=${senderOpenId?.substring(0, 12) ?? '-'}`,
                 );
-                await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data)
+                await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data, { holdWhileThrottled: true })
                   .catch(err => logger.error(`Error sending grant card for foreign-bot new topic: ${err}`));
                 return;
               }
@@ -5428,7 +5443,8 @@ export function createLarkEventDispatcherRuntime(
           } else {
             logger.info(`Foreign bot @mention not a known sibling (${sibling.reason}); sending grant request card`);
             if (primary) return ignoredUnsupportedPrimarySideEffect('grant request cards');
-            await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data);
+            // 卡片待批期间的后续消息暂存到这张 pending 上，批准后依序重放（不再静默丢弃）。
+            await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data, { holdWhileThrottled: true });
             return;
           }
         }
@@ -6277,17 +6293,34 @@ export function createLarkEventDispatcherRuntime(
    *  ignoredUnsupportedPrimarySideEffect('grant request cards')）。能走到这里的只会是 primary
    *  之前发出、落盘后跨重启恢复的旧卡：授权照常生效，申请人按授权结果卡的提示再 @ 一次即可。 */
   function replayMessageEvent(data: any): void {
+    replayMessageEvents([data]);
+  }
+  /** 批量版：一条接一条 await，前一条处理完才处理下一条。
+   *  仅靠 setImmediate 的 FIFO 只能保证「开始处理」的顺序，异步路由（查群类型、判路由）
+   *  会让后一条先走到会话投递，所以这里必须串行。 */
+  function replayMessageEvents(datas: any[]): void {
     if (runtimeOptions.enqueuePrimary) {
-      logger.info(`[grant:${larkAppId}] durable primary: not replaying granted message ${String(data?.message?.message_id ?? '').substring(0, 12)} outside the durable inbox`);
+      if (datas.length > 0) {
+        const ids = datas.map(d => String(d?.message?.message_id ?? '?').substring(0, 12)).join(',');
+        logger.warn(`[grant:${larkAppId}] durable primary: not replaying ${datas.length} granted message(s) outside the durable inbox: ${ids}`);
+      }
       return;
     }
     setImmediate(() => {
-      void processMessageEvent(data)
-        .catch(err => logger.error(`Error replaying message event after grant: ${err}`));
+      void (async () => {
+        for (const data of datas) {
+          try {
+            await processMessageEvent(data);
+          } catch (err) {
+            logger.error(`Error replaying message event after grant: ${err}`);
+          }
+        }
+      })();
     });
   }
-  // 暴露给 daemon 的 cardDeps.replayGrantedMessage 调用。
+  // 暴露给 daemon 的 cardDeps.replayGrantedMessage / replayGrantedMessages 调用。
   handlers.replayMessageEvent = replayMessageEvent;
+  handlers.replayMessageEvents = replayMessageEvents;
 
   /**
    * im.message.updated_v1 —— 用户「修改」了一条已发送消息。

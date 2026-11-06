@@ -45,6 +45,7 @@ import { registerBot, __testOnly_resetBotRegistry } from '../src/bot-registry.js
 import { maybeSendGrantRequestCard } from '../src/im/lark/event-dispatcher.js';
 import {
   isThrottled,
+  claimPendingGrant,
   markDenied,
   markPendingDelivered,
   openPending,
@@ -237,5 +238,83 @@ describe('maybeSendGrantRequestCard — notice while the request is throttled', 
       ['om_r2', 'pending'],
       ['om_r3', 'pending'],
     ]);
+  });
+});
+
+/**
+ * 机器人发送方在申请卡待批期间不再被静默丢弃：holdWhileThrottled 把消息挂到 pending 上，
+ * 批准后依序重放；对发送方仍然一句不回（否则两个 bot 会互相回话）。
+ */
+describe('maybeSendGrantRequestCard — bot senders hold their messages instead of losing them', () => {
+  const BOT = 'ou_foreign_bot';
+  const LONG = 60 * 60 * 1000;
+  const botMsg = (id: string) => ({
+    message: { message_id: id, chat_id: GROUP, chat_type: 'group', content: `{"text":"task ${id}"}` },
+    sender: { sender_id: { open_id: BOT }, sender_type: 'bot' },
+  });
+  const hold = { holdWhileThrottled: true };
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), 'botmux-grant-bot-hold-'));
+    __testOnly_resetBotRegistry();
+    _resetGrantPending();
+    clearChatMemberCache();
+    vi.mocked(replyMessage).mockReset().mockResolvedValue('om_reply');
+    vi.mocked(sendUserMessage).mockReset().mockResolvedValue('om_dm');
+    vi.mocked(listChatMemberOpenIds).mockReset().mockResolvedValue([OWNER, BOT]);
+  });
+  afterEach(() => { rmSync(tempDir, { recursive: true, force: true }); });
+
+  function deliveredSelfServiceCard(): string {
+    const nonce = openPending(APP, GROUP, BOT, 3, botMsg('om_h1'), LONG);
+    markPendingDelivered(APP, GROUP, [BOT], nonce);
+    return nonce;
+  }
+
+  it('holds the next two messages in arrival order and never answers the bot (no reply loop)', async () => {
+    registerRestrictedBot();
+    const nonce = deliveredSelfServiceCard();
+    await maybeSendGrantRequestCard(APP, groupMsg('om_h2'), GROUP, BOT, botMsg('om_h2'), hold);
+    await maybeSendGrantRequestCard(APP, groupMsg('om_h3'), GROUP, BOT, botMsg('om_h3'), hold);
+
+    // 一张卡都没再发、也没有任何回话（bot 发送方永远静默）。
+    expect(replies()).toHaveLength(0);
+    expect(sendUserMessage).not.toHaveBeenCalled();
+    const claim = claimPendingGrant(APP, GROUP, [BOT], nonce);
+    expect(claim.ok).toBe(true);
+    if (!claim.ok) return;
+    expect(claim.queuedMessages?.map(m => m.message.message_id)).toEqual(['om_h2', 'om_h3']);
+  });
+
+  it('a human sender is unchanged: gets the pending notice, nothing is held for later', async () => {
+    registerRestrictedBot();
+    const nonce = openPending(APP, GROUP, REQUESTER, 3, botMsg('om_hu1'), LONG);
+    markPendingDelivered(APP, GROUP, [REQUESTER], nonce);
+    await maybeSendGrantRequestCard(APP, groupMsg('om_hu2'), GROUP, REQUESTER, botMsg('om_hu2'), asHuman);
+    expect(replies().map(c => [c[1], c[2] === pendingText() ? 'pending' : 'other'])).toEqual([['om_hu2', 'pending']]);
+    const claim = claimPendingGrant(APP, GROUP, [REQUESTER], nonce);
+    expect(claim.ok).toBe(true);
+    if (!claim.ok) return;
+    expect(claim.queuedMessages).toBeUndefined();
+  });
+
+  it('without the hold option a throttled bot message is still not held (legacy callers stay silent)', async () => {
+    registerRestrictedBot();
+    const nonce = deliveredSelfServiceCard();
+    await maybeSendGrantRequestCard(APP, groupMsg('om_legacy'), GROUP, BOT, botMsg('om_legacy'));
+    expect(replies()).toHaveLength(0);
+    const claim = claimPendingGrant(APP, GROUP, [BOT], nonce);
+    expect(claim.ok).toBe(true);
+    if (!claim.ok) return;
+    expect(claim.queuedMessages).toBeUndefined();
+  });
+
+  it('after a denial the hold is refused (terminal decision) and the bot stays unanswered', async () => {
+    registerRestrictedBot();
+    const nonce = deliveredSelfServiceCard();
+    markDenied(APP, GROUP, BOT);
+    await maybeSendGrantRequestCard(APP, groupMsg('om_denied'), GROUP, BOT, botMsg('om_denied'), hold);
+    expect(replies()).toHaveLength(0);
+    expect(claimPendingGrant(APP, GROUP, [BOT], nonce)).toEqual({ ok: false, reason: 'stale' });
   });
 });

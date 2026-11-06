@@ -7843,6 +7843,15 @@ const cardDeps: CardHandlerDeps = {
     }
     handlers.replayMessageEvent(data);
   },
+  // 申请卡待批期间暂存的后续消息：按到达顺序逐条串行重放。
+  replayGrantedMessages: (datas, larkAppId) => {
+    const handlers = botHandlers.get(larkAppId);
+    if (!handlers?.replayMessageEvents) {
+      logger.warn(`replayGrantedMessages: no handlers/replayMessageEvents for ${larkAppId}`);
+      return;
+    }
+    handlers.replayMessageEvents(datas);
+  },
   // 卡片「🗜️ 压缩」按钮：等价于用户在话题里发 /compact——走已有的
   // deliverPassthroughToExistingSession（raw_input 透传，含完整 turn 生命周期）。
   deliverPassthroughCommand: (ds, cmd, opts) =>
