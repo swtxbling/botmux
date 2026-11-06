@@ -807,6 +807,7 @@ import {
   resolveQuotaFallbackTarget,
 } from '../services/quota-fallback.js';
 import { claimRateLimitMention, rateLimitMentionAccountKey, releaseRateLimitMention } from '../services/rate-limit-mention.js';
+import { CLAUDE_AUTH_OVERRIDE_ENV_KEYS, claudeAuthOverrideKeys } from '../services/cli-credential-source.js';
 import type {
   CliTurnPayload,
   CodexAppDeliverySink,
@@ -2409,12 +2410,44 @@ function sessionCliId(ds: DaemonSession, botCfg: { cliId: CliId }): CliId {
  * same key. undefined means "not resolvable" (unknown CLI, unbound Codex
  * instance), which keeps the @owner budget per-process instead of guessing.
  */
-function rateLimitMentionAccountKeyForSession(
+type RateLimitMentionBotConfig = {
+  cliId: CliId;
+  cliConfigDir?: string;
+  credentialsSourceDir?: string;
+  env?: Record<string, string>;
+  envUnset?: string[];
+};
+
+/** Keys that make a bot authenticate as something other than the shared login
+ *  in its config home, so the config home alone can no longer name the account. */
+const RATE_LIMIT_ACCOUNT_SPLITTING_ENV_KEYS: readonly string[] = [
+  ...CLAUDE_AUTH_OVERRIDE_ENV_KEYS,
+  'ANTHROPIC_BASE_URL',
+];
+
+/**
+ * True when the bot runs on its own credentials (credentialsSourceDir or an
+ * auth/base-url env override) instead of the CLI's shared login. Such accounts
+ * cannot be keyed by config home alone — mixing them would let account A's
+ * limit silence account B's @ — so the caller falls back to the per-process
+ * budget.
+ */
+function rateLimitMentionAccountDiffersFromSharedLogin(botCfg: RateLimitMentionBotConfig): boolean {
+  if (botCfg.credentialsSourceDir) return true;
+  if (claudeAuthOverrideKeys(botCfg.env).length > 0) return true;
+  const baseUrl = botCfg.env?.ANTHROPIC_BASE_URL;
+  if (typeof baseUrl === 'string' && baseUrl.trim()) return true;
+  const unset = new Set(botCfg.envUnset ?? []);
+  return RATE_LIMIT_ACCOUNT_SPLITTING_ENV_KEYS.some((key) => unset.has(key));
+}
+
+export function rateLimitMentionAccountKeyForSession(
   ds: DaemonSession,
-  botCfg: { cliId: CliId; cliConfigDir?: string },
+  botCfg: RateLimitMentionBotConfig,
   cliId: CliId,
 ): string | undefined {
   if (cliId === 'claude-code') {
+    if (rateLimitMentionAccountDiffersFromSharedLogin(botCfg)) return undefined;
     // Mirror the launch: a frozen session profile wins over the bot default.
     return rateLimitMentionAccountKey(cliId,
       ds.session.cliConfigDir ?? ds.initConfig?.cliConfigDir ?? botCfg.cliConfigDir ?? join(homedir(), '.claude'));

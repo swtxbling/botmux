@@ -1,7 +1,38 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+// Fault injection for the claim-file layer only; everything else passes through.
+const fsHooks = vi.hoisted(() => ({
+  onAfterRename: null as null | ((dest: string) => void),
+  failTmpWrite: false,
+  failClaimRead: false,
+}));
+
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  const isClaimFile = (p: unknown) => typeof p === 'string' && p.includes('rate-limit-mention') && p.endsWith('.json');
+  return {
+    ...actual,
+    renameSync: (from: string, to: string) => {
+      actual.renameSync(from, to);
+      fsHooks.onAfterRename?.(to);
+    },
+    writeFileSync: ((file: any, data: any, options?: any) => {
+      if (fsHooks.failTmpWrite && typeof file === 'string' && file.endsWith('.tmp')) {
+        throw Object.assign(new Error('simulated ENOSPC'), { code: 'ENOSPC' });
+      }
+      return (actual.writeFileSync as any)(file, data, options);
+    }) as typeof actual.writeFileSync,
+    readFileSync: ((file: any, options?: any) => {
+      if (fsHooks.failClaimRead && isClaimFile(file)) {
+        throw Object.assign(new Error('simulated EACCES'), { code: 'EACCES' });
+      }
+      return (actual.readFileSync as any)(file, options);
+    }) as typeof actual.readFileSync,
+  };
+});
 import {
   RATE_LIMIT_MENTION_MAX_WINDOW_MS,
   RATE_LIMIT_MENTION_MIN_WINDOW_MS,
@@ -227,6 +258,94 @@ describe('跨进程（同账号的多个 bot daemon）', () => {
       larkAppId: 'cli_b', ownerOpenId: 'ou_b', kind: 'usage', retryAtMs, now, accountKey: account,
     })).toBeDefined();
     expect(existsSync(claimFileDir())).toBe(false);
+  });
+
+  it('接管写盘失败（ENOSPC）时照样 @，只是不带跨进程名额', async () => {
+    const botA = await loadProcess();
+    const botB = await loadProcess();
+    const now = 1_000_000;
+    const retryAtMs = now + 60 * 60 * 1_000;
+
+    expect(botA.claimRateLimitMention({
+      larkAppId: 'cli_a', ownerOpenId: 'ou_a', ownerUnionId, kind: 'usage', retryAtMs: now, accountKey: account,
+    })).toBeDefined();
+
+    const expiredAt = now + RATE_LIMIT_MENTION_MIN_WINDOW_MS;
+    fsHooks.failTmpWrite = true;
+    try {
+      expect(botB.claimRateLimitMention({
+        larkAppId: 'cli_b', ownerOpenId: 'ou_b', ownerUnionId, kind: 'usage', retryAtMs: retryAtMs + expiredAt, now: expiredAt, accountKey: account,
+      })).toBeDefined();
+    } finally {
+      fsHooks.failTmpWrite = false;
+    }
+  });
+
+  it('claim 文件读不了（EACCES）时不覆盖它，只在进程内去重', async () => {
+    const botA = await loadProcess();
+    const botB = await loadProcess();
+    const now = 1_000_000;
+    const retryAtMs = now + 60 * 60 * 1_000;
+
+    expect(botA.claimRateLimitMention({
+      larkAppId: 'cli_a', ownerOpenId: 'ou_a', ownerUnionId, kind: 'usage', retryAtMs, now, accountKey: account,
+    })).toBeDefined();
+    const path = join(claimFileDir(), readdirSync(claimFileDir())[0]);
+    const before = readFileSync(path, 'utf8');
+
+    fsHooks.failClaimRead = true;
+    try {
+      expect(botB.claimRateLimitMention({
+        larkAppId: 'cli_b', ownerOpenId: 'ou_b', ownerUnionId, kind: 'usage', retryAtMs, now: now + 1_000, accountKey: account,
+      })).toBeDefined();
+    } finally {
+      fsHooks.failClaimRead = false;
+    }
+    expect(readFileSync(path, 'utf8')).toBe(before);
+  });
+
+  it('存了远超上限的 expiresAt（时钟跳变 / 手改）当作坏数据接管', async () => {
+    const botA = await loadProcess();
+    const botB = await loadProcess();
+    const now = 1_000_000;
+    const retryAtMs = now + 60 * 60 * 1_000;
+
+    expect(botA.claimRateLimitMention({
+      larkAppId: 'cli_a', ownerOpenId: 'ou_a', ownerUnionId, kind: 'usage', retryAtMs, now, accountKey: account,
+    })).toBeDefined();
+    const path = join(claimFileDir(), readdirSync(claimFileDir())[0]);
+    const stored = JSON.parse(readFileSync(path, 'utf8'));
+    writeFileSync(path, JSON.stringify({ ...stored, expiresAt: now + 10 * RATE_LIMIT_MENTION_MAX_WINDOW_MS }));
+
+    expect(botB.claimRateLimitMention({
+      larkAppId: 'cli_b', ownerOpenId: 'ou_b', ownerUnionId, kind: 'usage', retryAtMs, now: now + 1_000, accountKey: account,
+    })).toBeDefined();
+  });
+
+  it('接管后回读发现名额已经不是自己的，就不 @', async () => {
+    const botA = await loadProcess();
+    const botB = await loadProcess();
+    const now = 1_000_000;
+    const retryAtMs = now + 60 * 60 * 1_000;
+
+    expect(botA.claimRateLimitMention({
+      larkAppId: 'cli_a', ownerOpenId: 'ou_a', ownerUnionId, kind: 'usage', retryAtMs: now, now, accountKey: account,
+    })).toBeDefined();
+
+    // A competing takeover lands right after our rename.
+    fsHooks.onAfterRename = (dest) => {
+      writeFileSync(dest, JSON.stringify({ expiresAt: now + 60 * 60 * 1_000, token: 'someone-else', larkAppId: 'cli_x' }));
+    };
+    let claimed: number | undefined;
+    try {
+      claimed = botB.claimRateLimitMention({
+        larkAppId: 'cli_b', ownerOpenId: 'ou_b', ownerUnionId, kind: 'usage',
+        retryAtMs, now: now + RATE_LIMIT_MENTION_MIN_WINDOW_MS, accountKey: account,
+      });
+    } finally {
+      fsHooks.onAfterRename = null;
+    }
+    expect(claimed).toBeUndefined();
   });
 
   it('进程在写 claim 文件途中崩掉（留下空文件）时，别的进程仍能接管', async () => {

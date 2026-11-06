@@ -90,17 +90,31 @@ interface ClaimFileContents {
   larkAppId: string;
 }
 
-function readClaimFile(path: string): ClaimFileContents | undefined {
+/**
+ * Three states, because "cannot read" and "readable but garbage" must not be
+ * conflated: a missing file or a half-written one (crash between create and
+ * write) is free to take over, while an unreadable file (EACCES…) proves
+ * nothing and must fail open — never silence a real limit notice.
+ */
+type ClaimFileRead = { kind: 'ok'; contents?: ClaimFileContents } | { kind: 'error' };
+
+function readClaimFile(path: string): ClaimFileRead {
+  let raw: string;
   try {
-    const parsed = JSON.parse(readFileSync(path, 'utf8')) as Partial<ClaimFileContents> | null;
-    if (!parsed || typeof parsed !== 'object') return undefined;
+    raw = readFileSync(path, 'utf8');
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ENOENT' ? { kind: 'ok' } : { kind: 'error' };
+  }
+  try {
+    const parsed = JSON.parse(raw) as Partial<ClaimFileContents> | null;
+    if (!parsed || typeof parsed !== 'object') return { kind: 'ok' };
     const expiresAt = Number(parsed.expiresAt);
-    if (!Number.isFinite(expiresAt)) return undefined;
-    if (typeof parsed.token !== 'string' || !parsed.token) return undefined;
-    if (typeof parsed.larkAppId !== 'string') return undefined;
-    return { expiresAt, token: parsed.token, larkAppId: parsed.larkAppId };
+    if (!Number.isFinite(expiresAt)) return { kind: 'ok' };
+    if (typeof parsed.token !== 'string' || !parsed.token) return { kind: 'ok' };
+    if (typeof parsed.larkAppId !== 'string') return { kind: 'ok' };
+    return { kind: 'ok', contents: { expiresAt, token: parsed.token, larkAppId: parsed.larkAppId } };
   } catch {
-    return undefined;
+    return { kind: 'ok' };
   }
 }
 
@@ -127,19 +141,26 @@ function createClaimFileExclusive(path: string, contents: ClaimFileContents): bo
 /**
  * Replace an expired claim. The rename is atomic, and the re-read decides the
  * winner: only the process whose token is actually in the file reports a
- * claim. A concurrent takeover that lands between our rename and our re-read
- * makes this one lose, which costs at most one missed @ (never a duplicate).
+ * claim. Two sequential takeovers can both see their own token (the loser's
+ * rename lands after the winner's re-read), which costs at most one extra @ —
+ * never a missed one. A filesystem error here fails open (`unavailable`): the
+ * notice must still go out, just without the cross-process claim.
  */
-function takeoverClaimFile(path: string, contents: ClaimFileContents): boolean {
+function takeoverClaimFile(
+  path: string,
+  contents: ClaimFileContents,
+): 'claimed' | 'lost' | 'unavailable' {
   const tmp = `${path}.${contents.token}.tmp`;
   try {
     writeFileSync(tmp, JSON.stringify(contents), { mode: 0o600, flag: 'wx' });
     renameSync(tmp, path);
   } catch {
     try { unlinkSync(tmp); } catch { /* nothing to clean up */ }
-    return false;
+    return 'unavailable';
   }
-  return readClaimFile(path)?.token === contents.token;
+  const current = readClaimFile(path);
+  if (current.kind === 'error') return 'unavailable';
+  return current.contents?.token === contents.token ? 'claimed' : 'lost';
 }
 
 type CrossProcessResult = { path: string; token: string } | 'denied' | 'unavailable';
@@ -171,10 +192,19 @@ function claimCrossProcess(input: {
     return 'unavailable';
   }
   const existing = readClaimFile(path);
+  // Unreadable (EACCES…) proves nothing: fail open rather than silence.
+  if (existing.kind === 'error') return 'unavailable';
+  const live = existing.contents;
   // Bots disagree slightly on the reset time, so the comparison is against the
-  // stored expiry, not equality with ours. Unreadable/expired means free.
-  if (existing && existing.expiresAt > input.now) return 'denied';
-  return takeoverClaimFile(path, contents) ? { path, token } : 'denied';
+  // stored expiry, not equality with ours. A far-future expiry can only be a
+  // clock jump or a hand-edited file — taking it at face value would silence
+  // this account+owner+kind for up to that bogus horizon, so treat it as
+  // corrupt and take the claim over.
+  if (live && live.expiresAt > input.now
+    && live.expiresAt <= input.now + RATE_LIMIT_MENTION_MAX_WINDOW_MS) return 'denied';
+  const taken = takeoverClaimFile(path, contents);
+  if (taken === 'claimed') return { path, token };
+  return taken === 'lost' ? 'denied' : 'unavailable';
 }
 
 /**
@@ -236,7 +266,8 @@ export function releaseRateLimitMention(input: {
   const fileClaim = fileClaims.get(input.token);
   if (!fileClaim) return;
   fileClaims.delete(input.token);
-  if (readClaimFile(fileClaim.path)?.token === fileClaim.token) {
+  const current = readClaimFile(fileClaim.path);
+  if (current.kind === 'ok' && current.contents?.token === fileClaim.token) {
     try { unlinkSync(fileClaim.path); } catch { /* already gone */ }
   }
 }
