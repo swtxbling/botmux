@@ -110,7 +110,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 
 // ─── Imports under test ──────────────────────────────────────────────────────
 
-import { initWorkerPool, __testOnly_setupWorkerHandlers, __testOnly_resetRestartCoordinator, restartCounts, sendWorkerInput } from '../src/core/worker-pool.js';
+import { initWorkerPool, __testOnly_configureCrashNotices, __testOnly_setupWorkerHandlers, __testOnly_resetRestartCoordinator, restartCounts, sendWorkerInput } from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { getBot } from '../src/bot-registry.js';
 import { createWorkerStderrRing, WORKER_ERROR_MARKER } from '../src/core/worker-stderr-ring.js';
@@ -171,6 +171,9 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
     vi.clearAllMocks();
     restartCounts.clear();
     __testOnly_resetRestartCoordinator();
+    // Keep the notice's merge window out of these tests: one crash here still
+    // means one notice, delivered on the next tick.
+    __testOnly_configureCrashNotices({ windowMs: 0, retryDelayMs: 0 });
     initWorkerPool({
       sessionReply: sessionReplyMock,
       getSessionWorkingDir: () => '/tmp',

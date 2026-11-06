@@ -70,7 +70,7 @@ export interface CrashNoticeBatchItem {
 
 interface PendingBatch {
   items: CrashNoticeBatchItem[];
-  timer: ReturnType<typeof setTimeout>;
+  timer: ReturnType<typeof setTimeout> | null;
 }
 
 export interface CrashNoticeBatcherOptions {
@@ -126,7 +126,7 @@ function entryTail(entry: CrashNoticeEntry, loc?: Locale): string | undefined {
   const source = entry.logTail
     ? tr('worker.crash_recent_output', undefined, loc)
     : tr('workerDiag.recentStderr', undefined, loc);
-  return `**${entry.sessionLabel}** · ${source.replace(/[：:]\s*$/, '')}\n\`\`\`\n${tail}\n\`\`\``;
+  return `**${entry.sessionLabel}** · ${source}\n\`\`\`\n${tail}\n\`\`\``;
 }
 
 /**
@@ -230,6 +230,9 @@ export class CrashNoticeBatcher {
     const timer = setTimeout(() => { void this.flush(key); }, this.windowMs);
     unrefTimer(timer);
     this.batches.set(key, { items: [item], timer });
+    // A zero window means "no merging": flush on the current turn instead of
+    // parking the notice behind a timer tick.
+    if (this.windowMs === 0) void this.flush(key);
   }
 
   pendingKeys(): string[] {
@@ -244,7 +247,7 @@ export class CrashNoticeBatcher {
 
   /** Drop queued notices without sending (test isolation). */
   dispose(): void {
-    for (const batch of this.batches.values()) clearTimeout(batch.timer);
+    for (const batch of this.batches.values()) if (batch.timer) clearTimeout(batch.timer);
     this.batches.clear();
   }
 
@@ -252,7 +255,7 @@ export class CrashNoticeBatcher {
     const batch = this.batches.get(key);
     if (!batch) return;
     this.batches.delete(key);
-    clearTimeout(batch.timer);
+    if (batch.timer) clearTimeout(batch.timer);
 
     const cardJson = JSON.stringify(buildCrashNoticeCard(batch.items.map(item => item.entry), batch.items[0]?.locale));
     const ids = batch.items.map(item => item.entry.sessionId).join(', ');
