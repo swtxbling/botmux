@@ -6815,6 +6815,24 @@ export function __testOnly_configureCrashNotices(opts: { windowMs?: number; retr
   crashNoticeBatcher = newCrashNoticeBatcher(opts.windowMs, opts.retryDelayMs);
 }
 
+/** Best-effort, bounded: push queued crash notices out before the daemon dies
+ *  (otherwise anything inside the merge window is silently lost). */
+export const CRASH_NOTICE_SHUTDOWN_FLUSH_TIMEOUT_MS = 1_500;
+export async function flushPendingCrashNotices(): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      crashNoticeBatcher.flushNow(),
+      new Promise<void>(resolve => {
+        timer = setTimeout(resolve, CRASH_NOTICE_SHUTDOWN_FLUSH_TIMEOUT_MS);
+        (timer as unknown as { unref?: () => void }).unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 // ─── Skills installation ────────────────────────────────────────────────────
 
 /** Track which CLI adapters have had skills installed this daemon lifecycle */
@@ -19805,6 +19823,7 @@ function setupWorkerHandlers(
           // 文案按停止原因分流：永久退出通道刻意跨 60s 窗口累计，两次崩溃可能
           // 相隔很久，沿用「1 分钟内崩溃 N 次」会是假话。
           const trimmedLogTail = msg.logTail?.trim() || undefined;
+          const noticeGeneration = ds.workerGeneration;
           const entry: CrashNoticeEntry = {
             sessionId: ds.session.sessionId,
             sessionLabel: crashNoticeLabel(ds.session.title, ds.currentTurnTitle, cliName),
@@ -19820,8 +19839,11 @@ function setupWorkerHandlers(
             ...(msg.sandboxNamespace ? { sandboxNotice: sandboxNamespaceNotice(msg.sandboxNamespace, loc) } : {}),
           };
           if (!suppressExitUi) {
-            // Same recipient = same bot + reply anchor. Private-reply sessions
-            // deliver to a requester rather than the chat, so keep them apart.
+            // Merge key = reply anchor only: one thread/chat keeps its notice
+            // where people already look. Private-reply sessions deliver to a
+            // requester rather than the chat, so keep them apart. Each bot is a
+            // separate daemon posting into its own chats/topics, so cross-bot
+            // crashes are never merged (re-routing would move the notice).
             const route = privateReplyEnabled(ds.session)
               ? `${ds.larkAppId}|${sessionAnchorId(ds)}|${ds.session.sessionId}`
               : `${ds.larkAppId}|${sessionAnchorId(ds)}`;
@@ -19829,6 +19851,10 @@ function setupWorkerHandlers(
               entry,
               locale: loc,
               send: cardJson => scopedReply(cardJson, 'interactive', undefined),
+              // The session must still be the thing that crashed when the
+              // window closes: closed / replaced sessions get a log line, not
+              // a stale notice in a thread that has moved on.
+              stillRelevant: () => ds.session.status === 'active' && ds.workerGeneration === noticeGeneration,
               onSendError: async (replyErr) => {
                 if (replyErr instanceof MessageWithdrawnError && ownsLifecycleMutation()) {
                   await closeWithdrawnSessionIfLedgerEmpty(ds, 'Root message withdrawn while sending crash diagnostic');

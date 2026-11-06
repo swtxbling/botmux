@@ -110,6 +110,7 @@ import {
   __testOnly_configureCrashNotices,
   __testOnly_setupWorkerHandlers,
   __testOnly_resetRestartCoordinator,
+  flushPendingCrashNotices,
   restartCounts,
 } from '../src/core/worker-pool.js';
 import { buildCrashNoticeCard, trimCrashTail, type CrashNoticeEntry } from '../src/core/crash-notice.js';
@@ -200,6 +201,10 @@ async function waitForSends(n: number, settleMs = 120): Promise<void> {
 describe('crash notice merge and folded terminal tail', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // clearAllMocks keeps implementations: the failed-send case below installs
+    // a rejecting mock, which must not leak into later tests.
+    sessionReplyMock.mockReset();
+    sessionReplyMock.mockResolvedValue('om_reply');
     restartCounts.clear();
     __testOnly_resetRestartCoordinator();
     __testOnly_configureCrashNotices({ windowMs: 25, retryDelayMs: 5 });
@@ -255,7 +260,7 @@ describe('crash notice merge and folded terminal tail', () => {
     expect(panelMarkdown(sent.card)).toContain('RAW_TERMINAL_MARKER');
   });
 
-  it('does not merge notices that belong to different recipients', async () => {
+  it('does not merge notices that belong to different anchors', async () => {
     const workerA = makeFakeWorker();
     const dsA = makeDs('sid-topic-a', workerA, { title: 'topic-a', scope: 'topic' });
     __testOnly_setupWorkerHandlers(dsA, workerA);
@@ -291,6 +296,37 @@ describe('crash notice merge and folded terminal tail', () => {
     const logged = vi.mocked(logger.error).mock.calls.map(call => String(call[0])).join('\n');
     expect(logged).toContain('sid-fail');
   });
+
+  it('flushes queued notices on shutdown instead of losing the merge window', async () => {
+    __testOnly_configureCrashNotices({ windowMs: 5_000, retryDelayMs: 5 });
+    const worker = makeFakeWorker();
+    const ds = makeDs('sid-shutdown', worker, { title: 'shutdown-bot', scope: 'chat' });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    await crashToStop(worker, 'TAIL_SHUTDOWN');
+    expect(sessionReplyMock).not.toHaveBeenCalled(); // still inside the window
+
+    await flushPendingCrashNotices();
+
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
+    expect(panelMarkdown(sentCards()[0].card)).toContain('TAIL_SHUTDOWN');
+  });
+
+  it('drops a queued notice when its session left the state it crashed in', async () => {
+    __testOnly_configureCrashNotices({ windowMs: 5_000, retryDelayMs: 5 });
+    const worker = makeFakeWorker();
+    const ds = makeDs('sid-closed-in-window', worker, { title: 'closed-bot', scope: 'chat' });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    await crashToStop(worker, 'TAIL_CLOSED');
+    // The user closes the session while the notice sits in its merge window.
+    ds.session.status = 'idle' as any;
+    await flushPendingCrashNotices();
+
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+    const warned = vi.mocked(logger.warn).mock.calls.map(call => String(call[0])).join('\n');
+    expect(warned).toContain('sid-closed-in-window');
+  });
 });
 
 describe('crash notice card rendering', () => {
@@ -317,5 +353,39 @@ describe('crash notice card rendering', () => {
     const panel: any = card.body.elements.find(el => el.tag === 'collapsible_panel');
     expect(panel.expanded).toBe(false);
     expect(panel.elements[0].content).toContain('PANIC');
+  });
+  it('budgets the folded tails in bytes, so CJK output cannot overflow the card', () => {
+    const cjk = '终端报错信息'.repeat(400); // 2400 chars ≈ 7.2KB of UTF-8
+    const entries = Array.from({ length: 10 }, (_, i) =>
+      entry({ sessionId: `s${i}`, sessionLabel: `会话-${i}`, logTail: cjk }));
+    const card = buildCrashNoticeCard(entries);
+    const bytes = Buffer.byteLength(JSON.stringify(card), 'utf8');
+    expect(bytes).toBeLessThanOrEqual(20_000);
+    const panel: any = card.body.elements.find((el: any) => el.tag === 'collapsible_panel');
+    const omitted = panel.elements.some((el: any) =>
+      typeof el.content === 'string' && /另有 \d+ 个会话的终端输出未展开/.test(el.content));
+    expect(omitted).toBe(true);
+  });
+
+  it('lists at most 20 sessions and counts the rest', () => {
+    const entries = Array.from({ length: 30 }, (_, i) =>
+      entry({ sessionId: `cap-${i}`, sessionLabel: `cap-${i}` }));
+    const card = buildCrashNoticeCard(entries);
+    const listText = String(card.body.elements[1]?.content ?? '');
+    expect(listText).toContain('cap-19');
+    expect(listText).not.toContain('cap-20');
+    expect(card.body.elements.some((el: any) =>
+      typeof el.content === 'string' && el.content.includes('10 个会话'))).toBe(true);
+  });
+
+  it('cannot be broken by a fence or markdown inside a label or terminal tail', () => {
+    const card = buildCrashNoticeCard([entry({
+      sessionLabel: 'bad`label **x**',
+      logTail: 'before\n```\ninjected',
+    })]);
+    const panel: any = card.body.elements.find((el: any) => el.tag === 'collapsible_panel');
+    const content = String(panel.elements[0].content);
+    expect(content).toContain('bad\\`label');
+    expect(content).toMatch(/^`{4,}$/m); // fence longer than the ``` inside the tail
   });
 });

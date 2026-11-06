@@ -477,6 +477,7 @@ import {
   identityDecisionConflict,
   identityDecisionTurnIsLive,
   collectSessionTurnGarbage,
+  flushPendingCrashNotices,
 } from './core/worker-pool.js';
 import { resetPromptCacheKeepalive, runPromptCacheKeepaliveSweep, statuslineContextTokens } from './core/prompt-cache-keepalive.js';
 import { noteIdleAutoCompactTurnStarted, runIdleAutoCompactSweep, type IdleAutoCompactNotice } from './core/idle-auto-compact.js';
@@ -35125,6 +35126,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       async () => {
     setSessionLifecycleShutdown(true);
     logger.info(`Daemon shutting down... (active: ${getActiveCount()})`);
+    // Crash notices queued inside their merge window have not been sent yet;
+    // deliver them (bounded) before the workers go away and the process exits.
+    await flushPendingCrashNotices();
 
     const initialShutdownFleet = collectUniqueDaemonShutdownSessions(activeSessions.values());
     if (!initialShutdownFleet.ok) {
