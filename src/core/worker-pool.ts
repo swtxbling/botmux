@@ -18709,11 +18709,14 @@ function setupWorkerHandlers(
           const mentionClaim = ownerOpenId
             ? { larkAppId: ds.larkAppId, ownerOpenId, kind: limit.kind }
             : undefined;
-          const mentionOwner = !!mentionClaim
-            && claimRateLimitMention({ ...mentionClaim, retryAtMs: limit.retryAtMs });
-          const notifyText = mentionOwner ? `<at id=${ownerOpenId}></at> ${notifyBody}` : notifyBody;
+          const mentionToken = mentionClaim
+            ? claimRateLimitMention({ ...mentionClaim, retryAtMs: limit.retryAtMs })
+            : undefined;
+          const notifyText = mentionToken !== undefined ? `<at id=${ownerOpenId}></at> ${notifyBody}` : notifyBody;
           scopedReply(notifyText, 'text', msg.turnId).catch((err: any) => {
-            if (mentionOwner && mentionClaim) releaseRateLimitMention(mentionClaim);
+            if (mentionClaim && mentionToken !== undefined) {
+              releaseRateLimitMention({ ...mentionClaim, token: mentionToken });
+            }
             logger.debug(`[${t}] Failed to deliver rate-limit notification: ${err?.message ?? err}`);
           });
         }
