@@ -1867,6 +1867,9 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       ...(pendingMessage !== undefined ? [pendingMessage] : []),
       ...(claim.queuedMessages ?? []),
     ];
+    if (claim.queuedMessages?.length) {
+      logger.info(`[grant:${larkAppId}] replaying ${claim.queuedMessages.length} held message(s) after approval in ${grantChatId.substring(0, 12)}`);
+    }
     if (replayMessages.length > 0) {
       try {
         if (deps.replayGrantedMessages) deps.replayGrantedMessages(replayMessages, larkAppId);

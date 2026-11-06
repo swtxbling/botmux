@@ -6300,8 +6300,9 @@ export function createLarkEventDispatcherRuntime(
    *  会让后一条先走到会话投递，所以这里必须串行。 */
   function replayMessageEvents(datas: any[]): void {
     if (runtimeOptions.enqueuePrimary) {
-      for (const data of datas) {
-        logger.info(`[grant:${larkAppId}] durable primary: not replaying granted message ${String(data?.message?.message_id ?? '').substring(0, 12)} outside the durable inbox`);
+      if (datas.length > 0) {
+        const ids = datas.map(d => String(d?.message?.message_id ?? '?').substring(0, 12)).join(',');
+        logger.warn(`[grant:${larkAppId}] durable primary: not replaying ${datas.length} granted message(s) outside the durable inbox: ${ids}`);
       }
       return;
     }

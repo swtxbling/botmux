@@ -498,6 +498,31 @@ describe('card-handler grant replay — messages held while the card was pending
     expect(messages.map((m: any) => m.message.message_id)).toEqual(['om_1', 'om_2', 'om_3']);
   });
 
+  it('multi-target card: 每个目标暂存的消息都重放，不是只重放第一个目标的', async () => {
+    // owner 一次 /grant 多个目标 → 每个 target 各一条 pending entry，各自暂存自己的消息。
+    // claim 只取第一个目标的 queuedMessages 会让其余目标的消息无声消失。
+    const { pending, handler } = await fresh();
+    const nonce = pending.openPendingMulti('h1', 'oc_1', ['ou_g', 'ou_h'], 3, event('om_first'), 60 * 60 * 1000);
+    pending.markPendingDelivered('h1', 'oc_1', ['ou_g', 'ou_h'], nonce);
+    expect(pending.queuePendingMessage('h1', 'oc_1', 'ou_g', event('om_g_held'))).toBe('queued');
+    expect(pending.queuePendingMessage('h1', 'oc_1', 'ou_h', event('om_h_held'))).toBe('queued');
+
+    const replayGrantedMessages = vi.fn();
+    const res = await handler.handleCardAction(
+      {
+        operator: { open_id: 'ou_owner' },
+        action: { value: { action: 'grant_chat', target_open_ids: ['ou_g', 'ou_h'], chat_id: 'oc_1', nonce } },
+      },
+      { ...deps, replayGrantedMessages },
+      'h1',
+    );
+    expect(res?.toast).toBeUndefined();
+    expect(replayGrantedMessages).toHaveBeenCalledTimes(1);
+    const [messages] = replayGrantedMessages.mock.calls[0]!;
+    expect(messages.map((m: any) => m.message.message_id))
+      .toEqual(['om_first', 'om_g_held', 'om_h_held']);
+  });
+
   it('denial replays nothing and the held messages are gone', async () => {
     const { pending, handler } = await fresh();
     const nonce = pending.openPending('h1', 'oc_1', 'ou_g', 3, event('om_1'), 60 * 60 * 1000);

@@ -412,12 +412,15 @@ export function claimPendingGrant(
     return { ok: false, reason: 'unsaved' };
   }
   const first = claimed[0]!;
+  // 多目标卡（owner 一次 /grant 多个目标）每个 target 各有一条 entry：按 target 顺序
+  // 摊平各自暂存的消息，不能只取第一个 target，否则其余 target 的暂存消息无声消失。
+  const queuedMessages = claimed.flatMap(e => e.queuedMessages ?? []);
   return {
     ok: true,
     quota: first.quota,
     durationMs: first.durationMs,
     messageData: first.messageData,
-    ...(first.queuedMessages?.length ? { queuedMessages: first.queuedMessages } : {}),
+    ...(queuedMessages.length ? { queuedMessages } : {}),
     restore: () => {
       let restored = false;
       keys.forEach((k, i) => {
