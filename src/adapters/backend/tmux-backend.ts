@@ -9,9 +9,20 @@ import { sessionEnvUnsetFlags } from '../../core/session-env.js';
 import { logger } from '../../utils/logger.js';
 import { isExecutable } from '../../utils/executable.js';
 import { PROCESS_TABLE_MAX_BUFFER } from '../../utils/exec-limits.js';
-import { classifyPaneLiveness, PANE_LIVENESS_FORMAT, readPaneProcessAlive, type PaneLivenessObservation } from './pane-liveness.js';
+import { classifyPaneLiveness, PANE_LIVENESS_FORMAT, readPaneProcessAliveForServer, type PaneLivenessObservation } from './pane-liveness.js';
 import { readUnreapedPaneExit } from './unreaped-pane-exit.js';
 import { tmuxCommand, tmuxSocketArgs } from './tmux-socket.js';
+
+/** Liveness display reads: one answer, plus one short retry on 'unknown'. */
+const PANE_LIVENESS_ATTEMPTS = 2;
+const PANE_LIVENESS_RETRY_DELAY_MS = 50;
+
+/** Synchronous, CPU-free wait (same pattern as probeSessionWithRetry). */
+function sleepSyncMs(ms: number): void {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch { /* SharedArrayBuffer unavailable: retry immediately */ }
+}
 
 /**
  * `unset KEY KEY ...` clause spliced into the shell wrapper before exec. The
@@ -349,11 +360,14 @@ export class TmuxBackend {
     //
     // 'unknown' keeps the historical answer ('exists' ⇒ reattach): an
     // unanswered liveness probe must never tear down a possibly-live session.
+    // The same applies when the reap cannot prove that the SAME tmux server
+    // still owns the session: it then reports no reap and we reattach.
     const liveness = TmuxBackend.probePaneLiveness(name, socketName);
-    if (liveness.liveness === 'dead') {
-      TmuxBackend.reapDeadPaneSession(name, socketName, liveness);
+    if (liveness.liveness === 'dead' && TmuxBackend.reapDeadPaneSession(name, socketName, liveness)) {
       return 'missing';
     }
+    // 'unknown', or a death whose session could not be proven to be the same
+    // server's any more: reattach as before rather than guess.
     return probe;
   }
 
@@ -425,6 +439,22 @@ export class TmuxBackend {
    * tear down live sessions.
    */
   static probePaneLiveness(name: string, socketName?: string): PaneLivenessObservation {
+    // 'unknown' is deliberately retried a small, bounded number of times: a
+    // single timed-out display read (a loaded host, a tmux stall) must not be
+    // the final answer for a launch decision — but it must never turn INTO a
+    // death either. A second decisive answer is used; still-unknown keeps the
+    // historical behaviour (reattach, no kill). The delay is short so a cold
+    // launch pays at most one extra 2s deadline plus 50ms.
+    let observation = TmuxBackend.readPaneLivenessOnce(name, socketName);
+    for (let attempt = 1; observation.liveness === 'unknown' && attempt < PANE_LIVENESS_ATTEMPTS; attempt += 1) {
+      sleepSyncMs(PANE_LIVENESS_RETRY_DELAY_MS);
+      observation = TmuxBackend.readPaneLivenessOnce(name, socketName);
+    }
+    return observation;
+  }
+
+  /** One display-message round-trip of {@link probePaneLiveness}. */
+  private static readPaneLivenessOnce(name: string, socketName?: string): PaneLivenessObservation {
     try {
       const out = String(
         execFileSync(
@@ -432,23 +462,28 @@ export class TmuxBackend {
           { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], env: tmuxEnv(), timeout: 2000 },
         ) ?? '',
       );
-      const observation = classifyPaneLiveness(out, readPaneProcessAlive);
+      // The pane pid is only meaningful from the SERVER's pid namespace (a
+      // container talking to a host server cannot see its children): pass the
+      // server pid along so an invisible /proc/<pane_pid> stays 'unknown'
+      // instead of killing a live session.
+      const observation = classifyPaneLiveness(out, readPaneProcessAliveForServer);
       // A pane death the kernel already knows outlives tmux's publish window:
-      // for an unreaped zombie of THIS server /proc holds the real exit code.
-      // Kept for the reaped session's diagnostic log — a launch probe has no
-      // CLI lifetime to replay it into the crash-restart policy, and the
-      // instance that owned the generation already reported its own exit.
+      // for an unreaped zombie of THIS server /proc holds the real exit code
+      // (or signal). Kept for the reaped session's diagnostic log — a launch
+      // probe has no CLI lifetime to replay it into the crash-restart policy,
+      // and the instance that owned the generation already reported its exit.
       if (observation.liveness === 'dead' && observation.deathStatus === null
-          && observation.panePid !== null) {
-        const serverPid = Number(String(out).trim().split(':')[4]);
-        const kernel = Number.isSafeInteger(serverPid)
-          ? readUnreapedPaneExit(observation.panePid, serverPid)
-          : null;
+          && observation.panePid !== null && observation.serverPid !== null) {
+        const kernel = readUnreapedPaneExit(observation.panePid, observation.serverPid);
         if (kernel?.kind === 'exited') observation.deathStatus = kernel.code;
+        else if (kernel?.kind === 'signaled') observation.deathSignal = kernel.signal;
       }
       return observation;
     } catch {
-      return { liveness: 'unknown', panePid: null, deathStatus: null, sessionId: null };
+      return {
+        liveness: 'unknown', panePid: null, deathStatus: null, deathSignal: null,
+        serverPid: null, sessionId: null,
+      };
     }
   }
 
@@ -471,33 +506,68 @@ export class TmuxBackend {
     name: string,
     socketName: string | undefined,
     observed: PaneLivenessObservation,
-  ): void {
+  ): boolean {
     const target = observed.sessionId;
-    if (!target) {
-      // No session id in the answer: a name-only kill could hit a session that
-      // replaced this one between probe and kill. Leave it; the create that
-      // follows reports `duplicate session` instead of silently killing a peer.
-      logger.warn(`[tmux] confirmed-dead pane session ${name} had no session id; not reaping it`);
-      return;
+    const serverPid = observed.serverPid;
+    if (!target || serverPid === null) {
+      // Without the session id AND the server pid there is no way to prove the
+      // target is still the object the probe described: a name-only kill could
+      // hit a session that replaced this one between probe and kill. Leave it;
+      // the create that follows reports `duplicate session` instead of silently
+      // killing a peer.
+      logger.warn(`[tmux] confirmed-dead pane session ${name} had no ${target ? 'server pid' : 'session id'}; not reaping it`);
+      return false;
     }
+    // Ownership check and kill are ONE server-side command (`if-shell -F`
+    // evaluates the condition and runs the branch in the same server queue):
+    // with a check-then-kill pair, a server that exits in between could be
+    // replaced by one that hands the saved `$N` to an unrelated session, and
+    // the kill would land there. A different server pid fails the comparison
+    // and the false branch leaves it alone.
+    const ours = `#{&&:#{==:#{pid},${serverPid}},#{==:#{session_id},${target}}}`;
     try {
       execFileSync(
-        'tmux', [...tmuxSocketArgs(socketName), 'kill-session', '-t', target],
+        'tmux', [
+          ...tmuxSocketArgs(socketName),
+          'if-shell', '-F', '-t', target, ours,
+          `kill-session -t '${target}'`,
+          `display-message -p 'not-ours'`,
+        ],
         { stdio: 'ignore', env: tmuxEnv(), timeout: 3000 },
       );
-    } catch { /* already gone, or the server answered "can't find session" */ }
+    } catch { /* already gone, or the server rejected the target */ }
+    // Only an id that disappeared proves the reap. `if-shell` itself returns
+    // success for both branches, so "reaped" is logged from this re-read, not
+    // from the exit code — and a live session owned by a replacement server is
+    // never reported as killed.
+    if (TmuxBackend.hasSessionId(target, socketName)) {
+      logger.warn(
+        `[tmux] confirmed-dead pane session ${name} (${target}) is no longer owned by server `
+        + `${serverPid}; not reaped`,
+      );
+      return false;
+    }
+    const death = observed.deathSignal !== null
+      ? `signal=${observed.deathSignal}`
+      : `exit=${observed.deathStatus ?? 'unknown'}`;
     logger.warn(
-      `[tmux] reaped confirmed-dead pane session ${name} (${target}): `
-      + `pane_pid=${observed.panePid ?? 'unknown'}, exit=${observed.deathStatus ?? 'unknown'}`,
+      `[tmux] reaped confirmed-dead pane session ${name} (${target} on server ${serverPid}): `
+      + `pane_pid=${observed.panePid ?? 'unknown'}, ${death}`,
     );
+    return true;
   }
 
-  /** True only when the pane is provably dead: tmux explicitly flags it dead,
-   *  or its pane process is gone. Any inconclusive answer (probe error,
-   *  timeout, an option this tmux does not report) is `false` — a liveness
-   *  probe must never invent a death. */
-  static isPaneDead(name: string, socketName?: string): boolean {
-    return TmuxBackend.probePaneLiveness(name, socketName).liveness === 'dead';
+  /** Exact-session existence check (`$N`), independent of any name. */
+  private static hasSessionId(sessionId: string, socketName?: string): boolean {
+    try {
+      execFileSync(
+        'tmux', [...tmuxSocketArgs(socketName), 'has-session', '-t', sessionId],
+        { stdio: 'ignore', env: tmuxEnv(), timeout: 3000 },
+      );
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /**

@@ -16,7 +16,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -24,6 +24,7 @@ import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
 import {
   classifyPaneLiveness,
   readPaneProcessAlive,
+  readPaneProcessAliveForServer,
 } from '../src/adapters/backend/pane-liveness.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 
@@ -41,7 +42,8 @@ describe('classifyPaneLiveness', () => {
 
   it('treats tmux\'s explicit pane_dead=1 as dead without asking the OS', () => {
     expect(classifyPaneLiveness('1::77:$3\n', neverAsked)).toEqual({
-      liveness: 'dead', panePid: null, deathStatus: 77, sessionId: '$3',
+      liveness: 'dead', panePid: null, deathStatus: 77, deathSignal: null,
+      serverPid: null, sessionId: '$3',
     });
   });
 
@@ -51,7 +53,8 @@ describe('classifyPaneLiveness', () => {
 
   it('treats pane_dead=0 with a gone pane process as dead', () => {
     expect(classifyPaneLiveness('0:4242::$3', () => false)).toEqual({
-      liveness: 'dead', panePid: 4242, deathStatus: null, sessionId: '$3',
+      liveness: 'dead', panePid: 4242, deathStatus: null, deathSignal: null,
+      serverPid: null, sessionId: '$3',
     });
   });
 
@@ -77,6 +80,15 @@ describe('classifyPaneLiveness', () => {
 
   it('never accepts a garbled session id as a kill target', () => {
     expect(classifyPaneLiveness('1::77:bmx-x', neverAsked).sessionId).toBeNull();
+  });
+
+  it('passes the SERVER pid from the same answer to the OS check', () => {
+    const seen: Array<[number, number | null]> = [];
+    classifyPaneLiveness('0:4242::$3:991', (pid, serverPid) => {
+      seen.push([pid, serverPid]);
+      return true;
+    });
+    expect(seen).toEqual([[4242, 991]]);
   });
 });
 
@@ -130,30 +142,107 @@ describe('readPaneProcessAlive', () => {
   });
 });
 
+describe('readPaneProcessAliveForServer', () => {
+  const enoent = () => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); };
+
+  it('does not read an absent pane pid as death when the server itself is invisible', () => {
+    // A container looking at a host tmux server through a mounted socket: the
+    // pane pid is not in OUR /proc, but the pane may be perfectly alive.
+    expect(readPaneProcessAliveForServer(4242, 991, {
+      platform: 'linux',
+      readFile: (path) => (path.includes('/991/') ? enoent() : enoent()),
+    })).toBeNull();
+  });
+
+  it('does not read an absent pane pid as death when the server pid is missing', () => {
+    expect(readPaneProcessAliveForServer(4242, null, {
+      platform: 'linux',
+      readFile: () => enoent(),
+    })).toBeNull();
+  });
+
+  it('trusts the pane pid once the server is visible in the same /proc', () => {
+    const readFile = (path: string) => {
+      if (path.includes('/991/')) return '991 (tmux) S 1 991 991 0 -1';
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    };
+    expect(readPaneProcessAliveForServer(4242, 991, { platform: 'linux', readFile })).toBe(false);
+  });
+
+  it('does not need a server pid where kill(pid, 0) is authoritative', () => {
+    expect(readPaneProcessAliveForServer(4242, null, {
+      platform: 'darwin',
+      signal: () => {},
+    })).toBe(true);
+  });
+});
+
 /**
  * Fake tmux: answers the two queries the launch probe makes, so the wiring
  * (which verdict becomes 'missing', and whether anything is killed) is driven
  * through the REAL TmuxBackend code without a live server.
  */
+const FAKE = `#!/bin/sh
+log="\${FAKE_TMUX_LOG:-}"
+[ -n "$log" ] && printf '%s\\n' "$*" >> "$log"
+killflag="\${FAKE_TMUX_KILLFLAG:-}"
+cmd=""
+for arg in "$@"; do
+  case "$arg" in
+    has-session|display-message|kill-session|if-shell) cmd="$arg"; break ;;
+  esac
+done
+case "$cmd" in
+  has-session)
+    [ -n "$killflag" ] && [ -f "$killflag" ] && exit 1
+    exit 0 ;;
+  display-message)
+    if [ -n "\${FAKE_TMUX_DISPLAY_COUNTER:-}" ]; then
+      n=0
+      [ -f "$FAKE_TMUX_DISPLAY_COUNTER" ] && n=$(cat "$FAKE_TMUX_DISPLAY_COUNTER")
+      n=$((n + 1))
+      printf '%s' "$n" > "$FAKE_TMUX_DISPLAY_COUNTER"
+      if [ "$n" -le "\${FAKE_TMUX_GARBLE_READS:-0}" ]; then
+        printf 'not a liveness answer'
+        exit 0
+      fi
+    fi
+    printf '%s' "\${FAKE_TMUX_DISPLAY:-}"
+    exit "\${FAKE_TMUX_DISPLAY_EXIT:-0}" ;;
+  kill-session)
+    [ -n "$killflag" ] && : > "$killflag"
+    exit 0 ;;
+  if-shell)
+    owner="\${FAKE_TMUX_OWNER_PID:-}"
+    match=1
+    case "$*" in
+      *#{==:#{pid},*)
+        match=0
+        case "$*" in
+          *"#{==:#{pid},$owner}"*) match=1 ;;
+        esac ;;
+    esac
+    if [ "$match" = 1 ]; then
+      [ -n "$killflag" ] && : > "$killflag"
+      printf 'killed'
+    else
+      printf 'not-ours'
+    fi
+    exit 0 ;;
+esac
+exit 0
+`;
+
 describe('probeSessionForLaunch liveness wiring', () => {
   let dir: string;
   let logPath: string;
+  let killFlag: string;
   const saved: Record<string, string | undefined> = {};
-
-  const FAKE = `#!/bin/sh
-log="\${FAKE_TMUX_LOG:-}"
-[ -n "$log" ] && printf '%s\\n' "$*" >> "$log"
-for arg in "$@"; do
-  case "$arg" in
-    has-session) exit 0 ;;
-    display-message)
-      printf '%s' "\${FAKE_TMUX_DISPLAY:-}"
-      exit "\${FAKE_TMUX_DISPLAY_EXIT:-0}" ;;
-    kill-session) exit 0 ;;
-  esac
-done
-exit 0
-`;
+  const FAKE_ENV = [
+    'PATH', 'FAKE_TMUX_LOG', 'FAKE_TMUX_DISPLAY', 'FAKE_TMUX_DISPLAY_EXIT',
+    'FAKE_TMUX_KILLFLAG', 'FAKE_TMUX_OWNER_PID',
+    'FAKE_TMUX_DISPLAY_COUNTER', 'FAKE_TMUX_GARBLE_READS',
+  ];
 
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), 'bmx-liveness-'));
@@ -161,13 +250,16 @@ exit 0
     mkdirSync(bin);
     writeFileSync(join(bin, 'tmux'), FAKE, { mode: 0o755 });
     logPath = join(dir, 'calls.log');
-    for (const key of ['PATH', 'FAKE_TMUX_LOG', 'FAKE_TMUX_DISPLAY', 'FAKE_TMUX_DISPLAY_EXIT']) {
-      saved[key] = process.env[key];
-    }
+    killFlag = join(dir, 'killed');
+    for (const key of FAKE_ENV) saved[key] = process.env[key];
     process.env.PATH = `${bin}:${process.env.PATH}`;
     process.env.FAKE_TMUX_LOG = logPath;
-    delete process.env.FAKE_TMUX_DISPLAY;
-    delete process.env.FAKE_TMUX_DISPLAY_EXIT;
+    process.env.FAKE_TMUX_KILLFLAG = killFlag;
+    process.env.FAKE_TMUX_OWNER_PID = String(process.pid);
+    for (const key of ['FAKE_TMUX_DISPLAY', 'FAKE_TMUX_DISPLAY_EXIT',
+      'FAKE_TMUX_DISPLAY_COUNTER', 'FAKE_TMUX_GARBLE_READS']) {
+      delete process.env[key];
+    }
   });
 
   afterEach(() => {
@@ -181,48 +273,93 @@ exit 0
   const calls = (): string => {
     try { return readFileSync(logPath, 'utf8'); } catch { return ''; }
   };
+  const displayReads = (): string[] => calls().split('\n')
+    .filter(line => /-L fake display-message /.test(line));
 
   it('reports a retained corpse as missing and reaps that exact session', () => {
-    process.env.FAKE_TMUX_DISPLAY = '1::77:$7';
+    process.env.FAKE_TMUX_DISPLAY = `1::77:$7:${process.pid}`;
     expect(TmuxBackend.probeSessionForLaunch('bmx-dead', 'fake')).toBe('missing');
     const log = calls();
     expect(log).toMatch(/display-message/);
-    expect(log).toMatch(/-L fake kill-session -t \$7/);
+    expect(log).toMatch(/-L fake if-shell .*kill-session -t '\$7'/);
+    expect(existsSync(killFlag)).toBe(true);
   });
 
   it('reports a pane whose process is gone as missing and reaps it', () => {
-    process.env.FAKE_TMUX_DISPLAY = `0:${reapedPid()}::$8`;
+    process.env.FAKE_TMUX_DISPLAY = `0:${reapedPid()}::$8:${process.pid}`;
     expect(TmuxBackend.probeSessionForLaunch('bmx-dead', 'fake')).toBe('missing');
-    expect(calls()).toMatch(/kill-session -t \$8/);
+    expect(calls()).toMatch(/if-shell .*kill-session -t '\$8'/);
   });
 
   it('keeps reattaching to a live pane and never kills it', () => {
-    process.env.FAKE_TMUX_DISPLAY = `0:${process.pid}::$9`;
+    process.env.FAKE_TMUX_DISPLAY = `0:${process.pid}::$9:${process.pid}`;
     expect(TmuxBackend.probeSessionForLaunch('bmx-live', 'fake')).toBe('exists');
-    expect(calls()).not.toMatch(/kill-session/);
+    expect(calls()).not.toMatch(/if-shell|kill-session/);
   });
 
   it('keeps reattaching (and kills nothing) when the liveness probe cannot answer', () => {
     process.env.FAKE_TMUX_DISPLAY_EXIT = '1';
     expect(TmuxBackend.probeSessionForLaunch('bmx-live', 'fake')).toBe('exists');
-    expect(calls()).not.toMatch(/kill-session/);
+    expect(calls()).not.toMatch(/if-shell|kill-session/);
+    // A bounded retry happened, but never a kill.
+    expect(displayReads()).toHaveLength(2);
   });
 
   it('keeps reattaching (and kills nothing) on a garbled liveness answer', () => {
     process.env.FAKE_TMUX_DISPLAY = 'target pane has exited';
     expect(TmuxBackend.probeSessionForLaunch('bmx-live', 'fake')).toBe('exists');
-    expect(calls()).not.toMatch(/kill-session/);
+    expect(calls()).not.toMatch(/if-shell|kill-session/);
+  });
+
+  it('does not kill when an UNKNOWN answer still carried a valid session id', () => {
+    // pid 1 is never probeable, so the verdict is 'unknown' — a session id in
+    // the same answer must not be turned into a kill target.
+    process.env.FAKE_TMUX_DISPLAY = `0:1::$5:${process.pid}`;
+    expect(TmuxBackend.probeSessionForLaunch('bmx-live', 'fake')).toBe('exists');
+    expect(calls()).not.toMatch(/if-shell|kill-session/);
+  });
+
+  it('retries an unreadable liveness read and uses the decisive second answer', () => {
+    process.env.FAKE_TMUX_DISPLAY_COUNTER = join(dir, 'reads');
+    process.env.FAKE_TMUX_GARBLE_READS = '1';
+    process.env.FAKE_TMUX_DISPLAY = `0:${reapedPid()}::$10:${process.pid}`;
+    expect(TmuxBackend.probeSessionForLaunch('bmx-dead', 'fake')).toBe('missing');
+    expect(displayReads()).toHaveLength(2);
+    expect(existsSync(killFlag)).toBe(true);
+  });
+
+  it('never treats an invisible server pid as proof of a dead pane', () => {
+    // The pane pid is a reaped one, but the "server" pid is reaped too: on
+    // Linux that means this process cannot see the server's pid namespace, so
+    // the absent pane pid proves nothing and nothing may be killed.
+    if (process.platform !== 'linux') return;
+    process.env.FAKE_TMUX_DISPLAY = `0:${reapedPid()}::$6:${reapedPid()}`;
+    expect(TmuxBackend.probeSessionForLaunch('bmx-live', 'fake')).toBe('exists');
+    expect(calls()).not.toMatch(/if-shell|kill-session/);
+  });
+
+  it('kills only when the answering server still owns that exact session', () => {
+    // The answer came from server `process.pid`; the fake pretends the current
+    // owner is another server, so the atomic if-shell condition must fail.
+    process.env.FAKE_TMUX_OWNER_PID = '999999';
+    process.env.FAKE_TMUX_DISPLAY = `0:${reapedPid()}::$11:${process.pid}`;
+    expect(TmuxBackend.probeSessionForLaunch('bmx-live', 'fake')).toBe('exists');
+    const log = calls();
+    expect(log).toContain(`#{==:#{pid},${process.pid}}`);
+    expect(log).toContain('#{==:#{session_id},$11}');
+    expect(log).toMatch(/if-shell/);
+    expect(existsSync(killFlag)).toBe(false);
   });
 
   it('does not kill by name when the answer carried no session id', () => {
-    process.env.FAKE_TMUX_DISPLAY = '1::77:';
-    expect(TmuxBackend.probeSessionForLaunch('bmx-dead', 'fake')).toBe('missing');
-    expect(calls()).not.toMatch(/kill-session/);
+    process.env.FAKE_TMUX_DISPLAY = `1::77:${process.pid}`;
+    // Without a session id the corpse cannot be safely reaped; keep the old
+    // reattach behaviour rather than kill something we cannot identify.
+    expect(TmuxBackend.probeSessionForLaunch('bmx-dead', 'fake')).toBe('exists');
+    expect(calls()).not.toMatch(/if-shell|kill-session/);
   });
 
   it('leaves an absent session at "missing" without probing liveness', () => {
-    // has-session is the only call that should happen; give the fake a
-    // display answer that would otherwise read as dead.
     writeFileSync(join(dir, 'bin', 'tmux'), `#!/bin/sh
 log="\${FAKE_TMUX_LOG:-}"
 [ -n "$log" ] && printf '%s\\n' "$*" >> "$log"
@@ -234,7 +371,7 @@ done
 exit 0
 `, { mode: 0o755 });
     expect(TmuxBackend.probeSessionForLaunch('bmx-absent', 'fake')).toBe('missing');
-    expect(calls()).not.toMatch(/display-message|kill-session/);
+    expect(calls()).not.toMatch(/display-message|if-shell|kill-session/);
   });
 });
 

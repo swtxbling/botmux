@@ -32,6 +32,13 @@ export interface PaneLivenessObservation {
   panePid: number | null;
   /** `#{pane_dead_status}` when tmux already published the real exit code. */
   deathStatus: number | null;
+  /** Signal that killed the pane, available only from an unreaped zombie's
+   *  kernel entry (tmux itself does not publish it in this format). */
+  deathSignal: number | null;
+  /** `#{pid}` — the tmux SERVER that answered, not the pane. Lets a reap prove
+   *  the same server still owns the session, and gates the pid-namespace check
+   *  in {@link readPaneProcessAliveForServer}. */
+  serverPid: number | null;
   /** `#{session_id}` (`$N`) — the exact session object the answer described, so
    *  a reap can target it instead of a name that may be re-created meanwhile. */
   sessionId: string | null;
@@ -45,8 +52,12 @@ export interface PaneLivenessObservation {
  */
 export const PANE_LIVENESS_FORMAT = '#{pane_dead}:#{pane_pid}:#{pane_dead_status}:#{session_id}:#{pid}';
 
-function unknown(sessionId: string | null = null, panePid: number | null = null): PaneLivenessObservation {
-  return { liveness: 'unknown', panePid, deathStatus: null, sessionId };
+function unknown(
+  sessionId: string | null = null,
+  panePid: number | null = null,
+  serverPid: number | null = null,
+): PaneLivenessObservation {
+  return { liveness: 'unknown', panePid, deathStatus: null, deathSignal: null, serverPid, sessionId };
 }
 
 /** tmux session ids are `$<digits>`; never treat a garbled field as a target. */
@@ -67,29 +78,40 @@ function parseSessionId(raw: string | undefined): string | null {
  */
 export function classifyPaneLiveness(
   raw: string,
-  processAlive: (pid: number) => boolean | null,
+  processAlive: (panePid: number, serverPid: number | null) => boolean | null,
 ): PaneLivenessObservation {
   const fields = String(raw ?? '').trim().split(':');
-  const [deadRaw, pidRaw, statusRaw, sessionRaw] = fields;
+  const [deadRaw, pidRaw, statusRaw, sessionRaw, serverRaw] = fields;
   const sessionId = parseSessionId(sessionRaw);
   const panePid = /^[1-9]\d*$/.test(pidRaw ?? '') && Number.isSafeInteger(Number(pidRaw))
     ? Number(pidRaw)
     : null;
   const deathStatus = /^\d+$/.test(statusRaw ?? '') ? Number(statusRaw) : null;
+  const serverPid = /^[1-9]\d*$/.test(serverRaw ?? '') && Number.isSafeInteger(Number(serverRaw))
+    ? Number(serverRaw)
+    : null;
   if (deadRaw !== '0' && deadRaw !== '1') {
     // '' (timeout / tmux error), garbled output, a tmux that does not report
     // the flag: no answer, not a death.
-    return unknown(sessionId, panePid);
+    return unknown(sessionId, panePid, serverPid);
   }
-  if (deadRaw === '1') return { liveness: 'dead', panePid, deathStatus, sessionId };
+  if (deadRaw === '1') {
+    return { liveness: 'dead', panePid, deathStatus, deathSignal: null, serverPid, sessionId };
+  }
   // Explicitly "not dead" — but confirm the process the pane is supposed to be
   // running is still there. A missing/unparsable pid is "cannot confirm", not
-  // "the process is gone".
-  if (panePid === null) return unknown(sessionId, null);
-  const alive = processAlive(panePid);
-  if (alive === true) return { liveness: 'alive', panePid, deathStatus, sessionId };
-  if (alive === false) return { liveness: 'dead', panePid, deathStatus, sessionId };
-  return unknown(sessionId, panePid);
+  // "the process is gone". The server pid goes along because on Linux the pane
+  // pid is only meaningful from the server's pid namespace — see
+  // readPaneProcessAliveForServer.
+  if (panePid === null) return unknown(sessionId, null, serverPid);
+  const alive = processAlive(panePid, serverPid);
+  if (alive === true) {
+    return { liveness: 'alive', panePid, deathStatus, deathSignal: null, serverPid, sessionId };
+  }
+  if (alive === false) {
+    return { liveness: 'dead', panePid, deathStatus, deathSignal: null, serverPid, sessionId };
+  }
+  return unknown(sessionId, panePid, serverPid);
 }
 
 export interface PaneProcessProbeDeps {
@@ -134,4 +156,28 @@ export function readPaneProcessAlive(pid: number, deps: PaneProcessProbeDeps = {
     if (err?.code === 'EPERM') return true;
     return null;
   }
+}
+
+/**
+ * {@link readPaneProcessAlive} as seen from the tmux SERVER that owns the pane.
+ *
+ * On Linux `/proc` is pid-namespaced: a botmux inside a container (or any
+ * process in another pid namespace) can reach the tmux server through a mounted
+ * socket while `/proc/<pane_pid>` for its children looks absent. There, an
+ * ENOENT would be "not in OUR namespace", not "the process is gone" — acting on
+ * it would kill a live session. The server pid comes from the SAME tmux answer;
+ * if it is missing or not visible to us, this host's view is not the server's,
+ * so an absent pane pid proves nothing: `null` (unknown). Other platforms use
+ * `kill(pid, 0)`, which is not namespaced this way, so the plain check stands.
+ */
+export function readPaneProcessAliveForServer(
+  panePid: number,
+  serverPid: number | null,
+  deps: PaneProcessProbeDeps = {},
+): boolean | null {
+  const platform = deps.platform ?? process.platform;
+  if (platform === 'linux') {
+    if (serverPid === null || readPaneProcessAlive(serverPid, deps) !== true) return null;
+  }
+  return readPaneProcessAlive(panePid, deps);
 }
