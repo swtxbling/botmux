@@ -204,6 +204,16 @@ function deliveryNotices(): string[] {
     .filter(text => /Worker execution queue|Worker 的执行队列|never reached the CLI|没有送到 CLI/.test(text));
 }
 
+/** The exact text `sessionReply` receives for a delivery notice in this suite's
+ * locale (the bot mock resolves to `zh`). Read from the message catalogue so the
+ * assertions follow wording changes instead of pinning sentences. */
+function renderedNotice(
+  key: 'worker.input_not_delivered' | 'worker.input_delivery_failed',
+  turnId: string,
+): string {
+  return zhMessages[key].replace('{turnId}', turnId.substring(0, 16));
+}
+
 describe('ordinary IM auto-redelivery (worker exit settlement)', () => {
   let replay: ReturnType<typeof vi.fn>;
 
@@ -322,6 +332,79 @@ describe('ordinary IM auto-redelivery (worker exit settlement)', () => {
     const notices = deliveryNotices();
     expect(notices).toHaveLength(1);
     expect(notices[0]).toMatch(/did not run|没有执行/);
+  });
+
+  it('does not replay when the dead worker receipt ACK lands after exit', async () => {
+    // `exit` is emitted before the child's last IPC frames are necessarily
+    // dispatched: the worker's own receipt ACK can still land after the exit
+    // settlement removed the record. Ignoring it would let the deferred timer
+    // replay a turn the CLI already holds — a double execution.
+    const worker = makeFakeWorker();
+    const ds = makeDs(worker, 'sid-late-ack');
+    __testOnly_setupWorkerHandlers(ds, worker);
+    expect(sendWorkerInput(ds, { content: 'acked late' }, 'om_late_ack_1')).toBe(true);
+
+    worker.emit('exit', 1, null);
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_late_ack_1' });
+    await flush();
+
+    expect(replay).not.toHaveBeenCalled();
+    // The mark is written before the replay is armed, so the spent retry stays
+    // recorded even though the replay itself was cancelled.
+    expect(ds.session.ordinaryImAutoRedelivery?.turnIds).toEqual(['om_late_ack_1']);
+    const notices = deliveryNotices();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toBe(renderedNotice('worker.input_delivery_failed', 'om_late_ack_1'));
+  });
+
+  it('does not tell the user to resend when a late receipt ACK lands after the retry was spent', async () => {
+    // With a persisted mark the settlement used to speak synchronously at exit
+    // ("did not run, just resend") before the dying worker's last frames could
+    // drain. Both the notice choice and the wording now wait for that window.
+    const worker = makeFakeWorker();
+    const ds = makeDs(worker, 'sid-late-ack-marked');
+    ds.session.ordinaryImAutoRedelivery = {
+      turnIds: ['om_late_ack_marked_1'],
+      attemptedAt: '2026-11-06T00:00:00.000Z',
+    };
+    __testOnly_setupWorkerHandlers(ds, worker);
+    expect(sendWorkerInput(ds, { content: 'already retried' }, 'om_late_ack_marked_1')).toBe(true);
+
+    worker.emit('exit', 1, null);
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_late_ack_marked_1' });
+    await flush();
+
+    expect(replay).not.toHaveBeenCalled();
+    const notices = deliveryNotices();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toBe(renderedNotice('worker.input_delivery_failed', 'om_late_ack_marked_1'));
+    expect(notices[0]).not.toBe(renderedNotice('worker.input_not_delivered', 'om_late_ack_marked_1'));
+  });
+
+  it('still says the earlier copy did not run when no late ACK arrives', async () => {
+    // The grace window must not turn every already-retried settlement into the
+    // vague wording: without a receipt ACK the proof still holds, and the user
+    // may simply resend. Once the window closed, a late ACK changes nothing.
+    const worker = makeFakeWorker();
+    const ds = makeDs(worker, 'sid-no-late-ack');
+    ds.session.ordinaryImAutoRedelivery = {
+      turnIds: ['om_no_late_ack_1'],
+      attemptedAt: '2026-11-06T00:00:00.000Z',
+    };
+    __testOnly_setupWorkerHandlers(ds, worker);
+    expect(sendWorkerInput(ds, { content: 'no ack' }, 'om_no_late_ack_1')).toBe(true);
+
+    worker.emit('exit', 1, null);
+    await flush();
+
+    expect(replay).not.toHaveBeenCalled();
+    const notices = deliveryNotices();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toBe(renderedNotice('worker.input_not_delivered', 'om_no_late_ack_1'));
+
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_no_late_ack_1' });
+    await flush();
+    expect(deliveryNotices()).toHaveLength(1);
   });
 
   it('treats a late success callback from an earlier attempt as possibly delivered', async () => {
