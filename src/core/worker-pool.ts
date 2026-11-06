@@ -806,7 +806,7 @@ import {
   claimQuotaFallbackEvent,
   resolveQuotaFallbackTarget,
 } from '../services/quota-fallback.js';
-import { claimRateLimitMention, releaseRateLimitMention } from '../services/rate-limit-mention.js';
+import { claimRateLimitMention, rateLimitMentionAccountKey, releaseRateLimitMention } from '../services/rate-limit-mention.js';
 import type {
   CliTurnPayload,
   CodexAppDeliverySink,
@@ -2401,6 +2401,29 @@ export function dshRuntimeForSession(ds: DaemonSession): 'official' | 'tui' | un
  *  「是不是 Codex App」统一用 `isCodexAppCliId(sessionCliId(...))`，不要再写 `session.cliId ?? bot.cliId`。 */
 function sessionCliId(ds: DaemonSession, botCfg: { cliId: CliId }): CliId {
   return ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId;
+}
+
+/**
+ * The CLI account this session runs under, as `family:canonical config home` —
+ * where the credentials live, so two bot daemons sharing one account derive the
+ * same key. undefined means "not resolvable" (unknown CLI, unbound Codex
+ * instance), which keeps the @owner budget per-process instead of guessing.
+ */
+function rateLimitMentionAccountKeyForSession(
+  ds: DaemonSession,
+  botCfg: { cliId: CliId; cliConfigDir?: string },
+  cliId: CliId,
+): string | undefined {
+  if (cliId === 'claude-code') {
+    // Mirror the launch: a frozen session profile wins over the bot default.
+    return rateLimitMentionAccountKey(cliId,
+      ds.session.cliConfigDir ?? ds.initConfig?.cliConfigDir ?? botCfg.cliConfigDir ?? join(homedir(), '.claude'));
+  }
+  if (cliId === 'codex' || cliId === 'codex-app') {
+    const binding = ds.session.cliInstanceBinding ?? ds.initConfig?.cliInstanceBinding;
+    return rateLimitMentionAccountKey(cliId, binding?.codexHome);
+  }
+  return undefined;
 }
 
 function supportsBotmuxLarkNativeSessionTitle(cliId: CliId): boolean {
@@ -18806,10 +18829,20 @@ function setupWorkerHandlers(
           );
           const ownerOpenId = ds.session.ownerOpenId;
           // One account limit usually hits every busy topic of this bot at
-          // once. Every topic still gets its own notice, but only the first
-          // one in the episode @-mentions the owner.
+          // once — and every other bot daemon on the same CLI account. Every
+          // topic still gets its own notice, but only the first one in the
+          // episode @-mentions the owner. union_id + account key let sibling
+          // daemons coordinate through the shared data dir; without either we
+          // keep the per-process budget (never dedupe across different people:
+          // open_id is app-scoped and cannot identify the owner across bots).
           const mentionClaim = ownerOpenId
-            ? { larkAppId: ds.larkAppId, ownerOpenId, kind: limit.kind }
+            ? {
+              larkAppId: ds.larkAppId,
+              ownerOpenId,
+              ownerUnionId: ds.session.ownerUnionId,
+              kind: limit.kind,
+              accountKey: rateLimitMentionAccountKeyForSession(ds, botCfg, sessionCliId(ds, botCfg)),
+            }
             : undefined;
           const mentionToken = mentionClaim
             ? claimRateLimitMention({ ...mentionClaim, retryAtMs: limit.retryAtMs })

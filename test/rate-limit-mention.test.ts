@@ -1,9 +1,13 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   RATE_LIMIT_MENTION_MAX_WINDOW_MS,
   RATE_LIMIT_MENTION_MIN_WINDOW_MS,
   __testOnly_resetRateLimitMentions,
   claimRateLimitMention,
+  rateLimitMentionAccountKey,
   releaseRateLimitMention,
 } from '../src/services/rate-limit-mention.js';
 
@@ -71,6 +75,211 @@ describe('claimRateLimitMention', () => {
       expect(claimRateLimitMention({ ...base, retryAtMs: bad, now })).toBeDefined();
       expect(claimRateLimitMention({ ...base, retryAtMs: bad, now: now + RATE_LIMIT_MENTION_MIN_WINDOW_MS - 1 })).toBeUndefined();
       expect(claimRateLimitMention({ ...base, retryAtMs: bad, now: now + RATE_LIMIT_MENTION_MIN_WINDOW_MS })).toBeDefined();
+    }
+  });
+});
+
+describe('跨进程（同账号的多个 bot daemon）', () => {
+  let dataDir: string;
+  let previousDataDir: string | undefined;
+
+  beforeEach(() => {
+    dataDir = mkdtempSync(join(tmpdir(), 'rlm-'));
+    previousDataDir = process.env.SESSION_DATA_DIR;
+    process.env.SESSION_DATA_DIR = dataDir;
+  });
+
+  afterEach(() => {
+    if (previousDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+    else process.env.SESSION_DATA_DIR = previousDataDir;
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  // A "process" is a fresh module instance: its in-memory Map is empty and
+  // only the shared claim file can make it stay quiet.
+  async function loadProcess(): Promise<typeof import('../src/services/rate-limit-mention.js')> {
+    vi.resetModules();
+    return import('../src/services/rate-limit-mention.js');
+  }
+
+  const account = 'claude-code:/accounts/shared';
+  const ownerUnionId = 'on_same_person';
+
+  function claimFileDir(): string {
+    return join(dataDir, 'rate-limit-mention');
+  }
+
+  it('同账号、同一人（不同 bot 的 open_id 不同）只 @ 一次', async () => {
+    const botA = await loadProcess();
+    const botB = await loadProcess();
+    const now = 1_000_000;
+    const retryAtMs = now + 60 * 60 * 1_000;
+
+    expect(botA.claimRateLimitMention({
+      larkAppId: 'cli_a', ownerOpenId: 'ou_a', ownerUnionId, kind: 'usage', retryAtMs, now, accountKey: account,
+    })).toBeDefined();
+    expect(botB.claimRateLimitMention({
+      larkAppId: 'cli_b', ownerOpenId: 'ou_b', ownerUnionId, kind: 'usage', retryAtMs, now, accountKey: account,
+    })).toBeUndefined();
+  });
+
+  it('账号不同就各发各的', async () => {
+    const botA = await loadProcess();
+    const botB = await loadProcess();
+    const now = 1_000_000;
+    const retryAtMs = now + 60 * 60 * 1_000;
+
+    expect(botA.claimRateLimitMention({
+      larkAppId: 'cli_a', ownerOpenId: 'ou_a', ownerUnionId, kind: 'usage', retryAtMs, now, accountKey: account,
+    })).toBeDefined();
+    expect(botB.claimRateLimitMention({
+      larkAppId: 'cli_b', ownerOpenId: 'ou_b', ownerUnionId, kind: 'usage', retryAtMs, now,
+      accountKey: 'claude-code:/accounts/other',
+    })).toBeDefined();
+  });
+
+  it('文件名不同：同账号不同人 / 不同限额类型互不影响', async () => {
+    const botA = await loadProcess();
+    const otherPerson = await loadProcess();
+    const otherKind = await loadProcess();
+    const now = 1_000_000;
+    const retryAtMs = now + 60 * 60 * 1_000;
+
+    expect(botA.claimRateLimitMention({
+      larkAppId: 'cli_a', ownerOpenId: 'ou_a', ownerUnionId, kind: 'usage', retryAtMs, now, accountKey: account,
+    })).toBeDefined();
+    expect(otherPerson.claimRateLimitMention({
+      larkAppId: 'cli_b', ownerOpenId: 'ou_b', ownerUnionId: 'on_other_person', kind: 'usage', retryAtMs, now, accountKey: account,
+    })).toBeDefined();
+    expect(otherKind.claimRateLimitMention({
+      larkAppId: 'cli_c', ownerOpenId: 'ou_c', ownerUnionId, kind: 'rate', retryAtMs, now, accountKey: account,
+    })).toBeDefined();
+    expect(readdirSync(claimFileDir())).toHaveLength(3);
+  });
+
+  it('claim 过期后别的进程可以重新 @', async () => {
+    const botA = await loadProcess();
+    const botB = await loadProcess();
+    const now = 1_000_000;
+
+    expect(botA.claimRateLimitMention({
+      larkAppId: 'cli_a', ownerOpenId: 'ou_a', ownerUnionId, kind: 'usage', retryAtMs: now, now, accountKey: account,
+    })).toBeDefined();
+    const expiredAt = now + RATE_LIMIT_MENTION_MIN_WINDOW_MS;
+    expect(botB.claimRateLimitMention({
+      larkAppId: 'cli_b', ownerOpenId: 'ou_b', ownerUnionId, kind: 'usage', retryAtMs: expiredAt + 60_000, now: expiredAt, accountKey: account,
+    })).toBeDefined();
+  });
+
+  it('A 发送失败让出名额后，B 可以 @；文件也一并撤掉', async () => {
+    const botA = await loadProcess();
+    const botB = await loadProcess();
+    const now = 1_000_000;
+    const retryAtMs = now + 60 * 60 * 1_000;
+
+    const token = botA.claimRateLimitMention({
+      larkAppId: 'cli_a', ownerOpenId: 'ou_a', ownerUnionId, kind: 'usage', retryAtMs, now, accountKey: account,
+    });
+    expect(token).toBeDefined();
+    expect(readdirSync(claimFileDir())).toHaveLength(1);
+
+    botA.releaseRateLimitMention({ larkAppId: 'cli_a', ownerOpenId: 'ou_a', kind: 'usage', token: token! });
+    expect(readdirSync(claimFileDir())).toHaveLength(0);
+
+    expect(botB.claimRateLimitMention({
+      larkAppId: 'cli_b', ownerOpenId: 'ou_b', ownerUnionId, kind: 'usage', retryAtMs, now: now + 1, accountKey: account,
+    })).toBeDefined();
+  });
+
+  it('迟到的发送失败不会删掉 B 后来拿到的那份', async () => {
+    const botA = await loadProcess();
+    const botB = await loadProcess();
+    const botC = await loadProcess();
+    const now = 1_000_000;
+
+    const stale = botA.claimRateLimitMention({
+      larkAppId: 'cli_a', ownerOpenId: 'ou_a', ownerUnionId, kind: 'usage', retryAtMs: now, now, accountKey: account,
+    });
+    expect(stale).toBeDefined();
+
+    const later = now + RATE_LIMIT_MENTION_MIN_WINDOW_MS;
+    expect(botB.claimRateLimitMention({
+      larkAppId: 'cli_b', ownerOpenId: 'ou_b', ownerUnionId, kind: 'usage', retryAtMs: later + 60 * 60 * 1_000, now: later, accountKey: account,
+    })).toBeDefined();
+
+    botA.releaseRateLimitMention({ larkAppId: 'cli_a', ownerOpenId: 'ou_a', kind: 'usage', token: stale! });
+
+    expect(botC.claimRateLimitMention({
+      larkAppId: 'cli_c', ownerOpenId: 'ou_c', ownerUnionId, kind: 'usage', retryAtMs: later + 60 * 60 * 1_000, now: later + 1, accountKey: account,
+    })).toBeUndefined();
+  });
+
+  it('有账号但没有 union_id 时也不跨进程去重（open_id 跨 bot 认不出人）', async () => {
+    const botA = await loadProcess();
+    const botB = await loadProcess();
+    const now = 1_000_000;
+    const retryAtMs = now + 60 * 60 * 1_000;
+
+    expect(botA.claimRateLimitMention({
+      larkAppId: 'cli_a', ownerOpenId: 'ou_a', kind: 'usage', retryAtMs, now, accountKey: account,
+    })).toBeDefined();
+    expect(botB.claimRateLimitMention({
+      larkAppId: 'cli_b', ownerOpenId: 'ou_b', kind: 'usage', retryAtMs, now, accountKey: account,
+    })).toBeDefined();
+    expect(existsSync(claimFileDir())).toBe(false);
+  });
+
+  it('进程在写 claim 文件途中崩掉（留下空文件）时，别的进程仍能接管', async () => {
+    const botA = await loadProcess();
+    const botB = await loadProcess();
+    const now = 1_000_000;
+    const retryAtMs = now + 60 * 60 * 1_000;
+
+    expect(botA.claimRateLimitMention({
+      larkAppId: 'cli_a', ownerOpenId: 'ou_a', ownerUnionId, kind: 'usage', retryAtMs, now, accountKey: account,
+    })).toBeDefined();
+    const [file] = readdirSync(claimFileDir());
+    writeFileSync(join(claimFileDir(), file), '');
+
+    expect(botB.claimRateLimitMention({
+      larkAppId: 'cli_b', ownerOpenId: 'ou_b', ownerUnionId, kind: 'usage', retryAtMs, now: now + 1_000, accountKey: account,
+    })).toBeDefined();
+  });
+
+  it('算不出账号时退回进程内去重（不会跨进程乱静默）', async () => {
+    const botA = await loadProcess();
+    const botB = await loadProcess();
+    const now = 1_000_000;
+    const retryAtMs = now + 60 * 60 * 1_000;
+    const input = { larkAppId: 'cli_a', ownerOpenId: 'ou_a', ownerUnionId, kind: 'usage' as const, retryAtMs, now };
+
+    expect(botA.claimRateLimitMention(input)).toBeDefined();
+    expect(botA.claimRateLimitMention({ ...input, now: now + 1 })).toBeUndefined();
+    expect(botB.claimRateLimitMention({ ...input, now: now + 1 })).toBeDefined();
+    expect(existsSync(claimFileDir())).toBe(false);
+  });
+});
+
+describe('rateLimitMentionAccountKey', () => {
+  it('没有配置目录 / 相对路径时算不出账号', () => {
+    expect(rateLimitMentionAccountKey('claude-code', undefined)).toBeUndefined();
+    expect(rateLimitMentionAccountKey('claude-code', '   ')).toBeUndefined();
+    expect(rateLimitMentionAccountKey('claude-code', 'relative/dir')).toBeUndefined();
+  });
+
+  it('同一目录经符号链接也归到同一个账号', () => {
+    const root = mkdtempSync(join(tmpdir(), 'rlm-key-'));
+    try {
+      const real = join(root, 'real-home');
+      mkdirSync(real);
+      const link = join(root, 'link-home');
+      symlinkSync(real, link, 'dir');
+      expect(rateLimitMentionAccountKey('claude-code', link))
+        .toBe(rateLimitMentionAccountKey('claude-code', real));
+      expect(rateLimitMentionAccountKey('claude-code', real))
+        .not.toBe(rateLimitMentionAccountKey('codex', real));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   });
 });
