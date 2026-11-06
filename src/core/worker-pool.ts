@@ -11277,6 +11277,48 @@ function clearOrdinaryImDeliveryTimer(record: OrdinaryImDelivery): void {
   record.timer = undefined;
 }
 
+/** Records settled by a worker exit, kept reachable until their deferred
+ * decision runs. `exit` can be emitted before the child's last IPC frames are
+ * dispatched, so the dead worker's own receipt ACK may still arrive inside the
+ * grace window — after settlement already removed the record from
+ * `pendingOrdinaryImDeliveries`. Keyed by the exact worker object plus turn id:
+ * a replacement generation's ACK can never touch this record. */
+const exitSettledOrdinaryImDeliveries = new WeakMap<ChildProcess, Map<string, OrdinaryImDelivery>>();
+const deferredExitSettlements = new Set<OrdinaryImDelivery>();
+
+function rememberExitSettledDelivery(record: OrdinaryImDelivery): void {
+  let byTurn = exitSettledOrdinaryImDeliveries.get(record.worker);
+  if (!byTurn) {
+    byTurn = new Map();
+    exitSettledOrdinaryImDeliveries.set(record.worker, byTurn);
+  }
+  byTurn.set(record.turnId, record);
+  deferredExitSettlements.add(record);
+}
+
+function forgetExitSettledDelivery(record: OrdinaryImDelivery): void {
+  deferredExitSettlements.delete(record);
+  const byTurn = exitSettledOrdinaryImDeliveries.get(record.worker);
+  if (!byTurn) return;
+  if (byTurn.get(record.turnId) === record) byTurn.delete(record.turnId);
+  if (byTurn.size === 0) exitSettledOrdinaryImDeliveries.delete(record.worker);
+}
+
+/** A dead worker's receipt ACK is the one fact that can still change after exit
+ * settlement. Honouring it only flips the record's own `received` flag, which
+ * makes the deferred decision decline the replay and speak ambiguously; it
+ * starts nothing, retries nothing, and settles no other delivery. */
+function acknowledgeStaleWorkerOrdinaryImReceipt(worker: ChildProcess, turnId: string): void {
+  const record = exitSettledOrdinaryImDeliveries.get(worker)?.get(turnId);
+  if (!record) return;
+  if (record.received) return;
+  record.received = true;
+  logger.warn(
+    `[${tag(record.ds)}] Late receipt ACK for ordinary IM turn ${turnId.substring(0, 16)} `
+    + 'arrived after its worker exited; the turn may already be in the CLI, so it will not be replayed',
+  );
+}
+
 /** Terminal user-facing notices for an ordinary-IM delivery that never landed.
  * `input_delivery_failed` states an UNKNOWN outcome ("could not confirm ...
  * do not resend"), which is only honest when the daemon really cannot tell.
@@ -11451,62 +11493,75 @@ function ordinaryImReplayDecision(
   });
 }
 
-/** True when the turn still provably never reached the worker. Drives which
- * notice is honest: "did not run, resend" vs "could not confirm, check first".
- *
- * Unconfirmed transport is proof only once the worker is gone
- * (`worker_exited_before_ipc_enqueue`). While the worker is still alive (IPC
- * callback timeout / error, generation change), bytes already handed to
- * `child.send` can still be read and executed later, so telling the user
- * "it did not run, just resend" could make the turn run twice. */
-function isRecordProvablyUndelivered(record: OrdinaryImDelivery, reason: string): boolean {
-  return reason === ORDINARY_IM_REPLAYABLE_REASON && isProvablyUndeliveredOrdinaryIm({
+/** True when the turn still provably never reached the worker, read from the
+ * record's CURRENT facts. Drives which notice is honest: "did not run, resend"
+ * vs "could not confirm, check first". The exit path proves the worker is gone;
+ * a late receipt ACK (or a late `child.send` success callback) revokes the
+ * proof, and the deferred notice must follow it. */
+function isRecordProvablyUndelivered(record: OrdinaryImDelivery): boolean {
+  return isProvablyUndeliveredOrdinaryIm({
     received: record.received,
     transportConfirmed: record.transportConfirmed || record.transportEverConfirmed,
   });
 }
 
-/** The replay door: decide, mark, then schedule the respawn. The respawn must
- * wait until the exit handler has finished clearing `ds.worker` and fencing the
- * generation, so it runs from a timer rather than inline. Returns true when
- * this record is being recovered automatically and no notice is owed now. */
-function maybeAutoRedeliverOrdinaryImDelivery(
-  record: OrdinaryImDelivery,
-  reason: string,
-): boolean {
+function ordinaryImUndeliveredNoticeKey(record: OrdinaryImDelivery): OrdinaryImFailureMessageKey {
+  return isRecordProvablyUndelivered(record)
+    ? 'worker.input_not_delivered'
+    : 'worker.input_delivery_failed';
+}
+
+/** Exit settlement for the one outcome that can prove nothing ran. BOTH the
+ * replay decision and the notice are taken after the IPC grace window: `exit`
+ * is emitted before the child's last frames are necessarily dispatched, so the
+ * worker's own receipt ACK may still land. Deciding at exit would either replay
+ * a turn the CLI already holds or tell the user "it did not run, resend it"
+ * about that same turn. Exactly one notice leaves this function, from the
+ * timer; the timer also owns the respawn because it must run after the exit
+ * handler cleared `ds.worker` and fenced the generation. */
+function deferOrdinaryImExitSettlement(record: OrdinaryImDelivery, reason: string): void {
   const ds = record.ds;
-  // Snapshot before writing this attempt's own mark; reused by the timer.
+  // Snapshot before this attempt writes its own mark; reused by the timer so
+  // the "already retried" guard keeps referring to earlier attempts only.
   const priorTurnIds = ds.session.ordinaryImAutoRedelivery?.turnIds?.slice();
   const decision = ordinaryImReplayDecision(record, reason, priorTurnIds);
-  if (decision !== 'auto-redeliver') return false;
-  if (!markOrdinaryImAutoRedelivery(ds, record.turnId)) return false;
-  // The canonical "Ordinary IM worker delivery failed ..." line is already
-  // logged by failOrdinaryImDelivery; this line only records the decision.
-  logger.warn(
-    `[${tag(ds)}] Ordinary IM turn ${record.turnId.substring(0, 16)} is provably `
-    + 'undelivered (worker never confirmed IPC transport); replaying it once on a fresh worker',
-  );
+  let replayArmed = false;
+  if (decision === 'auto-redeliver') {
+    // The mark is written before any replay starts: a daemon restart, a second
+    // exit, or a replay that itself fails must observe it and never retry the
+    // same turn again.
+    if (markOrdinaryImAutoRedelivery(ds, record.turnId)) {
+      replayArmed = true;
+      // The canonical "Ordinary IM worker delivery failed ..." line is already
+      // logged by failOrdinaryImDelivery; this line only records the decision.
+      logger.warn(
+        `[${tag(ds)}] Ordinary IM turn ${record.turnId.substring(0, 16)} is provably `
+        + 'undelivered (worker never confirmed IPC transport); replaying it once on a fresh worker',
+      );
+    }
+  }
+  rememberExitSettledDelivery(record);
   const timer = setTimeout(() => {
+    forgetExitSettledDelivery(record);
     // This body runs outside the event handler that used to call the notice
     // synchronously: an exception here would be an uncaught daemon error, so
     // every step is contained and a failed replay always ends in a notice.
     try {
       // Re-decide from current facts: late IPC callbacks / ACKs, a session that
       // stopped being active, or a mark written meanwhile all disqualify the
-      // replay and must not be seen as "already done".
+      // replay and must not be seen as "already done". The notice wording is
+      // chosen from the same facts, so a late ACK can still turn "did not run,
+      // resend it" into the ambiguous one.
       const lateDecision = ordinaryImReplayDecision(record, reason, priorTurnIds);
-      if (lateDecision !== 'auto-redeliver') {
-        const noticeKey = isRecordProvablyUndelivered(record, reason)
-          ? 'worker.input_not_delivered'
-          : 'worker.input_delivery_failed';
+      if (!replayArmed || lateDecision !== 'auto-redeliver') {
         logger.warn(
           `[${tag(ds)}] Not replaying ordinary IM turn ${record.turnId.substring(0, 16)}: `
-          + `state changed before the replay (received=${record.received} `
+          + `state changed before the replay (armed=${replayArmed} received=${record.received} `
           + `transportConfirmed=${record.transportConfirmed} `
           + `transportEverConfirmed=${record.transportEverConfirmed} `
           + `status=${ds.session.status})`,
         );
-        reportOrdinaryImDeliveryFailure(ds, record.turnId, reason, noticeKey);
+        reportOrdinaryImDeliveryFailure(ds, record.turnId, reason, ordinaryImUndeliveredNoticeKey(record));
         return;
       }
       if (ds.session.status !== 'active') {
@@ -11556,7 +11611,7 @@ function maybeAutoRedeliverOrdinaryImDelivery(
     }
   }, ORDINARY_IM_AUTO_REPLAY_DELAY_MS);
   timer.unref?.();
-  return true;
+  record.timer = timer;
 }
 
 /** Deliver the terminal user-facing notice for one failed ordinary-IM turn.
@@ -11625,6 +11680,7 @@ function failOrdinaryImDelivery(
   record: OrdinaryImDelivery,
   reason: string,
   messageKey?: OrdinaryImFailureMessageKey,
+  provablyUndelivered = false,
 ): void {
   if (pendingOrdinaryImDeliveries.get(record.key) !== record) return;
   clearOrdinaryImDelivery(record);
@@ -11633,15 +11689,20 @@ function failOrdinaryImDelivery(
     + `turn=${record.turnId.substring(0, 16)} generation=${record.workerGeneration} `
     + `attempts=${record.attempt} reason=${reason}`,
   );
-  if (maybeAutoRedeliverOrdinaryImDelivery(record, reason)) return;
-  // Proof that nothing ran changes what the user may safely do: a turn that
-  // never left the daemon can simply be sent again, while an ambiguous one must
-  // be checked in the session first.
-  const key = messageKey
-    ?? (isRecordProvablyUndelivered(record, reason)
-      ? 'worker.input_not_delivered'
-      : 'worker.input_delivery_failed');
-  reportOrdinaryImDeliveryFailure(record.ds, record.turnId, reason, key);
+  // `provablyUndelivered` is computed by the settlement path from the delivery
+  // facts themselves, never re-derived from the free-form `reason`. It is the
+  // one outcome safe to replay, and the only one whose notice may not be sent
+  // yet: the dying worker's last IPC frames can still land.
+  if (provablyUndelivered) {
+    deferOrdinaryImExitSettlement(record, reason);
+    return;
+  }
+  reportOrdinaryImDeliveryFailure(
+    record.ds,
+    record.turnId,
+    reason,
+    messageKey ?? 'worker.input_delivery_failed',
+  );
 }
 
 function retryOrFailOrdinaryImDelivery(
@@ -11954,13 +12015,18 @@ function settleOrdinaryImDeliveriesForWorker(
     // Use the sticky transport flag: a retry resets the per-attempt
     // `transportConfirmed`, but an earlier attempt's bytes may already be in
     // the channel. The logged reason must match the replay decision, since this
-    // line is the only way to diagnose a skipped replay later.
-    const reason = record.received
+    // line is the only way to diagnose a skipped replay later. The undelivered
+    // proof is taken from these same facts, so the notice decision downstream
+    // never has to parse this diagnostic string.
+    const received = record.received;
+    const transportConfirmed = record.transportConfirmed || record.transportEverConfirmed;
+    const provablyUndelivered = isProvablyUndeliveredOrdinaryIm({ received, transportConfirmed });
+    const reason = received
       ? 'worker_exited_after_receipt'
-      : record.transportConfirmed || record.transportEverConfirmed
+      : transportConfirmed
         ? 'worker_exited_after_ipc_enqueue'
-        : 'worker_exited_before_ipc_enqueue';
-    failOrdinaryImDelivery(record, reason);
+        : ORDINARY_IM_REPLAYABLE_REASON;
+    failOrdinaryImDelivery(record, reason, undefined, provablyUndelivered);
   }
 }
 
@@ -11969,6 +12035,11 @@ export function __testOnly_resetOrdinaryImDeliveries(): void {
     if (record.timer) clearTimeout(record.timer);
   }
   pendingOrdinaryImDeliveries.clear();
+  for (const record of deferredExitSettlements) {
+    if (record.timer) clearTimeout(record.timer);
+    record.timer = undefined;
+  }
+  deferredExitSettlements.clear();
 }
 
 export function isSessionTransferring(ds: DaemonSession): boolean {
@@ -17224,6 +17295,14 @@ function setupWorkerHandlers(
       // running. Stale workers gain no other authority.
       if (msg.type === 'turn_input_committed') {
         completeStaleWorkerOrdinaryImDelivery(worker, msg.turnId);
+      }
+      // `exit` is emitted before this child's last IPC frames are necessarily
+      // dispatched, so its own synchronous receipt ACK can land after the exit
+      // settlement. That ACK is the one fact that revokes the "provably
+      // undelivered" proof; without it the deferred timer would tell the user
+      // the turn did not run (or replay it) while the CLI already holds it.
+      if (msg.type === 'turn_input_received') {
+        acknowledgeStaleWorkerOrdinaryImReceipt(worker, msg.turnId);
       }
       logger.debug(`[${t}] Ignored stale worker message: ${msg.type}`);
       return;

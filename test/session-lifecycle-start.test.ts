@@ -2,6 +2,16 @@ import { EventEmitter, once } from 'node:events';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { applyQueuedCodexAppLegacyFallback } from '../src/core/session-create.js';
 import { acceptSessionGroupTitle } from '../src/services/session-group-title.js';
+import { messages as zhMessages } from '../src/i18n/zh.js';
+import { messages as enMessages } from '../src/i18n/en.js';
+
+/** Which delivery notice the user received is the behaviour under test; the
+ *  exact sentences are not. Identify each notice by the stable first line of
+ *  its catalogue entry so wording edits cannot make an assertion vacuous. */
+const noticeHead = (
+  key: 'worker.input_not_delivered' | 'worker.input_delivery_failed' | 'worker.input_retired_unconfirmed',
+  catalog: typeof zhMessages | typeof enMessages = zhMessages,
+): string => catalog[key].split('\n')[0];
 
 vi.mock('../src/services/session-group-title.js', () => ({
   acceptSessionGroupTitle: vi.fn(),
@@ -1217,10 +1227,9 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     worker.emit('exit', 1, null);
     await Promise.resolve();
     expect(sessionReply).toHaveBeenCalledTimes(1);
-    expect(sessionReply.mock.calls[0]?.[1]).toContain('无法确认这条消息是否已进入 Worker 的执行队列');
-    // Ambiguous ⇒ check first, never the "it did not run, just resend" advice.
-    expect(sessionReply.mock.calls[0]?.[1]).toContain('先在 Web 终端看一眼这个会话');
-    expect(sessionReply.mock.calls[0]?.[1]).not.toContain('重新发一次即可');
+    expect(sessionReply.mock.calls[0]?.[1]).toContain(noticeHead('worker.input_delivery_failed'));
+    // Ambiguous ⇒ check first, never the "it did not run, just resend" notice.
+    expect(sessionReply.mock.calls[0]?.[1]).not.toContain(noticeHead('worker.input_not_delivered'));
   });
 
   it('waits quietly when the worker receipt arrives late', async () => {
@@ -1405,15 +1414,15 @@ describe('ordinary IM worker receipt acknowledgement', () => {
 
     const bodies = sessionReply.mock.calls.map(call => String(call[1]));
     const terminal = bodies.at(-1)!;
-    expect(terminal).toContain('没有被执行');
+    expect(terminal).toContain(noticeHead('worker.input_rejected_before_admission'));
     expect(terminal).toContain('om_business');
     expect(terminal).toContain('cross_principal_requires_owner_confirmation');
     // The ambiguous-outcome notice must not be used for a rejection the daemon
     // can describe exactly: it tells the user not to resend, which would strand
     // a message that provably never ran.
     for (const body of bodies) {
-      expect(body).not.toContain('无法确认这条消息是否已进入 Worker 的执行队列');
-      expect(body).not.toContain('不要直接重发');
+      expect(body).not.toContain(noticeHead('worker.input_delivery_failed'));
+      expect(body).not.toContain(noticeHead('worker.input_not_delivered'));
     }
     expect(businessSends()).toHaveLength(2);
   });
@@ -2040,11 +2049,12 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     await vi.advanceTimersByTimeAsync(4_000);
 
     expect(sessionReply.mock.calls.map(call => call[1])).toEqual([
-      expect.stringContaining('could not confirm whether this message entered the Worker execution queue'),
+      expect.stringContaining(noticeHead('worker.input_delivery_failed', enMessages)),
     ]);
-    // Ambiguous ⇒ check first, never the "it did not run, just resend" advice.
-    expect(sessionReply.mock.calls.every(call => String(call[1]).includes('look at this session in the Web terminal first'))).toBe(true);
-    expect(sessionReply.mock.calls.some(call => String(call[1]).includes('the earlier copy did not run'))).toBe(false);
+    // Ambiguous ⇒ check first, never the "it did not run, just resend" notice.
+    expect(sessionReply.mock.calls.some(call => String(call[1]).includes(
+      noticeHead('worker.input_not_delivered', enMessages),
+    ))).toBe(false);
   });
 
   it('retries a turn that the worker received but could not enqueue', async () => {
