@@ -797,6 +797,7 @@ import {
   claimQuotaFallbackEvent,
   resolveQuotaFallbackTarget,
 } from '../services/quota-fallback.js';
+import { claimRateLimitMention, releaseRateLimitMention } from '../services/rate-limit-mention.js';
 import type {
   CliTurnPayload,
   CodexAppDeliverySink,
@@ -18702,8 +18703,17 @@ function setupWorkerHandlers(
             loc,
           );
           const ownerOpenId = ds.session.ownerOpenId;
-          const notifyText = ownerOpenId ? `<at id=${ownerOpenId}></at> ${notifyBody}` : notifyBody;
+          // One account limit usually hits every busy topic of this bot at
+          // once. Every topic still gets its own notice, but only the first
+          // one in the episode @-mentions the owner.
+          const mentionClaim = ownerOpenId
+            ? { larkAppId: ds.larkAppId, ownerOpenId, kind: limit.kind }
+            : undefined;
+          const mentionOwner = !!mentionClaim
+            && claimRateLimitMention({ ...mentionClaim, retryAtMs: limit.retryAtMs });
+          const notifyText = mentionOwner ? `<at id=${ownerOpenId}></at> ${notifyBody}` : notifyBody;
           scopedReply(notifyText, 'text', msg.turnId).catch((err: any) => {
+            if (mentionOwner && mentionClaim) releaseRateLimitMention(mentionClaim);
             logger.debug(`[${t}] Failed to deliver rate-limit notification: ${err?.message ?? err}`);
           });
         }
