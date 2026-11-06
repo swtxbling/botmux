@@ -1750,8 +1750,8 @@ export interface ScheduledTask {
   larkAppId?: string;
   /** Where the user originally created the task (for cross-thread tasks where
    *  --chat-id / --root-msg-id retarget execution to a different chat).
-   *  When set and != chatId/rootMessageId, the "🕐 task started" notification
-   *  is posted here instead of (or in addition to) the execution target. */
+   *  Fires never post a per-run notice back here; these fields only route
+   *  opt-in failure / expiry notifications (see scheduleNotificationTarget). */
   creatorChatId?: string;
   creatorRootMessageId?: string;
   creatorLarkAppId?: string;
@@ -1818,7 +1818,7 @@ export interface ScheduledTask {
    *    new writes express this as executionPosition='new-topic'
    *  - 'local': log only, no delivery */
   deliver?: 'origin' | 'local' | 'new-topic';
-  /** Silent execution: fires post NO "🕐 task started" banner / creator notice,
+  /** Silent execution: fires post NO "🕐 task started" banner,
    *  and the spawned turn suppresses daemon-initiated group output (streaming
    *  card, bridge final_output forwarding). The prompt is wrapped with a hint
    *  telling the model to `botmux send` only when its alert condition is met —
