@@ -8,9 +8,8 @@ import * as sessionStore from '../services/session-store.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
 import * as idempotencyStore from '../services/idempotency-store.js';
 import * as groupsStore from '../services/groups-store.js';
-import * as oncallStore from '../services/oncall-store.js';
 import { randomUUID } from 'node:crypto';
-import { getBot, effectiveDefaultWorkingDir } from '../bot-registry.js';
+import { getBot, effectiveDefaultWorkingDir, findChatBoundWorkingDir } from '../bot-registry.js';
 import { getChatMode, getMessageChatId, sendMessage, replyMessage, type ChatMode } from '../im/lark/client.js';
 import { resolveRegularGroupMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import { localeForBot, t } from '../i18n/index.js';
@@ -295,7 +294,8 @@ export function externalEventOpensOwnTopic(chatMode: ChatMode, regularGroupMode:
 
 function resolveWorkingDir(larkAppId: string, chatId: string): { ok: true; workingDir: string; fromBotDefault: boolean } | { ok: false; error: string } {
   const bot = getBot(larkAppId);
-  const oncall = oncallStore.getOncallStatus(larkAppId, chatId)?.workingDir;
+  // oncall 绑定优先，其次群级默认目录（不改权限）。
+  const oncall = findChatBoundWorkingDir(larkAppId, chatId);
   const botDefault = effectiveDefaultWorkingDir(bot.config);
   const candidate = oncall || botDefault || bot.config.workingDir || '~';
   const v = validateWorkingDir(candidate, localeForBot(larkAppId));
@@ -306,6 +306,8 @@ function resolveWorkingDir(larkAppId: string, chatId: string): { ok: true; worki
   const fromBotDefault = !oncall && !!botDefault;
   return { ok: true, workingDir: v.resolvedPath, fromBotDefault };
 }
+
+export const __testOnly_resolveWorkingDir = resolveWorkingDir;
 
 function activeBySessionId(activeSessions: Map<string, DaemonSession>, sessionId: string): DaemonSession | undefined {
   for (const ds of activeSessions.values()) {

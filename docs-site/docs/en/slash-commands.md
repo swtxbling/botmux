@@ -300,6 +300,8 @@ See [Session Relay](/en/relay) for details.
 
 `/oncall bind <path>` · `/oncall unbind` · `/oncall status`
 
+`/chatdir bind <path>` · `/chatdir unbind` · `/chatdir status` — set only this bot's default directory for new sessions in this group, without changing who can talk to it (an oncall binding in the same group takes precedence)
+
 ## 🔑 Usage Authorization (owner / admins)
 
 | Command | Description |

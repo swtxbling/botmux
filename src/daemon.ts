@@ -3108,6 +3108,7 @@ function vcMeetingConsumerBotHasConfiguredWorkingDir(cfg: BotConfig): boolean {
     cfg.workingDir
     || effectiveDefaultWorkingDir(cfg)
     || (cfg.oncallChats && cfg.oncallChats.length > 0)
+    || (cfg.chatWorkingDirs && cfg.chatWorkingDirs.length > 0)
   );
 }
 

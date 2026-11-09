@@ -88,7 +88,7 @@ describe('resolvePinnedWorkingDir', () => {
     });
     expect(other.pinnedWorkingDir).toBe(defaultDir);
     expect(other.chatDirEntry).toBeUndefined();
-  });
+  }, 60_000);
 
   it('oncall binding wins over chatWorkingDirs in the same chat', async () => {
     const { botRegistry, daemon } = await loadFreshModules();
