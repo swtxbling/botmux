@@ -300,6 +300,8 @@ Dashboard 的「Bot 配置 → 权限与安全 → Slash 命令」还有一个�
 
 `/oncall bind <path>` · `/oncall unbind` · `/oncall status`
 
+`/chatdir bind <path>` · `/chatdir unbind` · `/chatdir status` — 只设置当前 bot 在本群新会话的默认目录，不改对话权限（同群有 oncall 绑定时以 oncall 为准）
+
 ## 🔑 使用授权（owner / 管理员）
 
 | 命令 | 说明 |

@@ -36,6 +36,7 @@ const mockGetBot = vi.fn(() => ({ config: { cliId: 'codex-app', apiOnly: true } 
 vi.mock('../src/bot-registry.js', () => ({
   getBot: (...a: any[]) => mockGetBot(...a),
   effectiveDefaultWorkingDir: vi.fn(() => '/tmp'),
+  findChatBoundWorkingDir: vi.fn(() => undefined),
 }));
 
 vi.mock('../src/services/groups-store.js', () => ({ isInChat: vi.fn(async () => true) }));

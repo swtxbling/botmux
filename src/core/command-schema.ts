@@ -142,6 +142,11 @@ export const COMMANDS: readonly CommandSpec[] = [
     help: ['help.oncall_bind', 'help.oncall_unbind', 'help.oncall_status'],
   },
   {
+    name: '/chatdir', sessionPolicy: 'default',
+    help: ['help.chatdir_bind', 'help.chatdir_unbind', 'help.chatdir_status'],
+    notes: '群级默认目录：只钉本 bot 在本群新会话的目录，不改对话权限（与 /oncall 的区别）',
+  },
+  {
     name: '/project', sessionPolicy: 'sessionless', help: ['help.project'],
     notes: '多一个 token 即 unexpected_arguments，是所有命令里 arity 最严的',
   },

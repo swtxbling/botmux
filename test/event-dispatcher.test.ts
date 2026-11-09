@@ -9022,6 +9022,7 @@ describe('managed Agent clone owner boundary', () => {
       'globalMessageListener',
       'groupMessageListenerOverrides',
       'oncallChats',
+      'chatWorkingDirs',
       'defaultOncallAutoboundChats',
       'allowedChatGroups',
       'chatGrants',

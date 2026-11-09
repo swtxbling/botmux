@@ -15,7 +15,7 @@
  * step always works against the latest on-disk snapshot.
  */
 import { readFileSync, statSync } from 'node:fs';
-import { findOncallChat, getBot, listOncallChats, type BotDefaultOncall, type OncallChat } from '../bot-registry.js';
+import { findChatWorkingDir, findOncallChat, getBot, listOncallChats, type BotDefaultOncall, type OncallChat } from '../bot-registry.js';
 import { rmwBotEntry } from './config-store.js';
 import { logger } from '../utils/logger.js';
 import { expandHomePath } from '../utils/working-dir.js';
@@ -403,6 +403,8 @@ export async function ensureDefaultOncallBound(
   // fast-path: tombstone 或已显式绑定 —— 跳过磁盘写
   if ((bot.config.defaultOncallAutoboundChats ?? []).includes(chatId)) return undefined;
   if (bot.config.oncallChats?.some(c => c.chatId === chatId)) return undefined;
+  // 本群已设群级默认目录（/chatdir）：用户明确选了「只钉目录、不开放权限」，不自动绑 oncall。
+  if (findChatWorkingDir(larkAppId, chatId)) return undefined;
   const resolved = expandHomePath(def.workingDir);
   let isDir = false;
   try { isDir = statSync(resolved).isDirectory(); } catch { /* not a dir */ }

@@ -91,10 +91,10 @@ export type WorkflowInboundAdmission =
  * message.
  */
 export function workflowNodePinnedStart(admission: WorkflowInboundAdmission | undefined):
-  | { pinnedWorkingDir: string; oncallEntry: undefined; inheritedFrom: null; pinnedFromBotDefault: false }
+  | { pinnedWorkingDir: string; oncallEntry: undefined; chatDirEntry: undefined; inheritedFrom: null; pinnedFromBotDefault: false }
   | undefined {
   if (!admission?.start || admission.workingDir === undefined) return undefined;
-  return { pinnedWorkingDir: admission.workingDir, oncallEntry: undefined, inheritedFrom: null, pinnedFromBotDefault: false };
+  return { pinnedWorkingDir: admission.workingDir, oncallEntry: undefined, chatDirEntry: undefined, inheritedFrom: null, pinnedFromBotDefault: false };
 }
 
 /** §15.4: a pinned node may not land in a node-topic session that runs

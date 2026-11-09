@@ -119,8 +119,10 @@ vi.mock('../src/bot-registry.js', () => ({
   })),
   getAllBots: vi.fn(() => []),
   getOwnerOpenId: vi.fn(() => 'ou_owner'),
-  // oncall pin is per-bot now (resolveDashboardSpawnWorkingDir → findOncallChat).
+  // oncall / 群级默认目录 pin is per-bot (resolveDashboardSpawnWorkingDir → findChatBoundWorkingDir).
   findOncallChat: vi.fn(() => undefined),
+  findChatBoundWorkingDir: vi.fn(() => undefined),
+  findChatWorkingDir: vi.fn(() => undefined),
   findOncallChatForAnyBot: vi.fn(() => undefined),
   // Mirror the real helper: defaultWorkingDir, else enabled defaultOncall dir.
   effectiveDefaultWorkingDir: vi.fn((cfg: any) =>
