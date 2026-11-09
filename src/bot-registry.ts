@@ -1927,6 +1927,8 @@ export interface BotConfig {
   allowedChatGroups?: string[];
   /** Oncall bindings: chat_id → default workingDir. Any group member can talk; allowedUsers still gates card buttons / daemon commands. */
   oncallChats?: OncallChat[];
+  /** 群级默认目录：chat_id → 新会话默认 workingDir。只钉目录，不改任何对话权限（与 oncallChats 的区别）；同群两者都有时 oncall 优先。 */
+  chatWorkingDirs?: OncallChat[];
   /** UI language for this bot: 'zh' or 'en'. Falls back to BOTMUX_LANG / LANG env when unset. */
   lang?: Locale;
   /** How this bot's built-in botmux bridge skills reach its CLI (only meaningful
@@ -3010,6 +3012,7 @@ function refreshRegisteredOncallChatsFromDisk(): void {
 
     const byAppId = new Map<string, OncallChat[]>();
     const chats = new Map<string, OncallChat>();
+    const chatDirsByAppId = new Map<string, OncallChat[]>();
     for (const entry of raw) {
       if (!entry || typeof entry.larkAppId !== 'string') continue;
       const botChats: OncallChat[] = [];
@@ -3023,11 +3026,14 @@ function refreshRegisteredOncallChatsFromDisk(): void {
         }
       }
       byAppId.set(entry.larkAppId, botChats);
+      chatDirsByAppId.set(entry.larkAppId, parseChatWorkingDirs(entry.chatWorkingDirs) ?? []);
     }
 
     for (const [larkAppId, bot] of bots) {
       const chats = byAppId.get(larkAppId);
       if (chats) bot.config.oncallChats = chats;
+      const chatDirs = chatDirsByAppId.get(larkAppId);
+      if (chatDirs) bot.config.chatWorkingDirs = chatDirs;
     }
     oncallChatCache = { mtimeMs, chats };
     registeredOncallConfigMtimeMs = mtimeMs;
@@ -3041,6 +3047,28 @@ export function findOncallChat(larkAppId: string, chatId: string): OncallChat | 
   refreshRegisteredOncallChatsFromDisk();
   const bot = bots.get(larkAppId);
   return bot?.config.oncallChats?.find(c => c.chatId === chatId);
+}
+
+/** 群级默认目录（不改权限）lookup，磁盘新鲜度同 {@link findOncallChat}。 */
+export function findChatWorkingDir(larkAppId: string, chatId: string): OncallChat | undefined {
+  refreshRegisteredOncallChatsFromDisk();
+  return bots.get(larkAppId)?.config.chatWorkingDirs?.find(c => c.chatId === chatId);
+}
+
+/**
+ * 本 bot 在该群的「群绑定目录」（raw，可能带 `~`）：oncall 绑定优先，其次群级默认目录。
+ * 只用于决定目录——权限判断仍只看 {@link findOncallChat}。
+ */
+export function findChatBoundWorkingDir(larkAppId: string, chatId: string): string | undefined {
+  return findOncallChat(larkAppId, chatId)?.workingDir
+    ?? findChatWorkingDir(larkAppId, chatId)?.workingDir;
+}
+
+export function parseChatWorkingDirs(raw: unknown): OncallChat[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  return raw
+    .filter((c: any) => c && typeof c.chatId === 'string' && typeof c.workingDir === 'string')
+    .map((c: any) => ({ chatId: c.chatId, workingDir: c.workingDir }));
 }
 
 /** All oncall bindings currently recorded for a bot, with the same disk
@@ -4318,6 +4346,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         : undefined,
       allowedChatGroups,
       oncallChats,
+      chatWorkingDirs: parseChatWorkingDirs(entry.chatWorkingDirs),
       defaultOncall,
       signedChatDefaults: entry.signedChatDefaults === true || undefined,
       signedChatDefaultsRegistryUrl: typeof entry.signedChatDefaultsRegistryUrl === 'string' && entry.signedChatDefaultsRegistryUrl.startsWith('https://') ? entry.signedChatDefaultsRegistryUrl : undefined,

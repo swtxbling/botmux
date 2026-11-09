@@ -11,7 +11,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
-import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir, loadBotConfigs, type BotConfig } from '../bot-registry.js';
+import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, findChatBoundWorkingDir, findChatWorkingDir, effectiveDefaultWorkingDir, loadBotConfigs, type BotConfig } from '../bot-registry.js';
 import { triggerUserAuthApplies, credentialSourceOf } from '../services/trigger-user-auth.js';
 import { platformCredentialsUrl } from '../platform/credential-grant-client.js';
 import { beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
@@ -96,6 +96,7 @@ import {
   removeVcMeetingPreparationsByChat,
 } from '../services/vc-meeting-preparations-store.js';
 import { bindOncall, unbindOncall, getOncallStatus } from '../services/oncall-store.js';
+import { bindChatWorkingDir, unbindChatWorkingDir, getChatWorkingDirStatus } from '../services/chat-working-dir-store.js';
 import {
   CONFIG_FIELDS, findConfigField, settableFieldKeys, parseBooleanValue,
   applyConfigField, setBotAllowedUsers, getConfigSnapshot, getConfigCardData, coerceConfigValue, type ConfigEffect,
@@ -331,7 +332,7 @@ export { validateWorkingDir };
 function resolveCurrentChatWorkingDirForRepo(ds: DaemonSession | undefined, loc: ReturnType<typeof localeForBot>): string | undefined {
   const current = ds?.workingDir ? validateWorkingDir(ds.workingDir, loc) : undefined;
   if (current?.ok) return current.resolvedPath;
-  const oncall = ds ? findOncallChat(ds.larkAppId, ds.chatId)?.workingDir : undefined;
+  const oncall = ds ? findChatBoundWorkingDir(ds.larkAppId, ds.chatId) : undefined;
   const resolvedOncall = oncall ? validateWorkingDir(oncall, loc) : undefined;
   if (resolvedOncall?.ok) return resolvedOncall.resolvedPath;
   if (!ds) return undefined;
@@ -937,6 +938,11 @@ function resolveScheduleWorkingDir(
   const oncallEntry = findOncallChat(bot.config.larkAppId, ds?.chatId ?? chatId);
   if (oncallEntry?.workingDir && usable(oncallEntry.workingDir, 'oncall-binding')) {
     return oncallEntry.workingDir;
+  }
+  // Layer 2b: 群级默认目录（不改权限）。
+  const chatDirEntry = findChatWorkingDir(bot.config.larkAppId, ds?.chatId ?? chatId);
+  if (chatDirEntry?.workingDir && usable(chatDirEntry.workingDir, 'chat-working-dir')) {
+    return chatDirEntry.workingDir;
   }
 
   // Layer 3: effective default working dir (defaultWorkingDir or
@@ -5385,6 +5391,73 @@ export async function handleCommand(
         }
 
         await sessionReply(rootId, t('cmd.oncall.unknown_sub', { sub }, loc));
+        break;
+      }
+
+      case '/chatdir': {
+        const args = message.content.replace(/^\/chatdir\s*/i, '').trim();
+        const [sub, ...rest] = args.length > 0 ? args.split(/\s+/) : [];
+        const appId = larkAppId ?? ds?.larkAppId;
+        const chatId = ds?.chatId;
+
+        if (!appId || !chatId) {
+          await sessionReply(rootId, t('cmd.chatdir.need_group', undefined, loc));
+          break;
+        }
+        if (isSessionGroup(chatId)) {
+          await sessionReply(rootId, t('sg.cmd_unsupported', { cmd: '/chatdir' }, loc));
+          break;
+        }
+
+        if (!sub || sub === 'status' || sub === '状态') {
+          const entry = getChatWorkingDirStatus(appId, chatId);
+          const oncall = getOncallStatus(appId, chatId);
+          const text = entry
+            ? t('cmd.chatdir.bound', { dir: entry.workingDir }, loc)
+            : t('cmd.chatdir.not_bound', undefined, loc);
+          const oncallNote = oncall ? `\n\n${t('cmd.chatdir.oncall_overrides', { dir: oncall.workingDir }, loc)}` : '';
+          await sessionReply(rootId, text + oncallNote);
+          break;
+        }
+
+        if (sub === 'bind' || sub === '绑定') {
+          const target = rest.join(' ').trim();
+          if (!target) {
+            await sessionReply(rootId, t('cmd.chatdir.bind_usage', undefined, loc));
+            break;
+          }
+          const validation = validateWorkingDir(target, loc);
+          if (!validation.ok) {
+            await sessionReply(rootId, validation.error);
+            break;
+          }
+          const result = await bindChatWorkingDir(appId, chatId, target);
+          if (!result.ok) {
+            await sessionReply(rootId, t('cmd.chatdir.bind_failed', { reason: result.reason }, loc));
+            break;
+          }
+          const oncall = getOncallStatus(appId, chatId);
+          const oncallNote = oncall ? `\n\n${t('cmd.chatdir.oncall_overrides', { dir: oncall.workingDir }, loc)}` : '';
+          await sessionReply(rootId, t('cmd.chatdir.bind_success', {
+            target,
+            resolved: validation.resolvedPath,
+          }, loc) + oncallNote);
+          logger.info(`[${logTag}] /chatdir bind chat=${chatId} dir=${target}`);
+          break;
+        }
+
+        if (sub === 'unbind' || sub === '解绑') {
+          const result = await unbindChatWorkingDir(appId, chatId);
+          if (!result.ok) {
+            await sessionReply(rootId, t('cmd.chatdir.unbind_failed', { reason: result.reason }, loc));
+            break;
+          }
+          await sessionReply(rootId, t(result.wasBound ? 'cmd.chatdir.unbind_success' : 'cmd.chatdir.not_bound', undefined, loc));
+          logger.info(`[${logTag}] /chatdir unbind chat=${chatId} wasBound=${result.wasBound}`);
+          break;
+        }
+
+        await sessionReply(rootId, t('cmd.chatdir.unknown_sub', { sub }, loc));
         break;
       }
 

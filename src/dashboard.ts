@@ -302,6 +302,7 @@ import {
   setReplyModeForGroup,
   getChatModeForGroup,
   unbindOncall,
+  chatWorkingDirAction,
   type GroupsActionDeps,
   type HandlerResult as GroupsHandlerResult,
 } from './dashboard/groups-action-helpers.js';
@@ -7593,6 +7594,20 @@ const server = createServer(async (req, res) => {
         const result = await unbindOncall(chatId, appId, groupsActionDeps);
         return writeHandlerResult(res, result);
       }
+    }
+    let mChatDir: RegExpMatchArray | null;
+    if ((mChatDir = url.pathname.match(/^\/api\/groups\/([^/]+)\/chat-working-dir\/([^/]+)$/))
+      && (req.method === 'GET' || req.method === 'PUT' || req.method === 'DELETE')) {
+      const chatId = decodeURIComponent(mChatDir[1]);
+      const appId = decodeURIComponent(mChatDir[2]);
+      let raw = '';
+      if (req.method === 'PUT') {
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(c as Buffer);
+        raw = Buffer.concat(chunks).toString('utf8');
+      }
+      const result = await chatWorkingDirAction(req.method, chatId, appId, raw, groupsActionDeps);
+      return writeHandlerResult(res, result);
     }
 
     // 只读单群拓扑（不在 PUBLIC_READ_PATHS，匿名访问已被全局 gate 401）。

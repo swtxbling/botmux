@@ -57,6 +57,57 @@ afterEach(() => {
 });
 
 describe('resolvePinnedWorkingDir', () => {
+  it('chatWorkingDirs pins THIS chat over a same-anchor peer and the bot default, without auto-worktree', async () => {
+    const { botRegistry, sessionStore, daemon } = await loadFreshModules();
+    const peerDir = tempDir('peer-repo');
+    const defaultDir = tempDir('default-repo');
+    const chatDir = tempDir('chat-repo');
+    botRegistry.registerBot({ larkAppId: 'app-peer', larkAppSecret: 's', cliId: 'claude-code' });
+    botRegistry.registerBot({
+      larkAppId: 'app-self',
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      defaultWorkingDir: defaultDir,
+      defaultWorkingDirAutoWorktree: true,
+      chatWorkingDirs: [{ chatId: 'oc_chat', workingDir: chatDir }],
+    });
+    await seedPeerSession(sessionStore, peerDir);
+
+    const result = await daemon.__testOnly_resolvePinnedWorkingDir({
+      scope: 'thread', anchor: 'om_root', chatId: 'oc_chat', chatType: 'group', larkAppId: 'app-self',
+    });
+    expect(result.pinnedWorkingDir).toBe(chatDir);
+    expect(result.chatDirEntry).toEqual({ chatId: 'oc_chat', workingDir: chatDir });
+    expect(result.oncallEntry).toBeUndefined();
+    expect(result.inheritedFrom).toBeNull();
+    expect(result.pinnedFromBotDefault).toBe(false);
+
+    // 其他群不受影响：仍走 bot 默认目录。
+    const other = await daemon.__testOnly_resolvePinnedWorkingDir({
+      scope: 'thread', anchor: 'om_other', chatId: 'oc_other', chatType: 'group', larkAppId: 'app-self',
+    });
+    expect(other.pinnedWorkingDir).toBe(defaultDir);
+    expect(other.chatDirEntry).toBeUndefined();
+  });
+
+  it('oncall binding wins over chatWorkingDirs in the same chat', async () => {
+    const { botRegistry, daemon } = await loadFreshModules();
+    const oncallDir = tempDir('oncall-repo');
+    const chatDir = tempDir('chat-repo');
+    botRegistry.registerBot({
+      larkAppId: 'app-self',
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      oncallChats: [{ chatId: 'oc_chat', workingDir: oncallDir }],
+      chatWorkingDirs: [{ chatId: 'oc_chat', workingDir: chatDir }],
+    });
+    const result = await daemon.__testOnly_resolvePinnedWorkingDir({
+      scope: 'thread', anchor: 'om_root', chatId: 'oc_chat', chatType: 'group', larkAppId: 'app-self',
+    });
+    expect(result.pinnedWorkingDir).toBe(oncallDir);
+    expect(result.chatDirEntry).toBeUndefined();
+  });
+
   it('prefers THIS bot\'s own defaultWorkingDir over a valid same-anchor peer (no cross-bot dir pollution)', async () => {
     const { botRegistry, sessionStore, daemon } = await loadFreshModules();
     const peerDir = tempDir('peer-repo');

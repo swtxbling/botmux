@@ -236,6 +236,26 @@ export async function unbindOncall(
   return { status: upstream.status, body: json ?? text };
 }
 
+/**
+ * GET/PUT/DELETE /api/groups/:chatId/chat-working-dir/:appId — 群级默认目录（不改权限）。
+ * 内部代理到该 bot daemon 的 `/api/chat-working-dir/:chatId`，PUT body 原样转发。
+ */
+export async function chatWorkingDirAction(
+  method: 'GET' | 'PUT' | 'DELETE',
+  chatId: string,
+  appId: string,
+  bodyRaw: string,
+  deps: GroupsActionDeps,
+): Promise<HandlerResult> {
+  const init: RequestInit = method === 'PUT'
+    ? { method, headers: { 'content-type': 'application/json' }, body: bodyRaw || '{}' }
+    : { method };
+  const upstream = await deps.proxyToDaemon(appId, `/api/chat-working-dir/${encodeURIComponent(chatId)}`, init);
+  const { text, json } = await parseUpstream(upstream);
+  if (method !== 'GET' && upstream.ok && json?.ok !== false) deps.invalidateGroups?.();
+  return { status: upstream.status, body: json ?? text };
+}
+
 /** Read-only single-chat topology probe through the named member bot's daemon. */
 export async function getChatModeForGroup(
   chatId: string, appId: string, deps: GroupsActionDeps,

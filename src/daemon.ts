@@ -110,6 +110,8 @@ import {
   getBotBrand,
   getDashboardAdminOpenIds,
   findOncallChat,
+  findChatBoundWorkingDir,
+  findChatWorkingDir,
   effectiveDefaultWorkingDir,
   effectiveBotDisplayName,
   resolveVcMeetingConsumerProfiles,
@@ -3220,8 +3222,9 @@ function assertVcMeetingConsumerAgentWorkingDir(candidate: VcMeetingConsumerAgen
   }
   assertVcMeetingConsumerAgentIsolation(cfg);
   const rawWorkingDir =
-    findOncallChat(candidate.larkAppId, listenerChatId)?.workingDir
+    findChatBoundWorkingDir(candidate.larkAppId, listenerChatId)
     ?? cfg.oncallChats?.find(chat => chat.chatId === listenerChatId)?.workingDir
+    ?? cfg.chatWorkingDirs?.find(chat => chat.chatId === listenerChatId)?.workingDir
     ?? effectiveDefaultWorkingDir(cfg)
     ?? cfg.workingDir;
   if (!rawWorkingDir) {
@@ -3334,7 +3337,7 @@ async function ensureVcMeetingReceiverSession(
       return current;
     }
 
-    const rawWorkingDir = findOncallChat(selfAppId, chatId)?.workingDir
+    const rawWorkingDir = findChatBoundWorkingDir(selfAppId, chatId)
       ?? effectiveDefaultWorkingDir(bot.config)
       ?? bot.config.workingDir
       ?? '~';
@@ -5448,7 +5451,7 @@ function resolveForceTopicCurrentWorkingDir(ctx: {
   const current = validateExplicitForceTopicWorkingDir(ctx.currentSession?.workingDir, loc);
   if (current) return current;
 
-  const oncall = validateExplicitForceTopicWorkingDir(findOncallChat(ctx.larkAppId, ctx.chatId)?.workingDir, loc);
+  const oncall = validateExplicitForceTopicWorkingDir(findChatBoundWorkingDir(ctx.larkAppId, ctx.chatId), loc);
   if (oncall) return oncall;
 
   const peers = ctx.scope === 'chat'
@@ -21283,6 +21286,7 @@ async function resolvePinnedWorkingDir(ctx: {
         return {
           pinnedWorkingDir: resolved,
           oncallEntry: undefined,
+          chatDirEntry: undefined,
           inheritedFrom: null,
           pinnedFromBotDefault: false,
         };
@@ -21294,30 +21298,33 @@ async function resolvePinnedWorkingDir(ctx: {
   if (!oncallEntry) {
     oncallEntry = await maybeAutoBindDefaultOncall(ctx.larkAppId, ctx.chatId, ctx.chatType);
   }
+  // 群级默认目录（不改权限）：oncall 没绑时，作为本群的目录绑定，优先于 sibling 继承和 bot 默认。
+  const chatDirEntry = !oncallEntry ? findChatWorkingDir(ctx.larkAppId, ctx.chatId) : undefined;
+  const chatBound = !!oncallEntry || !!chatDirEntry;
   // Resolve the bot default first so we know whether inheritance is only the
   // ordinary last-resort fallback or must preempt an auto-created worktree.
-  const botDefaultWorkingDir = !oncallEntry
+  const botDefaultWorkingDir = !chatBound
     ? resolveBotDefaultWorkingDir(ctx.larkAppId)
     : undefined;
-  const preferPeerOverAutoWorktree = !oncallEntry
+  const preferPeerOverAutoWorktree = !chatBound
     && !!botDefaultWorkingDir
     && botAutoWorktreeEnabled(ctx.larkAppId);
   // Peer inheritance is normally the fallback after this bot's own default. When
   // that default would create a fresh worktree, however, "bot@bot 同目录拉起"
   // takes priority: a valid same-anchor peer suppresses auto-worktree for this
   // session. The per-bot gate is enforced inside findInheritablePeer.
-  const inheritedFrom = (!oncallEntry && (!botDefaultWorkingDir || preferPeerOverAutoWorktree))
+  const inheritedFrom = (!chatBound && (!botDefaultWorkingDir || preferPeerOverAutoWorktree))
     ? findInheritablePeer({
         scope: ctx.scope, anchor: ctx.anchor, chatId: ctx.chatId, chatType: ctx.chatType,
         selfAppId: ctx.larkAppId,
         botToBotSameDir: getBot(ctx.larkAppId).config.botToBotSameDir !== false,
       })
     : null;
-  const pinnedWorkingDir = oncallEntry?.workingDir ?? inheritedFrom?.workingDir ?? botDefaultWorkingDir;
+  const pinnedWorkingDir = oncallEntry?.workingDir ?? chatDirEntry?.workingDir ?? inheritedFrom?.workingDir ?? botDefaultWorkingDir;
   // Only the bot-default winner opts into auto-worktree. A same-dir peer winner
   // keeps its exact workingDir and therefore suppresses worktree creation.
-  const pinnedFromBotDefault = !oncallEntry && !inheritedFrom && !!botDefaultWorkingDir;
-  return { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault };
+  const pinnedFromBotDefault = !chatBound && !inheritedFrom && !!botDefaultWorkingDir;
+  return { pinnedWorkingDir, oncallEntry, chatDirEntry, inheritedFrom, pinnedFromBotDefault };
 }
 
 export const __testOnly_resolvePinnedWorkingDir = resolvePinnedWorkingDir;
@@ -25287,7 +25294,7 @@ async function startInitialPassthroughSession(args: {
   fillNativeTopicId(session, scope, parsed.threadId);
   sessionStore.updateSession(session);
 
-  const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+  const { pinnedWorkingDir, oncallEntry, chatDirEntry, inheritedFrom, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
   // Auto-worktree: register PENDING (router buffers, no force-fork) and build the
   // worktree off the critical path (see willAutoWorktree / runAutoWorktreeCommit).
   const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
@@ -25373,6 +25380,8 @@ async function startInitialPassthroughSession(args: {
     onDurablyAdmitted?.();
     const reason = oncallEntry
       ? `oncall-bound chat ${chatId}`
+      : chatDirEntry
+      ? `chat working dir ${chatId}`
       : inheritedFrom
       ? `inherited from sibling session ${inheritedFrom.sessionId.substring(0, 8)} (app=${inheritedFrom.larkAppId ?? 'unknown'})`
       : `bot defaultWorkingDir`;
@@ -26379,6 +26388,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   const {
     pinnedWorkingDir: configPinnedWorkingDir,
     oncallEntry,
+    chatDirEntry,
     inheritedFrom,
     pinnedFromBotDefault: configPinnedFromBotDefault,
   } = await resolvePinnedWorkingDir({
@@ -26760,6 +26770,8 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     markIngressAdmitted(ctx);
     const reason = oncallEntry
       ? `oncall-bound chat ${chatId}`
+      : chatDirEntry
+      ? `chat working dir ${chatId}`
       : inheritedFrom
       ? `inherited from sibling session ${inheritedFrom.sessionId.substring(0, 8)} (app=${inheritedFrom.larkAppId ?? 'unknown'})`
       : `bot defaultWorkingDir`;
@@ -29487,7 +29499,7 @@ async function handleThreadReplyAdmitted(
     // A workflow node of a run approved with --working-dir starts exactly in
     // that (just range-checked) directory instead (design §15.4).
     const workflowStart = workflowNodePinnedStart(workflowAdmission);
-    const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = workflowStart
+    const { pinnedWorkingDir, oncallEntry, chatDirEntry, inheritedFrom, pinnedFromBotDefault } = workflowStart
       ?? await resolvePinnedWorkingDir({
         scope,
         anchor,
@@ -29616,6 +29628,8 @@ async function handleThreadReplyAdmitted(
       markIngressAdmitted(ctx);
       const reason = oncallEntry
         ? `oncall-bound chat ${autoCreateChatId}`
+        : chatDirEntry
+        ? `chat working dir ${autoCreateChatId}`
         : inheritedFrom
         ? `inherited from peer session ${inheritedFrom.sessionId.substring(0, 8)} (app=${inheritedFrom.larkAppId ?? 'unknown'})`
         : workflowStart
@@ -33145,7 +33159,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       operationStore, admissionStore, now: () => new Date(),
       resolveIdentity: () => resolveDispatchLaunchIdentity(getBot(cfg.larkAppId).config),
       resolveWorkingDir: (chatId) => {
-        const candidate = findOncallChat(cfg.larkAppId, chatId)?.workingDir
+        const candidate = findChatBoundWorkingDir(cfg.larkAppId, chatId)
           ?? effectiveDefaultWorkingDir(cfg) ?? cfg.workingDir;
         if (!candidate) return undefined;
         const checked = validateWorkingDir(candidate);

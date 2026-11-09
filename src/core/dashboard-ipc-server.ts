@@ -105,6 +105,7 @@ import {
 import * as groupsStore from '../services/groups-store.js';
 import { createGroupWithBots, transferGroupOwner } from '../services/group-creator.js';
 import * as oncallStore from '../services/oncall-store.js';
+import * as chatWorkingDirStore from '../services/chat-working-dir-store.js';
 import * as brandStore from '../services/brand-store.js';
 import * as sandboxStore from '../services/sandbox-store.js';
 import { findForbiddenReadWritePaths, findReadOnlyLauncherMountCovers } from '../services/sandbox-path-guard.js';
@@ -517,7 +518,7 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot, getBotClient, getBotOpenId, getOwnerOpenId, loadBotConfigs, findOncallChat, listOncallChats, effectiveDefaultWorkingDir, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, normalizeDshProfile, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
+import { getBotBrand, getBot, getBotClient, getBotOpenId, getOwnerOpenId, loadBotConfigs, findChatBoundWorkingDir, listOncallChats, effectiveDefaultWorkingDir, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, normalizeDshProfile, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
 import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, isUsableOpenId, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES, requestUserAuthorization } from '../utils/user-token.js';
 import { queryTriggerUserAuthStatus } from '../services/trigger-user-auth-status.js';
 import { revokeTriggerUserAuth } from '../services/revoke-trigger-user-auth.js';
@@ -6590,7 +6591,7 @@ function resolveDashboardScheduleWorkingDir(
 ): DashboardScheduleWorkingDir {
   let raw: unknown = explicit;
   if (raw === undefined) {
-    raw = (chatId ? findOncallChat(larkAppId, chatId)?.workingDir : undefined)
+    raw = (chatId ? findChatBoundWorkingDir(larkAppId, chatId) : undefined)
       ?? effectiveDefaultWorkingDir(getBot(larkAppId).config);
   }
   if (raw === undefined) return { ok: false, error: 'schedule_working_dir_unavailable' };
@@ -7607,6 +7608,34 @@ ipcRoute('DELETE', '/api/oncall/:chatId', requireBoundBot(async (_req, res, p) =
   // defaultOncallAutoboundChats so the auto-bind judge won't reinstate this
   // chat on the next observation, even if it had no prior binding.
   const r = await oncallStore.unbindOncall(cachedLarkAppId, p.chatId);
+  if (!r.ok) return jsonRes(res, 400, r);
+  jsonRes(res, 200, { ok: true, wasBound: r.wasBound });
+}));
+
+// ─── 群级默认目录（dashboard）──────────────────────────────────────────────
+// GET    /api/chat-working-dir/:chatId  → { entry | null }
+// PUT    /api/chat-working-dir/:chatId  body: {workingDir} — 设置 / 更新
+// DELETE /api/chat-working-dir/:chatId  — 取消（幂等）
+// 只钉目录、不改对话权限；鉴权同 oncall 路由（dashboard loopback token）。
+
+ipcRoute('GET', '/api/chat-working-dir/:chatId', requireBoundBot(async (_req, res, p) => {
+  jsonRes(res, 200, { ok: true, entry: chatWorkingDirStore.getChatWorkingDirStatus(cachedLarkAppId, p.chatId) ?? null });
+}));
+
+ipcRoute('PUT', '/api/chat-working-dir/:chatId', requireBoundBot(async (req, res, p) => {
+  const body = await readJsonBodyOrBadJson<{ workingDir?: unknown }>(req, res);
+  if (body === BAD_JSON) return;
+  const workingDir = typeof body.workingDir === 'string' ? body.workingDir.trim() : '';
+  if (!workingDir) return jsonRes(res, 400, { ok: false, error: 'workingDir_required' });
+  const v = validateWorkingDir(workingDir);
+  if (!v.ok) return jsonRes(res, 400, { ok: false, error: v.error });
+  const r = await chatWorkingDirStore.bindChatWorkingDir(cachedLarkAppId, p.chatId, workingDir);
+  if (!r.ok) return jsonRes(res, 400, r);
+  jsonRes(res, 200, { ok: true, entry: r.entry, created: r.created, resolvedPath: v.resolvedPath });
+}));
+
+ipcRoute('DELETE', '/api/chat-working-dir/:chatId', requireBoundBot(async (_req, res, p) => {
+  const r = await chatWorkingDirStore.unbindChatWorkingDir(cachedLarkAppId, p.chatId);
   if (!r.ok) return jsonRes(res, 400, r);
   jsonRes(res, 200, { ok: true, wasBound: r.wasBound });
 }));

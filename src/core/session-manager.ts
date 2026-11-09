@@ -48,7 +48,7 @@ import {
 import type { PersistentBackendTarget } from '../adapters/backend/types.js';
 import { adoptTargetLabel, validateAdoptTargetState } from './session-discovery.js';
 import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
-import { getBot, getAllBots, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir } from '../bot-registry.js';
+import { getBot, getAllBots, getOwnerOpenId, findChatBoundWorkingDir, effectiveDefaultWorkingDir } from '../bot-registry.js';
 import type { BotConfig } from '../bot-registry.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { sameRuntimeIdentity, type CliRuntimeConfig, type CliRuntimeSnapshot } from '../adapters/cli/runtime.js';
@@ -5589,7 +5589,7 @@ export async function deliverWorkflowNodeTurn(
  *  forkOrShowRepoCard 弹 /repo 卡片让用户在群里选。与普通新话题的 resolvePinnedWorkingDir
  *  同口径（少了 sibling 继承那层，新群无 sibling 可继承）。*/
 function resolveDashboardSpawnWorkingDir(larkAppId: string, chatId: string): string | undefined {
-  const oncall = findOncallChat(larkAppId, chatId)?.workingDir;
+  const oncall = findChatBoundWorkingDir(larkAppId, chatId);
   if (oncall) return oncall;
   const raw = effectiveDefaultWorkingDir(getBot(larkAppId).config);
   if (!raw) return undefined;
@@ -5655,7 +5655,7 @@ async function forkOrShowRepoCard(
   // 非 git 仓库 / 建失败 → 回退默认目录（提示经 notify 发）。registry 拿不到时兜底走原同步路径。
   const registry = getActiveSessionsRegistry();
   if (registry && ds.workingDir && !ds.worktreeCreating && botAutoWorktreeEnabled(larkAppId)) {
-    const isBotDefaultDir = !findOncallChat(larkAppId, ds.chatId)?.workingDir
+    const isBotDefaultDir = !findChatBoundWorkingDir(larkAppId, ds.chatId)
       && ds.workingDir === expandHome(effectiveDefaultWorkingDir(bot.config) ?? '');
     if (isBotDefaultDir) {
       const baseDir = ds.workingDir;
